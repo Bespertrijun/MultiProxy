@@ -105,13 +105,69 @@ manifest are documented in [`crates/agent/BUILD.md`](crates/agent/BUILD.md).
 
 ---
 
-## Run locally (high DNS port, no privileges)
+## Quick deploy (one-click scripts, no compilation needed)
 
-The panel uses CLI parameters with env-var fallback. The deploy flow is two steps:
-**`panel init`** (one-time admin setup) then **`panel serve`** (run):
+Pre-built binaries are published to [GitHub Releases](https://github.com/Bespertrijun/MultiProxy/releases).
+
+### Install panel (control server)
 
 ```sh
-# 1. One-time: create the admin user (password is required, no default)
+curl -sL https://github.com/Bespertrijun/MultiProxy/releases/latest/download/install-panel.sh | bash -s -- \
+  --admin-pass "your-strong-password"
+```
+
+The script automatically: downloads the panel binary → initializes the DB and admin user → downloads the GeoCN IP database → installs a systemd service and starts it.
+
+Optional flags:
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--admin-pass` | (required) | Admin password |
+| `--dns-port` | `53` | GeoDNS port |
+| `--http` | `0.0.0.0:8080` | Web bind |
+| `--data-dir` | `/opt/multiproxy` | Data directory |
+| `--no-geocn` | - | Skip IP database download |
+| `--no-systemd` | - | Don't install systemd service |
+
+### Install agent (each NAT node)
+
+After adding a node in the panel, copy the displayed install command and run it on the NAT node:
+
+```sh
+curl -sL https://github.com/Bespertrijun/MultiProxy/releases/latest/download/install-agent.sh | bash -s -- \
+  --panel-url wss://panel.example.com/agent \
+  --node-id <NODE_ID> --token <TOKEN>
+```
+
+The script automatically: detects arch (x86_64/aarch64) → downloads the matching agent binary → downloads gost → installs a systemd service and starts it.
+
+### Full deploy flow
+
+```
+1. Run the panel install script on the control server
+2. Open the panel → Settings → Configure Cloudflare (auto DNS setup)
+3. Add a DNS zone (e.g. emby.example.com)
+4. Add a node → copy the install command
+5. Paste and run the install command on the NAT node
+6. Back in the panel → add forwarding rules → configure line groups
+7. Users point their Emby client at the domain name
+```
+
+### Updates
+
+The panel supports online self-update:
+
+- **Panel update**: Settings → Check for updates → one-click update (auto-downloads + restarts)
+- **Agent update**: `agent --self-update --panel-url wss://...` or re-run the install script
+- **Release**: `git tag v0.2.0 && git push --tags` → CI auto-builds and publishes to GitHub Releases
+
+---
+
+## Local development (high DNS port, no privileges)
+
+Run from source (for development):
+
+```sh
+# 1. One-time: create the admin user
 cargo run -p panel -- init --admin-pass "change-me"
 
 # 2. Start the panel (DNS on a high port so no privileged bind is needed)
@@ -122,16 +178,16 @@ cargo run -p panel -- serve \
   --dns-port 15353
 ```
 
-Then exercise it (login → node → rule → zone → line group → query):
+Verify:
 
 ```sh
-# log in (stores a session cookie)
+# log in
 curl -c cj.txt -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"change-me"}' http://127.0.0.1:8080/api/login
-# create a node (token is shown once)
+# create a node
 curl -b cj.txt -H 'Content-Type: application/json' \
   -d '{"name":"n1","public_ip":"203.0.113.7"}' http://127.0.0.1:8080/api/nodes
-# query the GeoDNS on the high port
+# query the GeoDNS
 dig @127.0.0.1 -p 15353 emby.example.com A
 ```
 

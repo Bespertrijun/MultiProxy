@@ -84,12 +84,69 @@ cargo zigbuild -p agent --release --target aarch64-unknown-linux-musl
 
 ---
 
-## 本地运行（高位 DNS 端口，无需特权）
+## 快速部署（一键脚本,无需编译）
 
-面板使用 CLI 参数（支持环境变量回退）。部署分两步：**`panel init`**（一次性管理员设置）然后 **`panel serve`**（运行）：
+从 [GitHub Releases](https://github.com/Bespertrijun/MultiProxy/releases) 下载预编译二进制,一行命令完成安装。
+
+### 安装面板（主控机）
 
 ```sh
-# 1. 一次性：创建管理员用户（密码必填，无默认值）
+curl -sL https://github.com/Bespertrijun/MultiProxy/releases/latest/download/install-panel.sh | bash -s -- \
+  --admin-pass "你的强密码"
+```
+
+脚本自动完成:下载面板二进制 → 初始化数据库和管理员 → 下载 GeoCN IP 库 → 安装 systemd 服务并启动。
+
+可选参数:
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--admin-pass` | (必填) | 管理员密码 |
+| `--dns-port` | `53` | GeoDNS 端口 |
+| `--http` | `0.0.0.0:8080` | Web 绑定 |
+| `--data-dir` | `/opt/multiproxy` | 数据目录 |
+| `--no-geocn` | - | 跳过下载 IP 库 |
+| `--no-systemd` | - | 不装 systemd 服务 |
+
+### 安装 Agent（每台 NAT 小鸡）
+
+在面板中添加节点后,复制显示的一键安装命令,到 NAT 小鸡上执行:
+
+```sh
+curl -sL https://github.com/Bespertrijun/MultiProxy/releases/latest/download/install-agent.sh | bash -s -- \
+  --panel-url wss://panel.example.com/agent \
+  --node-id <节点ID> --token <节点Token>
+```
+
+脚本自动完成:检测架构(x86_64/aarch64) → 下载对应 agent 二进制 → 下载 gost → 安装 systemd 服务并启动。
+
+### 完整部署流程
+
+```
+1. 主控机运行面板安装脚本
+2. 打开面板 → 系统设置 → 配置 Cloudflare（自动搞定 DNS）
+3. 添加 DNS 域名（如 emby.example.com）
+4. 添加节点 → 复制安装命令
+5. NAT 小鸡上粘贴运行安装命令
+6. 回面板 → 添加转发规则 → 配线路组
+7. 用户在 Emby 客户端填域名即可使用
+```
+
+### 更新
+
+面板支持在线自更新:
+
+- **面板更新**: 系统设置 → 检查更新 → 一键更新（自动下载新版 + 重启）
+- **Agent 更新**: `agent --self-update --panel-url wss://...` 或重新运行安装脚本
+- **发版**: `git tag v0.2.0 && git push --tags` → CI 自动构建发布到 GitHub Releases
+
+---
+
+## 本地开发运行（高位 DNS 端口，无需特权）
+
+从源码运行(开发用):
+
+```sh
+# 1. 一次性：创建管理员用户
 cargo run -p panel -- init --admin-pass "change-me"
 
 # 2. 启动面板（DNS 用高位端口免去特权绑定）
@@ -100,16 +157,16 @@ cargo run -p panel -- serve \
   --dns-port 15353
 ```
 
-然后走一遍（登录 → 节点 → 规则 → 区域 → 线路组 → 查询）：
+验证:
 
 ```sh
-# 登录（保存会话 cookie）
+# 登录
 curl -c cj.txt -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"change-me"}' http://127.0.0.1:8080/api/login
-# 创建节点（token 仅展示一次）
+# 创建节点
 curl -b cj.txt -H 'Content-Type: application/json' \
   -d '{"name":"n1","public_ip":"203.0.113.7"}' http://127.0.0.1:8080/api/nodes
-# 在高位端口查询 GeoDNS
+# 查询 GeoDNS
 dig @127.0.0.1 -p 15353 emby.example.com A
 ```
 
