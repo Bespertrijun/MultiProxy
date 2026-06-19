@@ -94,7 +94,6 @@ impl CfClient {
         }
     }
 
-
     /// List DNS records matching a type and name.
     pub async fn list_records(&self, record_type: &str, name: &str) -> CfResult<Vec<DnsRecord>> {
         let url = format!(

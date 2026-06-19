@@ -59,6 +59,10 @@ struct Cli {
         default_value_t = 8096
     )]
     backend_port: u16,
+
+    /// Self-update: check the panel for a newer binary, download, replace, and restart.
+    #[arg(long = "self-update")]
+    self_update: bool,
 }
 
 #[tokio::main]
@@ -71,6 +75,25 @@ async fn main() {
 
     let platform = agent::platform::detect();
     let cli = Cli::parse();
+
+    // Handle --self-update before anything else.
+    if cli.self_update {
+        eprintln!("agent self-update mode");
+        match agent::updater::self_update(&cli.panel_url).await {
+            Ok(true) => {
+                // Updated and restarting — should not reach here.
+                std::process::exit(0);
+            }
+            Ok(false) => {
+                eprintln!("already up to date");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("self-update failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     let cfg = AgentConfig {
         panel_url: cli.panel_url,

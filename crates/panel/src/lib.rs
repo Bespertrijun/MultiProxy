@@ -17,6 +17,7 @@ pub mod error;
 pub mod scheduler;
 pub mod state;
 pub mod ui;
+pub mod updater;
 pub mod ws_server;
 
 use std::path::PathBuf;

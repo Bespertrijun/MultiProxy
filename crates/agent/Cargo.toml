@@ -49,6 +49,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 clap = { version = "4", features = ["derive", "env"] }
 rustls-pki-types = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 # In-test mock panel: a plain-ws server (no TLS) so the conn loop, config-apply,

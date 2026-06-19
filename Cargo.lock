@@ -45,6 +45,7 @@ dependencies = [
  "clap",
  "contract",
  "futures-util",
+ "reqwest",
  "rustls",
  "rustls-pki-types",
  "serde",

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{self, SESSION_COOKIE};
 use crate::error::{PanelError, Result};
 use crate::state::AppState;
+use crate::updater;
 use crate::ws_server::{now_ms, push_config_to, rebuild_and_store_snapshot};
 use crate::{acme, cloudflare, db, ui, ws_server};
 
@@ -53,6 +54,10 @@ pub fn router(state: AppState) -> Router {
                 .put(put_cf_settings)
                 .delete(delete_cf_settings),
         )
+        .route("/api/version", get(version_info))
+        .route("/api/update/check", get(update_check))
+        .route("/api/update/panel", post(update_panel))
+        .route("/api/update/agents", post(update_agents))
         .route("/api/logout", post(logout))
         .route("/api/change-password", post(change_password))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -966,6 +971,98 @@ async fn delete_cf_settings(State(state): State<AppState>) -> Response {
     }
     state.set_cf_config(None).await;
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+// ---------- version + self-update ----------
+
+async fn version_info() -> Response {
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": contract::PROTOCOL_VERSION,
+    }))
+    .into_response()
+}
+
+async fn update_check() -> Response {
+    match updater::check_update().await {
+        Ok(info) => Json(serde_json::json!(info)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+async fn update_panel() -> Response {
+    let info = match updater::check_update().await {
+        Ok(i) => i,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("check failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    if !info.has_update {
+        return Json(serde_json::json!({
+            "ok": false,
+            "message": "already up to date",
+        }))
+        .into_response();
+    }
+
+    let tag = info.latest_version.clone();
+    // Respond before starting the update so the client gets the response.
+    let msg = format!("updating to v{tag}, restarting...");
+    tokio::spawn(async move {
+        // Small delay so the HTTP response is flushed.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Err(e) = updater::self_update(&tag).await {
+            tracing::error!("self-update failed: {e}");
+        }
+    });
+
+    Json(serde_json::json!({
+        "ok": true,
+        "message": msg,
+    }))
+    .into_response()
+}
+
+async fn update_agents(State(state): State<AppState>) -> Response {
+    let info = match updater::check_update().await {
+        Ok(i) => i,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("check failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let tag = if info.has_update {
+        info.latest_version.clone()
+    } else {
+        info.current_version.clone()
+    };
+
+    let agent_bin_dir = std::path::Path::new(&state.agent_bin_dir);
+    match updater::update_agent_binaries(&tag, agent_bin_dir).await {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "message": format!("Agent binaries updated to v{tag}. Re-run the install script on each node or use `agent --self-update` to apply."),
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
 }
 
 // ---------- install script + agent binary download ----------

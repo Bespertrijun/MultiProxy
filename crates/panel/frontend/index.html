@@ -427,11 +427,11 @@ tailwind.config = {
             <dl class="space-y-3 text-sm">
               <div class="flex justify-between">
                 <dt class="text-panel-300">面板版本</dt>
-                <dd class="text-panel-100 font-medium">v1.0</dd>
+                <dd id="settingsPanelVersion" class="text-panel-100 font-medium">-</dd>
               </div>
               <div class="flex justify-between">
                 <dt class="text-panel-300">协议版本</dt>
-                <dd class="text-panel-100 font-medium">v1</dd>
+                <dd id="settingsProtoVersion" class="text-panel-100 font-medium">-</dd>
               </div>
               <div class="flex justify-between">
                 <dt class="text-panel-300">IP库格式</dt>
@@ -578,6 +578,40 @@ tailwind.config = {
                 更新证书
               </button>
             </div>
+          </div>
+
+          <!-- System Update -->
+          <div class="bg-panel-800 border border-panel-500 rounded-xl p-5 md:col-span-2">
+            <h3 class="text-sm font-medium text-panel-200 mb-4 uppercase tracking-wider">系统更新</h3>
+            <dl class="space-y-3 text-sm mb-4">
+              <div class="flex justify-between">
+                <dt class="text-panel-300">当前版本</dt>
+                <dd id="updateCurrentVer" class="text-panel-100 font-medium">-</dd>
+              </div>
+              <div id="updateLatestRow" class="flex justify-between hidden">
+                <dt class="text-panel-300">最新版本</dt>
+                <dd id="updateLatestVer" class="text-emerald-400 font-medium">-</dd>
+              </div>
+              <div id="updateNotesRow" class="hidden">
+                <dt class="text-panel-300 mb-1">更新说明</dt>
+                <dd id="updateNotes" class="text-panel-100 text-xs bg-panel-700 rounded-lg p-3 mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap">-</dd>
+              </div>
+            </dl>
+            <div class="flex items-center gap-3">
+              <button id="updateCheckBtn" onclick="doUpdateCheck()"
+                class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                检查更新
+              </button>
+              <button id="updatePanelBtn" onclick="doUpdatePanel()"
+                class="bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed hidden">
+                更新面板
+              </button>
+              <button id="updateAgentBtn" onclick="doUpdateAgents()"
+                class="bg-amber-600 hover:bg-amber-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed hidden">
+                更新 Agent 二进制
+              </button>
+            </div>
+            <div id="updateStatus" class="hidden mt-3 text-xs text-panel-300"></div>
           </div>
 
           <!-- Change Password -->
@@ -1382,6 +1416,7 @@ function renderSettings() {
   document.getElementById('settingsRuleCount').textContent = _rules.length;
   document.getElementById('settingsGroupCount').textContent = _groups.length;
   document.getElementById('settingsZoneCount').textContent = _zones.length;
+  loadVersionInfo();
   refreshCfSettings();
   refreshCertStatus();
 }
@@ -1532,6 +1567,97 @@ async function doGeocnUpdate() {
     toast('IP 数据库更新成功 (' + sizeMb + ' MB)', 'success');
   } catch (e) {
     toast('更新失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+/* ========== System Update ========== */
+async function loadVersionInfo() {
+  try {
+    var data = await api('GET', '/api/version');
+    document.getElementById('settingsPanelVersion').textContent = 'v' + (data.version || '-');
+    document.getElementById('settingsProtoVersion').textContent = 'v' + (data.protocol_version || '-');
+    document.getElementById('updateCurrentVer').textContent = 'v' + (data.version || '-');
+  } catch (e) {
+    // non-critical
+  }
+}
+
+async function doUpdateCheck() {
+  var btn = document.getElementById('updateCheckBtn');
+  var origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '检查中...';
+  try {
+    var info = await api('GET', '/api/update/check');
+    document.getElementById('updateCurrentVer').textContent = 'v' + info.current_version;
+    if (info.has_update) {
+      document.getElementById('updateLatestRow').classList.remove('hidden');
+      document.getElementById('updateLatestVer').textContent = 'v' + info.latest_version;
+      if (info.release_notes) {
+        document.getElementById('updateNotesRow').classList.remove('hidden');
+        document.getElementById('updateNotes').textContent = info.release_notes.slice(0, 500);
+      }
+      document.getElementById('updatePanelBtn').classList.remove('hidden');
+      document.getElementById('updateAgentBtn').classList.remove('hidden');
+      toast('发现新版本: v' + info.latest_version, 'info');
+    } else {
+      document.getElementById('updateLatestRow').classList.add('hidden');
+      document.getElementById('updateNotesRow').classList.add('hidden');
+      document.getElementById('updatePanelBtn').classList.add('hidden');
+      document.getElementById('updateAgentBtn').classList.add('hidden');
+      toast('已是最新版本', 'success');
+    }
+  } catch (e) {
+    toast('检查更新失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function doUpdatePanel() {
+  if (!confirm('确定要更新面板吗？面板将自动重启。')) return;
+  var btn = document.getElementById('updatePanelBtn');
+  var origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '更新中...';
+  var statusEl = document.getElementById('updateStatus');
+  try {
+    var result = await api('POST', '/api/update/panel');
+    if (result.ok) {
+      statusEl.classList.remove('hidden');
+      statusEl.innerHTML = '<span class="text-emerald-400">' + esc(result.message) + '</span>';
+      toast('正在更新，面板将自动重启...', 'info');
+      // Auto-refresh after 10 seconds to pick up the new version.
+      setTimeout(function() { location.reload(); }, 10000);
+    } else {
+      toast(result.message || '已是最新版本', 'info');
+    }
+  } catch (e) {
+    toast('更新失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function doUpdateAgents() {
+  var btn = document.getElementById('updateAgentBtn');
+  var origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '下载中...';
+  try {
+    var result = await api('POST', '/api/update/agents');
+    if (result.ok) {
+      toast(result.message, 'success');
+    } else {
+      toast('更新失败', 'error');
+    }
+  } catch (e) {
+    toast('Agent 更新失败: ' + e.message, 'error');
   } finally {
     btn.disabled = false;
     btn.textContent = origText;

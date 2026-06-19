@@ -1,5 +1,7 @@
 # multiProxy — Emby 多前置 NAT 中转 + GeoDNS 分线路
 
+![CI](https://github.com/Bespertrijun/MultiProxy/actions/workflows/ci.yml/badge.svg)
+
 [English](README.md) | 简体中文
 
 multiProxy 用一批分布在不同**运营商/地区**的 **NAT 中转节点**为单一后端（例如 **Emby** 媒体服务器）做前置，并通过**自建 GeoDNS**——按客户端的地区/运营商线路返回不同解析结果——把每个用户导向最合适的前置节点。一个中心**面板（panel）**管理整个节点群、渲染每个节点的转发配置、跟踪节点健康与容量、并对外提供 DNS 解析；每个 NAT 节点上的轻量 **agent** 主动反连面板、应用下发的配置、监管本地转发工具（gost/realm）、并定期上报自身状态。
@@ -168,6 +170,48 @@ bash deploy/smoke.sh
 - Compose：[`deploy/docker-compose.yml`](deploy/docker-compose.yml)——使用 `network_mode: host`（为无 ECS 回退保留递归器源 IP + 干净的 :53；文件里解释了 Docker UDP NAT 改写源 IP 的坑与 `userland-proxy: false` 备选）。
 - agent：[`deploy/agent-install.md`](deploy/agent-install.md)（按节点架构选哪个二进制、环境变量、systemd 单元）以及可选的 [`deploy/Dockerfile.agent`](deploy/Dockerfile.agent)。
 - DNS 拓扑操作手册：[`deploy/dns-setup.md`](deploy/dns-setup.md)。
+
+---
+
+## CI/CD
+
+GitHub Actions 自动化测试与发布：
+
+- **CI**（`.github/workflows/ci.yml`）—— 在每次 push/PR 到 `main` 时运行
+  `cargo fmt --check`、`clippy -D warnings` 和 `cargo test --workspace`。
+- **Release**（`.github/workflows/release.yml`）—— 推送 `v*` 标签时触发；通过
+  `cargo-zigbuild` 交叉构建静态 musl agent 二进制（x86_64 + aarch64），构建面板，
+  并将所有产物发布到 GitHub Release（自动生成发布说明）。
+
+---
+
+## 更新
+
+### 打标签发布
+
+```sh
+git tag v0.1.0
+git push --tags
+```
+
+CI 自动构建并将二进制发布到 GitHub Releases。
+
+### 面板更新
+
+在 Web UI 中：**系统设置** → **系统更新** → 点击 **检查更新**。如有新版本，点击
+**更新面板** —— 面板会下载新二进制、替换自身并自动重启。
+
+### Agent 更新
+
+两种方式：
+
+1. **在节点上重新运行安装脚本** —— 从面板的 `/dl/` 端点下载最新 agent 二进制。
+2. **`agent --self-update`** —— agent 将自身二进制与面板上的副本比较，如有不同则
+   下载、替换自身并重启。可手动运行或通过 cron 定时执行。
+
+> **注意**：从面板自动推送更新到 agent 是未来增强功能。目前请通过 UI 中的
+> **更新 Agent 二进制** 按钮更新面板 dist 目录中的 agent 二进制，然后在各节点
+> 重新运行安装脚本或使用 `agent --self-update`。
 
 ---
 

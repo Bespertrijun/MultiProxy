@@ -1,5 +1,7 @@
 # multiProxy — Emby multi-front NAT relay + GeoDNS line splitting
 
+![CI](https://github.com/Bespertrijun/MultiProxy/actions/workflows/ci.yml/badge.svg)
+
 English | [简体中文](README.zh-CN.md)
 
 multiProxy fronts a single backend (e.g. an **Emby** media server) with a fleet of
@@ -205,6 +207,54 @@ binary present, a healthy node yields an A record for the zone name.
   arch, env vars, systemd unit) and optional
   [`deploy/Dockerfile.agent`](deploy/Dockerfile.agent).
 - DNS topology runbook: [`deploy/dns-setup.md`](deploy/dns-setup.md).
+
+---
+
+## CI/CD
+
+GitHub Actions automates testing and releases:
+
+- **CI** (`.github/workflows/ci.yml`) — runs `cargo fmt --check`, `clippy -D warnings`,
+  and `cargo test --workspace` on every push/PR to `main`.
+- **Release** (`.github/workflows/release.yml`) — triggered by pushing a `v*` tag;
+  cross-builds static musl agent binaries (x86_64 + aarch64) via `cargo-zigbuild`,
+  builds the panel, and publishes all artifacts to a GitHub Release with auto-generated
+  release notes.
+
+---
+
+## Updates
+
+### Tagging a release
+
+```sh
+git tag v0.1.0
+git push --tags
+```
+
+CI auto-builds and publishes binaries to GitHub Releases.
+
+### Panel update
+
+From the web UI: **System Settings** (系统设置) > **System Update** (系统更新) > click
+**Check Update** (检查更新). If a new version is available, click **Update Panel**
+(更新面板) — the panel downloads the new binary, replaces itself, and restarts
+automatically.
+
+### Agent update
+
+Two options:
+
+1. **Re-run the install script** on the node — it downloads the latest agent binary
+   from the panel's `/dl/` endpoint.
+2. **`agent --self-update`** — the agent compares its binary against the panel's copy,
+   downloads if different, replaces itself, and restarts. Can be run manually or via a
+   cron job.
+
+> **Note**: automatic push-update of agents from the panel is a future enhancement.
+> For now, update the agent binaries in the panel's dist directory via the UI
+> (**Update Agent Binaries** button), then re-run the install script on each node
+> or use `agent --self-update`.
 
 ---
 

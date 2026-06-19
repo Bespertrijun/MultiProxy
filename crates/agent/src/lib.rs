@@ -28,6 +28,7 @@ pub mod platform;
 pub mod report;
 pub mod selfheal;
 pub mod supervisor;
+pub mod updater;
 
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;
