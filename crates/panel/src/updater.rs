@@ -24,67 +24,53 @@ pub struct UpdateInfo {
     pub release_notes: String,
 }
 
-/// A single asset from a GitHub release.
-#[derive(Debug, Deserialize)]
-struct GhAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-/// Subset of the GitHub release JSON we care about.
-#[derive(Debug, Deserialize)]
-struct GhRelease {
-    tag_name: String,
-    html_url: String,
-    #[serde(default)]
-    body: Option<String>,
-    assets: Vec<GhAsset>,
-}
-
-/// Check the GitHub Releases API for a newer version.
+/// Check for a newer version by following the GitHub "latest" redirect.
 pub async fn check_update() -> Result<UpdateInfo, String> {
     let current = env!("CARGO_PKG_VERSION");
-    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+    let url = format!("https://github.com/{GITHUB_REPO}/releases/latest");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .user_agent("multiProxy-panel")
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
     let resp = client
-        .get(&url)
+        .head(&url)
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
 
-    if !resp.status().is_success() {
-        return Err(format!("GitHub API returned {}", resp.status()));
-    }
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or("no redirect from /releases/latest")?;
 
-    let release: GhRelease = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse release JSON: {e}"))?;
+    // Location: https://github.com/{REPO}/releases/tag/v0.1.1
+    let tag = location
+        .rsplit('/')
+        .next()
+        .ok_or("cannot parse tag from redirect URL")?;
 
-    let latest = release
-        .tag_name
-        .strip_prefix('v')
-        .unwrap_or(&release.tag_name);
+    let latest = tag.strip_prefix('v').unwrap_or(tag);
     let has_update = version_newer(latest, current);
 
     Ok(UpdateInfo {
         current_version: current.to_string(),
         latest_version: latest.to_string(),
         has_update,
-        release_url: release.html_url,
-        release_notes: release.body.unwrap_or_default(),
+        release_url: location.to_string(),
+        release_notes: String::new(),
     })
 }
 
 /// Download a release asset by name and save it to `dest`. Returns bytes written.
 pub async fn download_asset(tag: &str, asset_name: &str, dest: &Path) -> Result<u64, String> {
-    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{tag}");
+    let url = format!(
+        "https://github.com/{GITHUB_REPO}/releases/download/{tag}/{asset_name}"
+    );
 
     let client = reqwest::Client::builder()
         .timeout(DOWNLOAD_TIMEOUT)
@@ -92,29 +78,8 @@ pub async fn download_asset(tag: &str, asset_name: &str, dest: &Path) -> Result<
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("fetch release: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("GitHub API returned {}", resp.status()));
-    }
-
-    let release: GhRelease = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse release JSON: {e}"))?;
-
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == asset_name)
-        .ok_or_else(|| format!("asset '{asset_name}' not found in release {tag}"))?;
-
     let dl_resp = client
-        .get(&asset.browser_download_url)
+        .get(&url)
         .send()
         .await
         .map_err(|e| format!("download asset: {e}"))?;
