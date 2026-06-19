@@ -88,8 +88,17 @@ else
   echo "[3/4] 跳过 GeoCN IP 库下载 (--no-geocn)"
 fi
 
-# 安装 systemd 服务
-if [[ "$SKIP_SYSTEMD" == "false" ]]; then
+# 安装服务 (自动检测 systemd / OpenRC / 裸跑)
+PANEL_CMD="/usr/local/bin/panel serve --db sqlite://$DATA_DIR/panel.db --http $HTTP_BIND --dns-port $DNS_PORT --geocn $DATA_DIR/GeoCN.mmdb --key-file $DATA_DIR/panel.key --cert-dir $DATA_DIR/certs --agent-bin-dir $DATA_DIR/dist"
+
+if [[ "$SKIP_SYSTEMD" == "true" ]]; then
+  echo ""
+  echo "[4/4] 跳过服务安装 (--no-systemd)"
+  echo ""
+  echo "手动启动:"
+  echo "  $PANEL_CMD"
+elif command -v systemctl &>/dev/null && systemctl --version &>/dev/null 2>&1; then
+  # systemd
   echo ""
   echo "[4/4] 安装 systemd 服务..."
   cat > /etc/systemd/system/multiproxy-panel.service <<EOF
@@ -100,14 +109,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/panel serve \\
-  --db "sqlite://$DATA_DIR/panel.db" \\
-  --http "$HTTP_BIND" \\
-  --dns-port $DNS_PORT \\
-  --geocn "$DATA_DIR/GeoCN.mmdb" \\
-  --key-file "$DATA_DIR/panel.key" \\
-  --cert-dir "$DATA_DIR/certs" \\
-  --agent-bin-dir "$DATA_DIR/dist"
+ExecStart=$PANEL_CMD
 Restart=always
 RestartSec=5
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -116,16 +118,45 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
   systemctl enable --now multiproxy-panel
-  echo "  ✓ 服务已启动: multiproxy-panel.service"
+  echo "  ✓ 服务已启动: multiproxy-panel.service (systemd)"
+elif command -v rc-service &>/dev/null; then
+  # OpenRC (Alpine)
+  echo ""
+  echo "[4/4] 安装 OpenRC 服务..."
+  cat > /etc/init.d/multiproxy-panel <<'INITEOF'
+#!/sbin/openrc-run
+
+name="multiproxy-panel"
+description="multiProxy Panel"
+command="/usr/local/bin/panel"
+command_args="serve --db sqlite://DATADIR/panel.db --http HTTPBIND --dns-port DNSPORT --geocn DATADIR/GeoCN.mmdb --key-file DATADIR/panel.key --cert-dir DATADIR/certs --agent-bin-dir DATADIR/dist"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/multiproxy-panel.log"
+error_log="/var/log/multiproxy-panel.log"
+
+depend() {
+    need net
+    after firewall
+}
+INITEOF
+  # 替换占位符
+  sed -i "s|DATADIR|$DATA_DIR|g; s|HTTPBIND|$HTTP_BIND|g; s|DNSPORT|$DNS_PORT|g" /etc/init.d/multiproxy-panel
+  chmod +x /etc/init.d/multiproxy-panel
+  rc-update add multiproxy-panel default
+  rc-service multiproxy-panel start
+  echo "  ✓ 服务已启动: multiproxy-panel (OpenRC)"
 else
+  # 无服务管理器,用 nohup 后台跑
   echo ""
-  echo "[4/4] 跳过 systemd 安装 (--no-systemd)"
-  echo ""
-  echo "手动启动:"
-  echo "  panel serve --db sqlite://$DATA_DIR/panel.db --dns-port $DNS_PORT --geocn $DATA_DIR/GeoCN.mmdb --key-file $DATA_DIR/panel.key"
+  echo "[4/4] 未检测到 systemd 或 OpenRC,使用 nohup 后台启动..."
+  nohup $PANEL_CMD > /var/log/multiproxy-panel.log 2>&1 &
+  echo $! > /run/multiproxy-panel.pid
+  echo "  ✓ 已后台启动 (PID: $!)"
+  echo "  日志: /var/log/multiproxy-panel.log"
+  echo "  停止: kill \$(cat /run/multiproxy-panel.pid)"
 fi
 
 echo ""

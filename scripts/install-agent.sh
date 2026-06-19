@@ -77,8 +77,17 @@ fi
 # 创建配置目录
 mkdir -p "$CONFIG_DIR"
 
-# 安装 systemd 服务
-if [[ "$SKIP_SYSTEMD" == "false" ]]; then
+# 安装服务 (自动检测 systemd / OpenRC / 裸跑)
+AGENT_CMD="/usr/local/bin/agent --panel-url \"$PANEL_URL\" --node-id \"$NODE_ID\" --token \"$TOKEN\" --config-dir \"$CONFIG_DIR\""
+
+if [[ "$SKIP_SYSTEMD" == "true" ]]; then
+  echo ""
+  echo "[3/3] 跳过服务安装 (--no-systemd)"
+  echo ""
+  echo "手动启动:"
+  echo "  $AGENT_CMD"
+elif command -v systemctl &>/dev/null && systemctl --version &>/dev/null 2>&1; then
+  # systemd
   echo ""
   echo "[3/3] 安装 systemd 服务..."
   cat > /etc/systemd/system/multiproxy-agent.service <<EOF
@@ -101,16 +110,48 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
   systemctl enable --now multiproxy-agent
-  echo "  ✓ 服务已启动: multiproxy-agent.service"
+  echo "  ✓ 服务已启动: multiproxy-agent.service (systemd)"
+elif command -v rc-service &>/dev/null; then
+  # OpenRC (Alpine)
+  echo ""
+  echo "[3/3] 安装 OpenRC 服务..."
+  cat > /etc/init.d/multiproxy-agent <<INITEOF
+#!/sbin/openrc-run
+
+name="multiproxy-agent"
+description="multiProxy Agent"
+command="/usr/local/bin/agent"
+command_args="--panel-url $PANEL_URL --node-id $NODE_ID --token $TOKEN --config-dir $CONFIG_DIR"
+command_background=true
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="/var/log/multiproxy-agent.log"
+error_log="/var/log/multiproxy-agent.log"
+
+depend() {
+    need net
+    after firewall
+}
+INITEOF
+  chmod +x /etc/init.d/multiproxy-agent
+  rc-update add multiproxy-agent default
+  rc-service multiproxy-agent start
+  echo "  ✓ 服务已启动: multiproxy-agent (OpenRC)"
 else
+  # 无服务管理器,用 nohup 后台跑
   echo ""
-  echo "[3/3] 跳过 systemd 安装 (--no-systemd)"
-  echo ""
-  echo "手动启动:"
-  echo "  agent --panel-url \"$PANEL_URL\" --node-id \"$NODE_ID\" --token \"$TOKEN\" --config-dir \"$CONFIG_DIR\""
+  echo "[3/3] 未检测到 systemd 或 OpenRC,使用 nohup 后台启动..."
+  nohup /usr/local/bin/agent \
+    --panel-url "$PANEL_URL" \
+    --node-id "$NODE_ID" \
+    --token "$TOKEN" \
+    --config-dir "$CONFIG_DIR" \
+    > /var/log/multiproxy-agent.log 2>&1 &
+  echo $! > /run/multiproxy-agent.pid
+  echo "  ✓ 已后台启动 (PID: $!)"
+  echo "  日志: /var/log/multiproxy-agent.log"
+  echo "  停止: kill \$(cat /run/multiproxy-agent.pid)"
 fi
 
 echo ""
