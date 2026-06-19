@@ -35,7 +35,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Start the panel (web UI/API + GeoDNS). This is the default mode.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// One-time admin user creation + DB migration.
     Init(InitArgs),
     /// Download and validate a GeoCN.mmdb file.
@@ -157,7 +157,7 @@ async fn main() {
 
     match cli.command {
         Some(Command::Init(args)) => run_init(args).await,
-        Some(Command::Serve(args)) => run_serve(args).await,
+        Some(Command::Serve(args)) => run_serve(*args).await,
         Some(Command::FetchGeocn(args)) => run_fetch_geocn(args).await,
         None => run_serve(ServeArgs::parse()).await,
     }
