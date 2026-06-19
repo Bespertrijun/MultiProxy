@@ -1875,7 +1875,7 @@ function buildInstallCmd(nodeId, token) {
   var proto = location.protocol === 'https:' ? 'wss' : 'ws';
   var panelUrl = proto + '://' + location.host + '/agent';
   var tokenStr = token || '<YOUR_TOKEN>';
-  return 'curl -sL https://' + location.host + '/install.sh | bash -s -- \\\n  --panel-url ' + panelUrl + ' \\\n  --node-id ' + nodeId + ' --token ' + tokenStr;
+  return 'curl -sL https://github.com/Bespertrijun/MultiProxy/releases/latest/download/install-agent.sh | bash -s -- \\\n  --panel-url ' + panelUrl + ' \\\n  --node-id ' + nodeId + ' --token ' + tokenStr;
 }
 
 function showInstallCmd(nodeId) {

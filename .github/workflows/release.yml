@@ -47,9 +47,11 @@ jobs:
     needs: [build, build-panel]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+      - run: cp scripts/install-panel.sh install-panel.sh && cp scripts/install-agent.sh install-agent.sh
       - run: ls -lh
       - uses: softprops/action-gh-release@v2
         with:
@@ -57,4 +59,6 @@ jobs:
             panel-linux-x86_64
             agent-linux-x86_64
             agent-linux-aarch64
+            install-panel.sh
+            install-agent.sh
           generate_release_notes: true
