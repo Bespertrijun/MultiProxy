@@ -1,0 +1,90 @@
+# docker-compose.yml — run the multiProxy panel (management + GeoDNS) on a
+# dedicated non-NAT public-IP host.
+#
+# ============================================================================
+# WHY network_mode: host  (this is the plan's RECOMMENDED production mode)
+# ============================================================================
+# The GeoDNS uses the DNS client's source IP for the "no-ECS fallback" geolocation
+# path (when a recursor does NOT send an EDNS Client Subnet option, the server
+# geolocates the recursor's own source IP instead).
+#
+# Docker's DEFAULT bridge networking with userland-proxy enabled REWRITES the
+# source IP of inbound UDP/53 packets to the bridge gateway (e.g. 172.17.0.1).
+# That silently corrupts the no-ECS fallback: the GeoDNS would geolocate the
+# Docker gateway, not the real recursor, and hand back the wrong line group.
+#
+# `network_mode: host` makes the panel bind the host's interfaces directly, so the
+# real recursor source IP reaches the GeoDNS intact, and :53 (udp+tcp) is clean.
+# This is the most reliable mode for a production authoritative DNS server.
+#
+# Alternatives if you cannot use host networking:
+#   * Set the Docker daemon flag  "userland-proxy": false  (iptables DNAT only),
+#     which preserves the source IP for non-loopback traffic — then you can use
+#     published ports below instead of host mode.
+#   * Accept that the source-IP fallback is unreliable under default NAT and rely
+#     on ECS (most mainland-China public recursors DO send ECS).
+#
+# ============================================================================
+# :53 binding (privileged port)
+# ============================================================================
+# Binding udp/tcp 53 needs either CAP_NET_BIND_SERVICE (preferred — granted via
+# cap_add below; with host networking the capability is honored against the host
+# :53), root, or a host with `sysctl net.ipv4.ip_unprivileged_port_start=53`.
+# Also free any local resolver (e.g. stop/relocate systemd-resolved off :53)
+# before starting, since host mode shares the host's port space.
+#
+# ============================================================================
+
+services:
+  panel:
+    image: ${PANEL_IMAGE:-multiproxy/panel:latest}
+    # Build locally instead of pulling: `docker compose build`.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.panel
+    container_name: multiproxy-panel
+    restart: unless-stopped
+
+    # RECOMMENDED: host networking preserves the recursor source IP for the
+    # no-ECS fallback and gives a clean :53. With host mode the `ports:` block is
+    # ignored (the container shares the host network namespace).
+    network_mode: host
+
+    # Grant the privileged-port bind capability without running as root.
+    cap_add:
+      - NET_BIND_SERVICE
+
+    environment:
+      # Env vars are read as fallback by clap (see `panel serve --help`).
+      PANEL_DB: "sqlite:///data/panel.db"      # SQLite URL (bundled libsqlite3)
+      PANEL_HTTP: "0.0.0.0:8080"               # web UI/API bind (front behind TLS proxy)
+      PANEL_DNS_ADDR: "0.0.0.0"                # GeoDNS bind addr
+      PANEL_DNS_PORT: "53"                     # GeoDNS port (udp+tcp)
+      PANEL_GEOCN: "/data/GeoCN.mmdb"          # GeoCN MMDB path (optional; absent → SERVFAIL until loaded)
+      PANEL_TTL: "30"                          # resolution A-record TTL secs (Q4 default 30)
+      RUST_LOG: "info"
+      # Admin user is created separately via `panel init`:
+      #   docker compose run panel panel init --admin-pass "my-strong-password"
+      # Run this ONCE before `docker compose up`.
+
+    volumes:
+      # Persist the SQLite DB and the GeoCN.mmdb across container re-creation.
+      - panel-data:/data
+      # Mount a host copy of GeoCN.mmdb read-only (hot-swappable on the host):
+      - ./GeoCN.mmdb:/data/GeoCN.mmdb:ro
+
+  # ----------------------------------------------------------------------------
+  # PUBLISHED-PORTS variant (only if you CANNOT use host networking):
+  #   1. Remove `network_mode: host` above.
+  #   2. Set "userland-proxy": false in /etc/docker/daemon.json (preserves source
+  #      IP via iptables DNAT) — REQUIRED so the no-ECS fallback stays correct.
+  #   3. Uncomment the ports block:
+  #
+  #   ports:
+  #     - "53:53/udp"
+  #     - "53:53/tcp"
+  #     - "8080:8080/tcp"
+  # ----------------------------------------------------------------------------
+
+volumes:
+  panel-data:

@@ -1,0 +1,26 @@
+{
+  "services": [
+    {
+      "addr": ":443",
+      "forwarder": {
+        "nodes": [
+          {
+            "addr": "10.0.0.5:8096",
+            "name": "target"
+          }
+        ]
+      },
+      "handler": {
+        "type": "tcp"
+      },
+      "listener": {
+        "tls": {
+          "certFile": "/etc/multiproxy/tls.crt",
+          "keyFile": "/etc/multiproxy/tls.key"
+        },
+        "type": "tls"
+      },
+      "name": "svc-tcp-443"
+    }
+  ]
+}

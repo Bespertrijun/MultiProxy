@@ -1,0 +1,12 @@
+[network]
+no_tcp = false
+use_udp = true
+
+[[endpoints]]
+listen = "0.0.0.0:5353"
+remote = "10.0.0.9:53"
+udp = true
+
+[[endpoints]]
+listen = "0.0.0.0:9000"
+remote = "10.0.0.9:8096"

@@ -1,0 +1,12 @@
+/target
+/dist
+.omc/
+.claude/
+**/*.rs.bk
+*.pdb
+# local DB + GeoCN data (mounted at deploy)
+/deploy/data/*.db
+/deploy/data/*.mmdb
+/frontend/dist
+/frontend/node_modules
+.env

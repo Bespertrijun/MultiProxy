@@ -1,0 +1,67 @@
+[package]
+name = "panel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Management plane: CRUD/auth/config-render + WS reverse-server + health/capacity scheduler + in-process GeoDNS (Line A + Line C)."
+
+[[bin]]
+name = "panel"
+path = "src/main.rs"
+
+[lib]
+name = "panel"
+path = "src/lib.rs"
+
+[dependencies]
+contract = { workspace = true }
+geoip = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "set-header"] }
+
+# SQLite via sqlx with the BUNDLED libsqlite3 (no external .so) — AC, plan task 1.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+] }
+
+argon2 = "0.5"
+# Node-token hashing uses SHA-256 + a constant-time compare (subtle), NOT argon2:
+# agent tokens are 122-bit-random, so a fast hash is sufficient and avoids an
+# argon2-per-Hello CPU/mem DoS on the management runtime. argon2 stays ONLY for
+# PanelUser passwords (which are low-entropy and need the slow KDF).
+sha2 = "0.10"
+subtle = "2"
+rand = "0.8"
+
+arc-swap = "1.7"
+rust-embed = { version = "8", features = ["debug-embed"] }
+
+# Line C — embedded GeoDNS. Pinned per D4 / MINOR-8 (co-versioned at 0.26.1 here).
+hickory-server = "=0.26.1"
+hickory-proto = "=0.26.1"
+async-trait = "0.1"
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive", "env"] }
+uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ACME / Cloudflare / TLS cert issuance
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
+aes-gcm = "0.10"
+base64 = "0.22"
+# x509-parser for reading cert expiry from PEM
+x509-parser = "0.17"
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }

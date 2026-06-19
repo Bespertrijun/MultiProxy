@@ -1,0 +1,40 @@
+{
+  "services": [
+    {
+      "addr": ":8080",
+      "forwarder": {
+        "nodes": [
+          {
+            "addr": "10.0.0.5:8096",
+            "name": "target"
+          }
+        ]
+      },
+      "handler": {
+        "type": "tcp"
+      },
+      "listener": {
+        "type": "tcp"
+      },
+      "name": "svc-tcp-8080"
+    },
+    {
+      "addr": ":8443",
+      "forwarder": {
+        "nodes": [
+          {
+            "addr": "10.0.0.5:8096",
+            "name": "target"
+          }
+        ]
+      },
+      "handler": {
+        "type": "tcp"
+      },
+      "listener": {
+        "type": "tcp"
+      },
+      "name": "svc-tcp-8443"
+    }
+  ]
+}

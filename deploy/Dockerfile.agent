@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile.agent — OPTIONAL minimal container for the multiProxy node agent.
+#
+# The agent is normally deployed as a single static musl binary copied straight
+# onto the NAT node (see agent-install.md) — it needs no runtime deps. This image
+# is only for operators who prefer to run the agent in a container.
+#
+# IMPORTANT: the agent supervises the node's gost/realm forwarding child, which on
+# a NAT node must bind the node's forwarded port range and reach the LAN/host
+# network. In a container that almost always means HOST networking. Prefer the
+# bare-binary install (agent-install.md) on NAT nodes; use this image only if you
+# understand the networking implications.
+#
+# The build copies the pre-built static binary in (build it per arch with
+# cargo-zigbuild first — see crates/agent/BUILD.md), so this Dockerfile does NOT
+# compile Rust. Pass the matching-arch binary via the build arg.
+#
+# Build (after producing target/<triple>/release/agent):
+#   # amd64 node:
+#   docker build -f deploy/Dockerfile.agent \
+#     --build-arg AGENT_BIN=target/x86_64-unknown-linux-musl/release/agent \
+#     -t <repo>/agent:amd64 .
+#   # arm64 node:
+#   docker build -f deploy/Dockerfile.agent \
+#     --build-arg AGENT_BIN=target/aarch64-unknown-linux-musl/release/agent \
+#     -t <repo>/agent:arm64 .
+#
+# Or build a multi-arch manifest with buildx (see crates/agent/BUILD.md §"Multi-arch").
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+# Path (relative to the build context) of the pre-built static musl binary for the
+# target arch. The binary is fully static (ldd → "not a dynamic executable"), so
+# the distroless/static base is sufficient — no libc, no shell.
+ARG AGENT_BIN=target/x86_64-unknown-linux-musl/release/agent
+
+COPY ${AGENT_BIN} /usr/local/bin/agent
+
+# Required env (see crates/agent/src/main.rs). Provide at run time:
+#   AGENT_PANEL_URL   wss://panel.example.com/agent   (required)
+#   AGENT_NODE_ID     <the node id created in the panel> (required)
+#   AGENT_TOKEN       <the per-node token shown once in the panel> (required)
+#   AGENT_CONFIG_DIR  where gost/realm config is written (default /etc/multiproxy)
+#   AGENT_BACKEND_HOST / AGENT_BACKEND_PORT  Emby backend to probe (default 127.0.0.1:8096)
+ENV AGENT_CONFIG_DIR="/etc/multiproxy"
+
+ENTRYPOINT ["/usr/local/bin/agent"]

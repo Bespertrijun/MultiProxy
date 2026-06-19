@@ -1,0 +1,583 @@
+//! Health + capacity scheduler (Line A task 6 / 6b).
+//!
+//! Combines control-channel freshness (window = `2 × heartbeat + slack`) + agent
+//! self-report → classifies each node into an [`ExclusionClass`] → builds an
+//! [`AvailabilitySnapshot`] via the canonical [`select_available`] (two-tier
+//! fallback, Rec#1) → `ArcSwap::store`. Also the capacity engine: reset-aware
+//! `counter_epoch` delta accumulation (equality-only, Rec#3), persist-on-every-report
+//! (Rec#2), soft(90%)/hard(100%) quota classification, saturation debounce
+//! (85%/3win enter, 70%/3win exit), and `quota_reset_day` rollover.
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use contract::model::{AvailabilityState, FrontNode, LineGroup, NodeStatus, SaturationState};
+use contract::protocol::{Capacity, StatusReport};
+use contract::snapshot::{
+    select_available, AvailabilitySnapshot, ExclusionClass, LineAvailability, NodeClassification,
+};
+
+use crate::db::CapacityState;
+
+/// Freshness slack added on top of `2 × heartbeat_interval` (gap 7.3).
+pub const FRESHNESS_SLACK_SECS: u64 = 5;
+
+/// Saturation debounce defaults (rev3 §D / Q10).
+pub const SAT_ENTER_PCT: u8 = 85;
+pub const SAT_EXIT_PCT: u8 = 70;
+pub const SAT_WINDOWS: u8 = 3;
+
+/// Live, per-node observed state the scheduler tracks in memory between reports.
+#[derive(Debug, Clone, Default)]
+pub struct NodeRuntime {
+    /// Last time (unix-millis) a heartbeat/report arrived (control-channel freshness).
+    pub last_contact_ms: u64,
+    /// Whether the agent currently reports its forwarding+backend up.
+    pub forwarding_up: bool,
+    pub backend_reachable: bool,
+    /// Whether the control channel is currently considered connected.
+    pub connected: bool,
+    /// Capacity accounting state (mirrors persisted columns).
+    pub capacity: CapacityState,
+    pub throughput_bps: u64,
+    pub saturation: SaturationState,
+    /// Consecutive-window counters for saturation debounce hysteresis.
+    pub sat_enter_windows: u8,
+    pub sat_exit_windows: u8,
+}
+
+/// Compute the freshness window for a heartbeat interval: `2*interval + slack`.
+#[must_use]
+pub fn freshness_window_secs(heartbeat_interval_secs: u32) -> u64 {
+    2 * u64::from(heartbeat_interval_secs) + FRESHNESS_SLACK_SECS
+}
+
+/// Outcome of ingesting a capacity report: the new accounting state + derived runtime.
+#[derive(Debug, Clone)]
+pub struct CapacityOutcome {
+    pub state: CapacityState,
+    pub throughput_bps: u64,
+    pub saturation: SaturationState,
+    /// Whether a counter-epoch reset (or non-monotonic drop) was detected this report.
+    pub reset_detected: bool,
+}
+
+/// Apply one [`Capacity`] report to the prior [`CapacityState`] using reset-aware
+/// delta accumulation (rev3 §A / Rec#3).
+///
+/// Reset detection is **equality-only** on `counter_epoch` (`epoch != last_epoch`),
+/// never an ordering comparison — robust to a reinstalled agent picking a lower or
+/// random epoch. A non-monotonic counter drop within the same epoch is also treated
+/// as a reset (NIC wrap / counter restart). Only positive deltas accumulate; usage
+/// can only ever under-count, never over-count (fail-safe toward availability).
+#[must_use]
+pub fn apply_capacity(
+    prior: &CapacityState,
+    saturation_in: SaturationState,
+    sat_enter_windows: &mut u8,
+    sat_exit_windows: &mut u8,
+    bandwidth_cap_mbps: Option<u32>,
+    cap: &Capacity,
+) -> CapacityOutcome {
+    let mut state = prior.clone();
+    let mut reset_detected = false;
+
+    let epoch_changed = !prior.has_counter_baseline || cap.counter_epoch != prior.counter_epoch;
+    if epoch_changed {
+        // New epoch (or first ever report): establish baseline, accumulate nothing now.
+        reset_detected = prior.has_counter_baseline;
+        state.counter_epoch = cap.counter_epoch;
+        state.last_tx_bytes_total = cap.tx_bytes_total;
+        state.last_rx_bytes_total = cap.rx_bytes_total;
+        state.has_counter_baseline = true;
+    } else {
+        // Same epoch: accumulate positive deltas only; a drop = within-epoch reset.
+        let tx_delta = cap.tx_bytes_total.checked_sub(prior.last_tx_bytes_total);
+        let rx_delta = cap.rx_bytes_total.checked_sub(prior.last_rx_bytes_total);
+        match (tx_delta, rx_delta) {
+            (Some(tx), Some(rx)) => {
+                state.accumulated_usage_bytes = state
+                    .accumulated_usage_bytes
+                    .saturating_add(tx)
+                    .saturating_add(rx);
+                state.last_tx_bytes_total = cap.tx_bytes_total;
+                state.last_rx_bytes_total = cap.rx_bytes_total;
+            }
+            _ => {
+                // Non-monotonic drop → counter reset within the same epoch; re-baseline.
+                reset_detected = true;
+                state.last_tx_bytes_total = cap.tx_bytes_total;
+                state.last_rx_bytes_total = cap.rx_bytes_total;
+            }
+        }
+    }
+
+    // Saturation debounce hysteresis (rev3 §D).
+    let saturation = debounce_saturation(
+        saturation_in,
+        cap.throughput_bps,
+        bandwidth_cap_mbps,
+        sat_enter_windows,
+        sat_exit_windows,
+    );
+
+    CapacityOutcome {
+        state,
+        throughput_bps: cap.throughput_bps,
+        saturation,
+        reset_detected,
+    }
+}
+
+/// Saturation debounce state machine (rev3 §D / Scenario ⑤). Enter after
+/// [`SAT_WINDOWS`] consecutive windows ≥ [`SAT_ENTER_PCT`]; exit after
+/// [`SAT_WINDOWS`] consecutive windows < [`SAT_EXIT_PCT`]. Returns the new state.
+#[must_use]
+pub fn debounce_saturation(
+    current: SaturationState,
+    throughput_bps: u64,
+    bandwidth_cap_mbps: Option<u32>,
+    enter_windows: &mut u8,
+    exit_windows: &mut u8,
+) -> SaturationState {
+    let Some(cap_mbps) = bandwidth_cap_mbps else {
+        // No bandwidth cap configured → saturation tracking disabled.
+        *enter_windows = 0;
+        *exit_windows = 0;
+        return SaturationState::Normal;
+    };
+    let cap_bps = u64::from(cap_mbps) * 1_000_000 / 8; // Mbps → bytes/sec
+    if cap_bps == 0 {
+        return SaturationState::Normal;
+    }
+    let pct = (throughput_bps.saturating_mul(100) / cap_bps).min(255) as u8;
+
+    match current {
+        SaturationState::Normal => {
+            if pct >= SAT_ENTER_PCT {
+                *enter_windows = enter_windows.saturating_add(1);
+            } else {
+                *enter_windows = 0;
+            }
+            *exit_windows = 0;
+            if *enter_windows >= SAT_WINDOWS {
+                *enter_windows = 0;
+                SaturationState::Saturated
+            } else {
+                SaturationState::Normal
+            }
+        }
+        SaturationState::Saturated => {
+            if pct < SAT_EXIT_PCT {
+                *exit_windows = exit_windows.saturating_add(1);
+            } else {
+                *exit_windows = 0;
+            }
+            *enter_windows = 0;
+            if *exit_windows >= SAT_WINDOWS {
+                *exit_windows = 0;
+                SaturationState::Normal
+            } else {
+                SaturationState::Saturated
+            }
+        }
+    }
+}
+
+/// Classify a single node into its [`ExclusionClass`] from health + capacity inputs
+/// (the two-tier taxonomy; Line-0 task 5). Order of precedence:
+/// unhealthy/hard-quota (hard) > soft-quota/saturated (soft) > included.
+#[must_use]
+pub fn classify_node(
+    node: &FrontNode,
+    rt: &NodeRuntime,
+    now_ms: u64,
+    heartbeat_interval: u32,
+) -> ExclusionClass {
+    // Health: control-channel fresh AND agent reports forwarding+backend up.
+    let window_ms = freshness_window_secs(heartbeat_interval) * 1000;
+    let fresh = rt.connected && now_ms.saturating_sub(rt.last_contact_ms) <= window_ms;
+    let healthy = fresh && rt.forwarding_up && rt.backend_reachable;
+    if !healthy {
+        return ExclusionClass::Unhealthy;
+    }
+
+    // Quota: hard exclusion at hard%, soft exclusion at soft%.
+    if let (Some(quota), pct_hard, pct_soft) = (
+        node.traffic_quota_bytes,
+        node.hard_quota_pct,
+        node.soft_quota_pct,
+    ) {
+        if quota > 0 {
+            let used = rt.capacity.accumulated_usage_bytes;
+            let hard_threshold = quota.saturating_mul(u64::from(pct_hard)) / 100;
+            let soft_threshold = quota.saturating_mul(u64::from(pct_soft)) / 100;
+            if used >= hard_threshold {
+                return ExclusionClass::HardQuota;
+            }
+            if used >= soft_threshold {
+                return ExclusionClass::SoftQuota;
+            }
+        }
+    }
+
+    // Saturation (soft exclusion).
+    if rt.saturation == SaturationState::Saturated {
+        return ExclusionClass::Saturated;
+    }
+
+    ExclusionClass::Included
+}
+
+/// Map an [`ExclusionClass`] to the persisted [`AvailabilityState`] (observability).
+#[must_use]
+pub fn availability_state_for(class: ExclusionClass) -> AvailabilityState {
+    if class.is_included() {
+        AvailabilityState::Available
+    } else if class.is_soft() {
+        AvailabilityState::SoftExcluded
+    } else {
+        AvailabilityState::HardExcluded
+    }
+}
+
+/// Build an [`AvailabilitySnapshot`] from the current nodes, their runtime, and the
+/// line groups. Each line's `available` set is two-tier-resolved via
+/// [`select_available`]; the per-node classification rides along for observability.
+#[must_use]
+pub fn build_snapshot(
+    nodes: &HashMap<String, FrontNode>,
+    runtimes: &HashMap<String, NodeRuntime>,
+    groups: &[LineGroup],
+    generation: u64,
+    now_ms: u64,
+    heartbeat_interval: u32,
+) -> AvailabilitySnapshot {
+    let mut lines = HashMap::new();
+    for g in groups {
+        let mut classified: Vec<(IpAddr, ExclusionClass)> = Vec::new();
+        for node_id in &g.member_node_ids {
+            let Some(node) = nodes.get(node_id) else {
+                continue;
+            };
+            let Ok(ip) = node.public_ip.parse::<IpAddr>() else {
+                continue;
+            };
+            let rt = runtimes.get(node_id).cloned().unwrap_or_default();
+            let class = classify_node(node, &rt, now_ms, heartbeat_interval);
+            classified.push((ip, class));
+        }
+        let available = select_available(&classified);
+        let line = LineAvailability {
+            available,
+            fallback_group: g.fallback_group.clone(),
+            classified: classified
+                .into_iter()
+                .map(|(ip, class)| NodeClassification { ip, class })
+                .collect(),
+        };
+        lines.insert(g.id.clone(), line);
+    }
+    AvailabilitySnapshot {
+        generation,
+        built_at: now_ms,
+        lines,
+    }
+}
+
+/// Whether the calendar day-of-month equals a node's `quota_reset_day` (rollover).
+#[must_use]
+pub fn is_quota_reset_day(quota_reset_day: Option<u8>, day_of_month: u8) -> bool {
+    quota_reset_day.is_some_and(|d| d == day_of_month)
+}
+
+/// Update a node's in-memory health runtime from a fresh `StatusReport`.
+pub fn apply_status_report(rt: &mut NodeRuntime, report: &StatusReport, now_ms: u64) {
+    rt.last_contact_ms = now_ms;
+    rt.connected = true;
+    rt.forwarding_up = report.forwarding_up;
+    rt.backend_reachable = report.backend_reachable;
+}
+
+/// Shared, atomically-swappable snapshot handle (the scheduler↔resolver coupling
+/// surface, MAJOR-5). The scheduler stores; the DNS resolver loads lock-free.
+pub type SnapshotHandle = Arc<ArcSwap<AvailabilitySnapshot>>;
+
+/// Build a fresh snapshot handle initialized to an empty snapshot.
+#[must_use]
+pub fn new_snapshot_handle() -> SnapshotHandle {
+    Arc::new(ArcSwap::from_pointee(AvailabilitySnapshot::default()))
+}
+
+/// Convenience: classify all nodes and persist `NodeStatus` online/offline back onto
+/// the node records (used by the API/UI health view, AC-5). Pure — returns the
+/// updated status, the caller persists.
+// wired in M2 (AC-5): no caller in M1; kept as scaffolding for the persisted
+// NodeStatus write-back path.
+#[must_use]
+pub fn node_status_from_runtime(
+    rt: &NodeRuntime,
+    now_ms: u64,
+    heartbeat_interval: u32,
+) -> NodeStatus {
+    let window_ms = freshness_window_secs(heartbeat_interval) * 1000;
+    if rt.connected && now_ms.saturating_sub(rt.last_contact_ms) <= window_ms {
+        NodeStatus::Online
+    } else {
+        NodeStatus::Offline
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contract::isp::Isp;
+    use contract::model::Region;
+    use contract::protocol::CapacitySource;
+    use std::net::Ipv4Addr;
+
+    fn node(id: &str, ip: &str, quota: Option<u64>) -> FrontNode {
+        FrontNode {
+            id: id.into(),
+            name: id.into(),
+            public_ip: ip.into(),
+            region: Region::unknown(),
+            isp: Isp::Unknown,
+            status: NodeStatus::Unknown,
+            last_seen: 0,
+            desired_config_gen: 0,
+            applied_config_gen: 0,
+            bandwidth_cap_mbps: Some(100),
+            traffic_quota_bytes: quota,
+            quota_reset_day: Some(1),
+            soft_quota_pct: 90,
+            hard_quota_pct: 100,
+            accumulated_usage_bytes: 0,
+            current_throughput_bps: 0,
+            saturation_state: SaturationState::Normal,
+            availability_state: AvailabilityState::Available,
+        }
+    }
+
+    fn healthy_rt(now: u64) -> NodeRuntime {
+        NodeRuntime {
+            last_contact_ms: now,
+            forwarding_up: true,
+            backend_reachable: true,
+            connected: true,
+            ..Default::default()
+        }
+    }
+
+    fn cap(epoch: u64, tx: u64, rx: u64, bps: u64) -> Capacity {
+        Capacity {
+            counter_epoch: epoch,
+            source: CapacitySource::ForwardBytes,
+            tx_bytes_total: tx,
+            rx_bytes_total: rx,
+            throughput_bps: bps,
+        }
+    }
+
+    #[test]
+    fn freshness_window_math() {
+        assert_eq!(freshness_window_secs(20), 45);
+    }
+
+    #[test]
+    fn first_report_baselines_no_accumulation() {
+        let prior = CapacityState::default();
+        let (mut e, mut x) = (0, 0);
+        let out = apply_capacity(
+            &prior,
+            SaturationState::Normal,
+            &mut e,
+            &mut x,
+            Some(100),
+            &cap(1, 1000, 2000, 0),
+        );
+        assert_eq!(out.state.accumulated_usage_bytes, 0);
+        assert!(out.state.has_counter_baseline);
+        assert!(!out.reset_detected);
+    }
+
+    #[test]
+    fn same_epoch_accumulates_positive_delta() {
+        let mut prior = CapacityState::default();
+        let (mut e, mut x) = (0, 0);
+        prior = apply_capacity(
+            &prior,
+            SaturationState::Normal,
+            &mut e,
+            &mut x,
+            Some(100),
+            &cap(1, 1000, 2000, 0),
+        )
+        .state;
+        let out = apply_capacity(
+            &prior,
+            SaturationState::Normal,
+            &mut e,
+            &mut x,
+            Some(100),
+            &cap(1, 1500, 2200, 0),
+        );
+        // delta tx=500 + rx=200 = 700
+        assert_eq!(out.state.accumulated_usage_bytes, 700);
+        assert!(!out.reset_detected);
+    }
+
+    #[test]
+    fn epoch_change_to_lower_value_is_reset_no_double_count() {
+        // Rec#3: a reinstalled agent picks a LOWER/random epoch — equality-only.
+        let mut prior = CapacityState::default();
+        let (mut e, mut x) = (0, 0);
+        prior = apply_capacity(
+            &prior,
+            SaturationState::Normal,
+            &mut e,
+            &mut x,
+            Some(100),
+            &cap(50, 9000, 1000, 0),
+        )
+        .state;
+        prior = apply_capacity(
+            &prior,
+            SaturationState::Normal,
+            &mut e,
+            &mut x,
+            Some(100),
+            &cap(50, 9500, 1000, 0),
+        )
+        .state;
+        assert_eq!(prior.accumulated_usage_bytes, 500);
+        // Agent reinstalled → epoch drops to 3, counters reset to small values.
+        let out = apply_capacity(
+            &prior,
+            SaturationState::Normal,
+            &mut e,
+            &mut x,
+            Some(100),
+            &cap(3, 10, 20, 0),
+        );
+        assert!(out.reset_detected);
+        // No double-count, no negative: accumulation unchanged (re-baselined).
+        assert_eq!(out.state.accumulated_usage_bytes, 500);
+        assert_eq!(out.state.counter_epoch, 3);
+    }
+
+    #[test]
+    fn within_epoch_counter_drop_is_reset() {
+        let mut prior = CapacityState::default();
+        let (mut e, mut x) = (0, 0);
+        prior = apply_capacity(
+            &prior,
+            SaturationState::Normal,
+            &mut e,
+            &mut x,
+            Some(100),
+            &cap(1, 1000, 1000, 0),
+        )
+        .state;
+        let out = apply_capacity(
+            &prior,
+            SaturationState::Normal,
+            &mut e,
+            &mut x,
+            Some(100),
+            &cap(1, 10, 10, 0),
+        );
+        assert!(out.reset_detected);
+        assert_eq!(out.state.accumulated_usage_bytes, 0);
+    }
+
+    #[test]
+    fn saturation_debounce_enter_and_exit() {
+        let cap_mbps = Some(100); // 100 Mbps = 12_500_000 B/s
+        let high = 11_000_000; // 88%
+        let low = 7_000_000; // 56%
+        let (mut e, mut x) = (0u8, 0u8);
+        let mut state = SaturationState::Normal;
+        // 2 windows high → still Normal (debounce).
+        state = debounce_saturation(state, high, cap_mbps, &mut e, &mut x);
+        state = debounce_saturation(state, high, cap_mbps, &mut e, &mut x);
+        assert_eq!(state, SaturationState::Normal);
+        // 3rd window high → Saturated.
+        state = debounce_saturation(state, high, cap_mbps, &mut e, &mut x);
+        assert_eq!(state, SaturationState::Saturated);
+        // 2 windows low → still Saturated.
+        state = debounce_saturation(state, low, cap_mbps, &mut e, &mut x);
+        state = debounce_saturation(state, low, cap_mbps, &mut e, &mut x);
+        assert_eq!(state, SaturationState::Saturated);
+        // 3rd low → back to Normal.
+        state = debounce_saturation(state, low, cap_mbps, &mut e, &mut x);
+        assert_eq!(state, SaturationState::Normal);
+    }
+
+    #[test]
+    fn brief_blip_does_not_flip() {
+        let (mut e, mut x) = (0u8, 0u8);
+        let mut state = SaturationState::Normal;
+        state = debounce_saturation(state, 11_000_000, Some(100), &mut e, &mut x); // high
+        state = debounce_saturation(state, 1_000_000, Some(100), &mut e, &mut x); // blip low resets counter
+        state = debounce_saturation(state, 11_000_000, Some(100), &mut e, &mut x); // high again
+        assert_eq!(state, SaturationState::Normal);
+    }
+
+    #[test]
+    fn classify_unhealthy_when_stale() {
+        let n = node("n1", "1.2.3.4", None);
+        let mut rt = healthy_rt(0);
+        rt.last_contact_ms = 0;
+        // now is way past the freshness window.
+        let class = classify_node(&n, &rt, 1_000_000, 20);
+        assert_eq!(class, ExclusionClass::Unhealthy);
+    }
+
+    #[test]
+    fn classify_hard_quota() {
+        let n = node("n1", "1.2.3.4", Some(1000));
+        let mut rt = healthy_rt(1000);
+        rt.capacity.accumulated_usage_bytes = 1000; // 100% → hard
+        let class = classify_node(&n, &rt, 1000, 20);
+        assert_eq!(class, ExclusionClass::HardQuota);
+    }
+
+    #[test]
+    fn classify_soft_quota() {
+        let n = node("n1", "1.2.3.4", Some(1000));
+        let mut rt = healthy_rt(1000);
+        rt.capacity.accumulated_usage_bytes = 950; // 95% ≥ 90% soft, < 100% hard
+        let class = classify_node(&n, &rt, 1000, 20);
+        assert_eq!(class, ExclusionClass::SoftQuota);
+    }
+
+    #[test]
+    fn snapshot_promotes_soft_over_blackout() {
+        // Scenario ⑥: one saturated node, rest unhealthy → saturated promoted.
+        let mut nodes = HashMap::new();
+        nodes.insert("n1".into(), node("n1", "10.0.0.1", None));
+        nodes.insert("n2".into(), node("n2", "10.0.0.2", None));
+        let mut rts = HashMap::new();
+        let mut rt1 = healthy_rt(1000);
+        rt1.saturation = SaturationState::Saturated;
+        rts.insert("n1".to_string(), rt1);
+        // n2 unhealthy (no runtime → default, not connected).
+        rts.insert("n2".to_string(), NodeRuntime::default());
+
+        let group = LineGroup {
+            id: "g1".into(),
+            name: "g1".into(),
+            match_region: None,
+            match_isp: None,
+            member_node_ids: vec!["n1".into(), "n2".into()],
+            priority: 0,
+            fallback_group: None,
+        };
+        let snap = build_snapshot(&nodes, &rts, &[group], 1, 1000, 20);
+        let avail = snap.available_for("g1");
+        assert_eq!(avail, &[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
+    }
+}

@@ -1,0 +1,95 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile.panel — multi-stage build for the multiProxy management panel.
+#
+# Stage 1 builds the `panel` release binary. The web frontend is embedded INTO the
+# binary at compile time via `rust-embed` (see crates/panel/src/ui.rs), so there is
+# no separate asset directory to copy into the runtime image — the single binary is
+# self-contained.
+#
+# Stage 2 is a minimal Debian-slim runtime. The panel links the BUNDLED libsqlite3
+# (sqlx `sqlite` + bundled feature) and the in-process GeoDNS (hickory) — no system
+# SQLite / DNS daemon is required. We use debian-slim (glibc) rather than scratch
+# because the panel is a glibc dynamic binary (it is NOT the static-musl agent).
+#
+# Multi-arch: build for linux/amd64 + linux/arm64 (panel/GeoDNS host may be ARM,
+# e.g. Oracle Ampere). The whole panel dep stack is pure-Rust / ARM-compilable
+# (hickory, axum, sqlx + bundled SQLite, rust-embed, maxminddb) — no x86-only dep:
+#
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     -f deploy/Dockerfile.panel -t <repo>/panel:<tag> --push .
+#
+# ----------------------------------------------------------------------------
+# Stage 1 — build
+# ----------------------------------------------------------------------------
+FROM rust:1.82-bookworm AS build
+
+WORKDIR /src
+
+# Copy the whole workspace (Cargo.lock pins the dep graph) and build the panel in
+# release. `debug-embed` on rust-embed is fine; the release build still embeds the
+# frontend from disk at compile time, so the assets must be present in the context.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Build only the panel binary in release.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p panel \
+    && cp /src/target/release/panel /usr/local/bin/panel
+
+# ----------------------------------------------------------------------------
+# Stage 2 — runtime
+# ----------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+# ca-certificates: the panel may later perform outbound TLS (e.g. ACME / fetching
+# a GeoCN.mmdb update); harmless to include and avoids a surprise on first TLS use.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Run as a non-root user. Binding :53 as non-root requires the
+# CAP_NET_BIND_SERVICE capability granted to the binary or the container (see the
+# note below and docker-compose.yml); the panel itself never needs root.
+RUN useradd --system --no-create-home --uid 10001 multiproxy
+
+COPY --from=build /usr/local/bin/panel /usr/local/bin/panel
+
+# Privileged-port (:53) binding without running as root:
+#   The cleanest option is to grant the binary CAP_NET_BIND_SERVICE so the
+#   non-root process can bind UDP/TCP 53. Uncomment if your base image ships
+#   `setcap` (libcap2-bin); otherwise grant the capability at the container level
+#   with `cap_add: [NET_BIND_SERVICE]` (compose) / `--cap-add=NET_BIND_SERVICE`,
+#   or run with host networking + a host that already permits the bind.
+#
+# RUN apt-get update && apt-get install -y --no-install-recommends libcap2-bin \
+#     && setcap 'cap_net_bind_service=+ep' /usr/local/bin/panel \
+#     && apt-get purge -y libcap2-bin && rm -rf /var/lib/apt/lists/*
+
+# Data dir for the SQLite DB and the (optional) GeoCN.mmdb. Declared as volumes so
+# the DB and geo database survive container re-creation.
+RUN mkdir -p /data && chown multiproxy:multiproxy /data
+VOLUME ["/data"]
+
+# Default config (override via env / compose / CLI flags). See `panel serve --help`.
+# Admin user must be created first: `panel init --admin-pass <PASSWORD>`
+ENV PANEL_DB="sqlite:///data/panel.db" \
+    PANEL_HTTP="0.0.0.0:8080" \
+    PANEL_DNS_ADDR="0.0.0.0" \
+    PANEL_DNS_PORT="53" \
+    PANEL_GEOCN="/data/GeoCN.mmdb" \
+    PANEL_TTL="30" \
+    RUST_LOG="info"
+
+# Resolution domain ① (GeoDNS) on 53/udp + 53/tcp; panel web UI/API on 8080.
+EXPOSE 53/udp
+EXPOSE 53/tcp
+EXPOSE 8080/tcp
+
+USER multiproxy
+
+# NOTE: this EXPOSE/USER setup is for bridge/published-port runs. Production DNS
+# should prefer host networking (see docker-compose.yml) so the recursor SOURCE IP
+# reaches the GeoDNS intact for the no-ECS fallback path.
+ENTRYPOINT ["/usr/local/bin/panel"]

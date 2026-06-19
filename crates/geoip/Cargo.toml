@@ -1,0 +1,15 @@
+[package]
+name = "geoip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GeoIpProvider trait + GeoCN(mmdb) impl (M1) + format-switch stub. Used by the panel's embedded GeoDNS."
+
+[dependencies]
+contract = { workspace = true }
+serde = { workspace = true }
+# Real GeoCN MMDB decode (D5 / CRITICAL-2 / Line C task 1).
+maxminddb = "0.28"
+# Hot-reload of the loaded provider (D5 / AC-10): swap the Arc<dyn GeoIpProvider>
+# atomically when the operator drops in a new DB file.
+arc-swap = "1.7"

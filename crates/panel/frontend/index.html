@@ -1,0 +1,1827 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MultiProxy Panel</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: {
+    extend: {
+      fontFamily: {
+        sans: ['JetBrains Mono', 'SF Mono', 'Cascadia Code', 'Menlo', 'monospace'],
+        display: ['system-ui', '-apple-system', 'Segoe UI', 'sans-serif'],
+      },
+      colors: {
+        panel: {
+          900: '#0b0e14',
+          800: '#111520',
+          700: '#171c2a',
+          600: '#1e2435',
+          500: '#2a3148',
+          400: '#3d4663',
+          300: '#6b7599',
+          200: '#9ca3bf',
+          100: '#c8cde0',
+        }
+      },
+      animation: {
+        'fade-in': 'fadeIn 0.3s ease-out',
+        'slide-up': 'slideUp 0.35s ease-out',
+        'slide-right': 'slideRight 0.3s ease-out',
+        'pulse-dot': 'pulseDot 2s ease-in-out infinite',
+      },
+      keyframes: {
+        fadeIn: { '0%': { opacity: '0' }, '100%': { opacity: '1' } },
+        slideUp: { '0%': { opacity: '0', transform: 'translateY(12px)' }, '100%': { opacity: '1', transform: 'translateY(0)' } },
+        slideRight: { '0%': { opacity: '0', transform: 'translateX(-12px)' }, '100%': { opacity: '1', transform: 'translateX(0)' } },
+        pulseDot: { '0%, 100%': { opacity: '1' }, '50%': { opacity: '0.4' } },
+      }
+    }
+  }
+}
+</script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: #0b0e14;
+    color: #c8cde0;
+    font-family: 'JetBrains Mono', 'SF Mono', monospace;
+    margin: 0;
+    min-height: 100vh;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #111520; }
+  ::-webkit-scrollbar-thumb { background: #2a3148; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3d4663; }
+
+  /* Smooth page transitions */
+  .page-section {
+    display: none;
+    animation: fadeIn 0.25s ease-out;
+  }
+  .page-section.active {
+    display: block;
+  }
+
+  /* Toast animations */
+  .toast-enter { animation: slideRight 0.3s ease-out; }
+  .toast-exit { animation: fadeOut 0.25s ease-in forwards; }
+  @keyframes fadeOut { to { opacity: 0; transform: translateX(20px); } }
+
+  /* Progress bar shimmer */
+  .progress-bar-fill {
+    position: relative;
+    overflow: hidden;
+  }
+  .progress-bar-fill::after {
+    content: '';
+    position: absolute;
+    top: 0; left: -100%; width: 100%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+    animation: shimmer 2.5s ease-in-out infinite;
+  }
+  @keyframes shimmer { 0% { left: -100%; } 100% { left: 100%; } }
+
+  /* Input focus ring */
+  input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: #3b82f6 !important;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25);
+  }
+
+  /* Table row hover */
+  .data-row:hover { background: rgba(59, 130, 246, 0.04); }
+  .data-row { transition: background 0.15s ease; }
+
+  /* Modal backdrop */
+  .modal-backdrop {
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(4px);
+  }
+
+  /* Sidebar nav link */
+  .nav-link {
+    transition: all 0.15s ease;
+    border-left: 3px solid transparent;
+  }
+  .nav-link:hover {
+    background: rgba(59, 130, 246, 0.08);
+    color: #e2e8f0;
+  }
+  .nav-link.active {
+    background: rgba(59, 130, 246, 0.12);
+    border-left-color: #3b82f6;
+    color: #60a5fa;
+  }
+
+  /* Status dot pulse */
+  .status-dot-online { animation: pulseDot 2s ease-in-out infinite; }
+
+  /* Card hover lift */
+  .card-hover { transition: transform 0.2s ease, box-shadow 0.2s ease; }
+  .card-hover:hover { transform: translateY(-1px); box-shadow: 0 4px 24px rgba(0,0,0,0.3); }
+</style>
+</head>
+<body class="dark">
+
+<!-- ==================== LOGIN ==================== -->
+<div id="loginView" class="min-h-screen flex items-center justify-center p-4">
+  <div class="w-full max-w-sm animate-slide-up">
+    <div class="text-center mb-8">
+      <div class="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-panel-700 border border-panel-500 mb-4">
+        <span class="text-2xl">&#9672;</span>
+      </div>
+      <h1 class="text-xl font-semibold text-white font-display">MultiProxy</h1>
+      <p class="text-sm text-panel-300 mt-1">GeoDNS 智能路由面板</p>
+    </div>
+    <div class="bg-panel-800 border border-panel-500 rounded-xl p-6 shadow-2xl">
+      <div class="space-y-4">
+        <div>
+          <label class="block text-xs font-medium text-panel-300 mb-1.5 uppercase tracking-wider">用户名</label>
+          <input id="loginUser" type="text" value="admin"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3.5 py-2.5 text-sm text-panel-100 placeholder-panel-400" />
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-panel-300 mb-1.5 uppercase tracking-wider">密码</label>
+          <input id="loginPass" type="password" placeholder="请输入密码"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3.5 py-2.5 text-sm text-panel-100 placeholder-panel-400"
+            onkeydown="if(event.key==='Enter')doLogin()" />
+        </div>
+        <button onclick="doLogin()"
+          class="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg px-4 py-2.5 text-sm transition-colors">
+          登录
+        </button>
+        <p id="loginError" class="text-red-400 text-xs text-center hidden"></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== APP SHELL ==================== -->
+<div id="appView" class="hidden">
+  <!-- Mobile header -->
+  <header class="lg:hidden fixed top-0 left-0 right-0 z-40 bg-panel-800 border-b border-panel-500 px-4 py-3 flex items-center justify-between">
+    <button onclick="toggleSidebar()" class="text-panel-200 hover:text-white p-1">
+      <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h16M3 11h16M3 16h16"/></svg>
+    </button>
+    <span class="text-sm font-semibold text-white font-display">MultiProxy</span>
+    <div class="w-8"></div>
+  </header>
+
+  <!-- Sidebar overlay for mobile -->
+  <div id="sidebarOverlay" class="hidden fixed inset-0 z-40 bg-black/50 lg:hidden" onclick="toggleSidebar()"></div>
+
+  <!-- Sidebar -->
+  <aside id="sidebar" class="fixed top-0 left-0 z-50 h-full w-56 bg-panel-800 border-r border-panel-500 flex flex-col transform -translate-x-full lg:translate-x-0 transition-transform duration-200">
+    <div class="px-5 py-5 border-b border-panel-500">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg bg-blue-600/20 border border-blue-500/30 flex items-center justify-center">
+          <span class="text-blue-400 text-sm">&#9672;</span>
+        </div>
+        <div>
+          <div class="text-sm font-semibold text-white font-display">MultiProxy</div>
+          <div class="text-[10px] text-panel-400 tracking-wider uppercase">Panel v1</div>
+        </div>
+      </div>
+    </div>
+
+    <nav class="flex-1 py-3 px-2 space-y-0.5 overflow-y-auto">
+      <a href="#dashboard" class="nav-link flex items-center gap-3 px-3 py-2.5 rounded-r-lg text-sm text-panel-200" data-page="dashboard">
+        <span class="w-5 text-center text-base">&#9635;</span>
+        <span>概览</span>
+      </a>
+      <a href="#nodes" class="nav-link flex items-center gap-3 px-3 py-2.5 rounded-r-lg text-sm text-panel-200" data-page="nodes">
+        <span class="w-5 text-center text-base">&#9881;</span>
+        <span>节点管理</span>
+      </a>
+      <a href="#rules" class="nav-link flex items-center gap-3 px-3 py-2.5 rounded-r-lg text-sm text-panel-200" data-page="rules">
+        <span class="w-5 text-center text-base">&#8644;</span>
+        <span>转发规则</span>
+      </a>
+      <a href="#groups" class="nav-link flex items-center gap-3 px-3 py-2.5 rounded-r-lg text-sm text-panel-200" data-page="groups">
+        <span class="w-5 text-center text-base">&#9776;</span>
+        <span>线路组</span>
+      </a>
+      <a href="#zones" class="nav-link flex items-center gap-3 px-3 py-2.5 rounded-r-lg text-sm text-panel-200" data-page="zones">
+        <span class="w-5 text-center text-base">&#9741;</span>
+        <span>DNS 域名</span>
+      </a>
+      <a href="#settings" class="nav-link flex items-center gap-3 px-3 py-2.5 rounded-r-lg text-sm text-panel-200" data-page="settings">
+        <span class="w-5 text-center text-base">&#9881;</span>
+        <span>系统设置</span>
+      </a>
+    </nav>
+
+    <div class="p-3 border-t border-panel-500">
+      <button onclick="doLogout()"
+        class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-panel-300 hover:text-red-400 hover:bg-red-500/10 transition-colors">
+        <span class="text-base">&#10005;</span>
+        <span>退出登录</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- Main content -->
+  <main class="lg:ml-56 min-h-screen pt-14 lg:pt-0">
+    <div class="p-4 lg:p-6 max-w-7xl mx-auto">
+
+      <!-- ======== DASHBOARD ======== -->
+      <section id="page-dashboard" class="page-section">
+        <div class="mb-6">
+          <h2 class="text-lg font-semibold text-white font-display">概览</h2>
+          <p class="text-sm text-panel-300 mt-0.5">系统总览与节点健康状态</p>
+        </div>
+
+        <!-- Summary cards -->
+        <div id="dashSummary" class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+          <div class="bg-panel-700 border border-panel-500 rounded-xl p-4 card-hover">
+            <div class="text-xs text-panel-300 uppercase tracking-wider mb-1">节点总数</div>
+            <div id="statTotal" class="text-2xl font-bold text-white">-</div>
+          </div>
+          <div class="bg-panel-700 border border-panel-500 rounded-xl p-4 card-hover">
+            <div class="text-xs text-panel-300 uppercase tracking-wider mb-1">在线</div>
+            <div id="statOnline" class="text-2xl font-bold text-emerald-400">-</div>
+          </div>
+          <div class="bg-panel-700 border border-panel-500 rounded-xl p-4 card-hover">
+            <div class="text-xs text-panel-300 uppercase tracking-wider mb-1">离线</div>
+            <div id="statOffline" class="text-2xl font-bold text-red-400">-</div>
+          </div>
+          <div class="bg-panel-700 border border-panel-500 rounded-xl p-4 card-hover">
+            <div class="text-xs text-panel-300 uppercase tracking-wider mb-1">饱和</div>
+            <div id="statSaturated" class="text-2xl font-bold text-amber-400">-</div>
+          </div>
+        </div>
+
+        <!-- Node grid -->
+        <div class="mb-4 flex items-center justify-between">
+          <h3 class="text-sm font-medium text-panel-200">节点健康状态</h3>
+          <span id="dashRefreshTimer" class="text-xs text-panel-400">自动刷新: 10秒</span>
+        </div>
+        <div id="dashNodeGrid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+          <div class="text-sm text-panel-400 py-8 text-center col-span-full">正在加载节点...</div>
+        </div>
+      </section>
+
+      <!-- ======== NODES ======== -->
+      <section id="page-nodes" class="page-section">
+        <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div>
+            <h2 class="text-lg font-semibold text-white font-display">节点管理</h2>
+            <p class="text-sm text-panel-300 mt-0.5">管理前置 NAT 中继节点</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <input id="nodeSearch" type="text" placeholder="搜索节点..."
+              oninput="filterNodes()"
+              class="bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400 w-48" />
+            <button onclick="openModal('addNodeModal')"
+              class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors whitespace-nowrap">
+              + 添加节点
+            </button>
+          </div>
+        </div>
+
+        <div class="bg-panel-800 border border-panel-500 rounded-xl overflow-hidden">
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="border-b border-panel-500 text-xs text-panel-300 uppercase tracking-wider">
+                  <th class="text-left px-4 py-3 font-medium">名称</th>
+                  <th class="text-left px-4 py-3 font-medium">IP地址</th>
+                  <th class="text-left px-4 py-3 font-medium">区域</th>
+                  <th class="text-left px-4 py-3 font-medium">运营商</th>
+                  <th class="text-left px-4 py-3 font-medium">状态</th>
+                  <th class="text-left px-4 py-3 font-medium">配置版本</th>
+                  <th class="text-left px-4 py-3 font-medium">带宽上限</th>
+                  <th class="text-left px-4 py-3 font-medium">流量配额</th>
+                  <th class="text-right px-4 py-3 font-medium">操作</th>
+                </tr>
+              </thead>
+              <tbody id="nodesTableBody" class="divide-y divide-panel-600">
+                <tr><td colspan="9" class="px-4 py-8 text-center text-panel-400">正在加载...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ======== RULES ======== -->
+      <section id="page-rules" class="page-section">
+        <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div>
+            <h2 class="text-lg font-semibold text-white font-display">转发规则</h2>
+            <p class="text-sm text-panel-300 mt-0.5">按节点配置端口转发规则</p>
+          </div>
+          <button onclick="openModal('addRuleModal')"
+            class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors whitespace-nowrap self-start">
+            + 添加规则
+          </button>
+        </div>
+
+        <div class="bg-panel-800 border border-panel-500 rounded-xl overflow-hidden">
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="border-b border-panel-500 text-xs text-panel-300 uppercase tracking-wider">
+                  <th class="text-left px-4 py-3 font-medium">节点</th>
+                  <th class="text-left px-4 py-3 font-medium">监听端口</th>
+                  <th class="text-left px-4 py-3 font-medium">协议</th>
+                  <th class="text-left px-4 py-3 font-medium">后端地址</th>
+                  <th class="text-left px-4 py-3 font-medium">工具</th>
+                  <th class="text-left px-4 py-3 font-medium">TLS</th>
+                  <th class="text-right px-4 py-3 font-medium">操作</th>
+                </tr>
+              </thead>
+              <tbody id="rulesTableBody" class="divide-y divide-panel-600">
+                <tr><td colspan="7" class="px-4 py-8 text-center text-panel-400">正在加载...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ======== LINE GROUPS ======== -->
+      <section id="page-groups" class="page-section">
+        <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div>
+            <h2 class="text-lg font-semibold text-white font-display">线路组</h2>
+            <p class="text-sm text-panel-300 mt-0.5">GeoDNS 区域/运营商路由分组</p>
+          </div>
+          <button onclick="openModal('addGroupModal')"
+            class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors whitespace-nowrap self-start">
+            + 添加线路组
+          </button>
+        </div>
+
+        <div class="bg-panel-800 border border-panel-500 rounded-xl overflow-hidden">
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="border-b border-panel-500 text-xs text-panel-300 uppercase tracking-wider">
+                  <th class="text-left px-4 py-3 font-medium">名称</th>
+                  <th class="text-left px-4 py-3 font-medium">匹配区域</th>
+                  <th class="text-left px-4 py-3 font-medium">匹配运营商</th>
+                  <th class="text-left px-4 py-3 font-medium">优先级</th>
+                  <th class="text-left px-4 py-3 font-medium">成员节点</th>
+                  <th class="text-left px-4 py-3 font-medium">回退组</th>
+                  <th class="text-right px-4 py-3 font-medium">操作</th>
+                </tr>
+              </thead>
+              <tbody id="groupsTableBody" class="divide-y divide-panel-600">
+                <tr><td colspan="7" class="px-4 py-8 text-center text-panel-400">正在加载...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ======== DNS ZONES ======== -->
+      <section id="page-zones" class="page-section">
+        <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div>
+            <h2 class="text-lg font-semibold text-white font-display">DNS 域名</h2>
+            <p class="text-sm text-panel-300 mt-0.5">权威 GeoDNS 域名管理</p>
+          </div>
+          <button onclick="openModal('addZoneModal')"
+            class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors whitespace-nowrap self-start">
+            + 添加域名
+          </button>
+        </div>
+
+        <div class="bg-panel-800 border border-panel-500 rounded-xl overflow-hidden">
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="border-b border-panel-500 text-xs text-panel-300 uppercase tracking-wider">
+                  <th class="text-left px-4 py-3 font-medium">域名</th>
+                  <th class="text-left px-4 py-3 font-medium">TTL</th>
+                  <th class="text-left px-4 py-3 font-medium">NS 记录</th>
+                  <th class="text-right px-4 py-3 font-medium">操作</th>
+                </tr>
+              </thead>
+              <tbody id="zonesTableBody" class="divide-y divide-panel-600">
+                <tr><td colspan="4" class="px-4 py-8 text-center text-panel-400">正在加载...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ======== SETTINGS ======== -->
+      <section id="page-settings" class="page-section">
+        <div class="mb-6">
+          <h2 class="text-lg font-semibold text-white font-display">系统设置</h2>
+          <p class="text-sm text-panel-300 mt-0.5">系统信息（只读）及账户设置</p>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="bg-panel-800 border border-panel-500 rounded-xl p-5">
+            <h3 class="text-sm font-medium text-panel-200 mb-4 uppercase tracking-wider">系统</h3>
+            <dl class="space-y-3 text-sm">
+              <div class="flex justify-between">
+                <dt class="text-panel-300">面板版本</dt>
+                <dd class="text-panel-100 font-medium">v1.0</dd>
+              </div>
+              <div class="flex justify-between">
+                <dt class="text-panel-300">协议版本</dt>
+                <dd class="text-panel-100 font-medium">v1</dd>
+              </div>
+              <div class="flex justify-between">
+                <dt class="text-panel-300">IP库格式</dt>
+                <dd class="text-panel-100 font-medium">MMDB (division_code)</dd>
+              </div>
+            </dl>
+          </div>
+          <div class="bg-panel-800 border border-panel-500 rounded-xl p-5">
+            <h3 class="text-sm font-medium text-panel-200 mb-4 uppercase tracking-wider">DNS</h3>
+            <dl class="space-y-3 text-sm">
+              <div class="flex justify-between">
+                <dt class="text-panel-300">DNS端口</dt>
+                <dd class="text-panel-100 font-medium">:53 (UDP/TCP)</dd>
+              </div>
+              <div class="flex justify-between">
+                <dt class="text-panel-300">TTL</dt>
+                <dd class="text-panel-100 font-medium">60秒</dd>
+              </div>
+              <div class="flex justify-between">
+                <dt class="text-panel-300">故障切换SLO</dt>
+                <dd class="text-panel-100 font-medium">&le;30秒从 :53 移除</dd>
+              </div>
+            </dl>
+          </div>
+          <div class="bg-panel-800 border border-panel-500 rounded-xl p-5 md:col-span-2">
+            <h3 class="text-sm font-medium text-panel-200 mb-4 uppercase tracking-wider">运行统计</h3>
+            <dl class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+              <div>
+                <dt class="text-panel-300 mb-1">节点总数</dt>
+                <dd id="settingsNodeCount" class="text-panel-100 font-medium text-lg">-</dd>
+              </div>
+              <div>
+                <dt class="text-panel-300 mb-1">规则总数</dt>
+                <dd id="settingsRuleCount" class="text-panel-100 font-medium text-lg">-</dd>
+              </div>
+              <div>
+                <dt class="text-panel-300 mb-1">线路组</dt>
+                <dd id="settingsGroupCount" class="text-panel-100 font-medium text-lg">-</dd>
+              </div>
+              <div>
+                <dt class="text-panel-300 mb-1">DNS 域名</dt>
+                <dd id="settingsZoneCount" class="text-panel-100 font-medium text-lg">-</dd>
+              </div>
+            </dl>
+          </div>
+
+          <!-- GeoCN Database Update -->
+          <div class="bg-panel-800 border border-panel-500 rounded-xl p-5 md:col-span-2">
+            <h3 class="text-sm font-medium text-panel-200 mb-4 uppercase tracking-wider">IP 数据库</h3>
+            <div class="flex items-center gap-4">
+              <div class="text-sm text-panel-300">
+                当前格式: <span class="text-panel-100 font-medium">MMDB (GeoCN)</span>
+              </div>
+              <button id="geocnUpdateBtn" onclick="doGeocnUpdate()"
+                class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                在线更新 GeoCN 数据库
+              </button>
+            </div>
+          </div>
+
+          <!-- Cloudflare Integration (editable) -->
+          <div class="bg-panel-800 border border-panel-500 rounded-xl p-5 md:col-span-2">
+            <div class="flex items-center justify-between mb-4">
+              <h3 class="text-sm font-medium text-panel-200 uppercase tracking-wider">Cloudflare 集成</h3>
+              <span id="cfStatusBadge" class="text-xs text-panel-400">检测中...</span>
+            </div>
+            <div id="cfHint" class="text-sm text-panel-400 mb-4 hidden">配置 Cloudflare API Token 后可自动管理 DNS 记录和 SSL 证书</div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+              <div>
+                <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">API Token</label>
+                <div class="relative">
+                  <input id="cfToken" type="password" placeholder="Cloudflare API Token"
+                    class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400 pr-10" />
+                  <button onclick="toggleCfTokenVisibility()" class="absolute right-2 top-1/2 -translate-y-1/2 text-panel-400 hover:text-panel-200 text-xs px-1">
+                    <span id="cfTokenToggle">显示</span>
+                  </button>
+                </div>
+              </div>
+              <div>
+                <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">Zone ID</label>
+                <input id="cfZoneId" type="text" placeholder="Cloudflare Zone ID"
+                  class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400" />
+              </div>
+              <div>
+                <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">域名</label>
+                <input id="cfDomainInput" type="text" placeholder="example.com"
+                  class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400" />
+              </div>
+              <div>
+                <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">解析子域名</label>
+                <input id="cfSubdomain" type="text" placeholder="emby" value="emby"
+                  class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400" />
+              </div>
+              <div>
+                <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">NS 名称</label>
+                <input id="cfNsName" type="text" placeholder="ns1" value="ns1"
+                  class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400" />
+              </div>
+              <div>
+                <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">面板公网 IP <span class="normal-case text-panel-400">(留空自动检测)</span></label>
+                <input id="cfPanelIp" type="text" placeholder="自动检测"
+                  class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400" />
+              </div>
+            </div>
+            <div class="flex items-center gap-3 mb-4">
+              <button id="cfSaveBtn" onclick="saveCfSettings()"
+                class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                保存并同步
+              </button>
+              <button id="cfClearBtn" onclick="clearCfSettings()"
+                class="bg-red-600/20 hover:bg-red-600/40 text-red-400 text-sm font-medium rounded-lg px-4 py-2.5 transition-colors">
+                清除配置
+              </button>
+            </div>
+            <div id="cfSyncStatus" class="hidden text-xs text-panel-300 space-y-1"></div>
+          </div>
+
+          <!-- SSL Certificate -->
+          <div class="bg-panel-800 border border-panel-500 rounded-xl p-5 md:col-span-2">
+            <h3 class="text-sm font-medium text-panel-200 mb-4 uppercase tracking-wider">SSL 证书</h3>
+            <dl class="space-y-3 text-sm">
+              <div class="flex justify-between">
+                <dt class="text-panel-300">状态</dt>
+                <dd id="certStatusText" class="text-panel-100 font-medium">检测中...</dd>
+              </div>
+              <div id="certDetails" class="hidden space-y-3">
+                <div class="flex justify-between">
+                  <dt class="text-panel-300">主题</dt>
+                  <dd id="certSubject" class="text-panel-100 font-medium text-xs">-</dd>
+                </div>
+                <div class="flex justify-between">
+                  <dt class="text-panel-300">到期时间</dt>
+                  <dd id="certExpires" class="text-panel-100 font-medium text-xs">-</dd>
+                </div>
+                <div class="flex justify-between">
+                  <dt class="text-panel-300">剩余天数</dt>
+                  <dd id="certDays" class="text-panel-100 font-medium">-</dd>
+                </div>
+              </div>
+            </dl>
+            <div class="mt-4">
+              <button id="certRenewBtn" onclick="doCertRenew()"
+                class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                更新证书
+              </button>
+            </div>
+          </div>
+
+          <!-- Change Password -->
+          <div class="bg-panel-800 border border-panel-500 rounded-xl p-5 md:col-span-2">
+            <h3 class="text-sm font-medium text-panel-200 mb-4 uppercase tracking-wider">修改密码</h3>
+            <div class="max-w-md space-y-4">
+              <div>
+                <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">当前密码</label>
+                <input id="cpCurrent" type="password" placeholder="请输入当前密码"
+                  class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400" />
+              </div>
+              <div>
+                <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">新密码</label>
+                <input id="cpNew" type="password" placeholder="至少6位"
+                  class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400" />
+              </div>
+              <div>
+                <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">确认新密码</label>
+                <input id="cpConfirm" type="password" placeholder="再次输入新密码"
+                  class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400" />
+              </div>
+              <button onclick="doChangePassword()"
+                class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors">
+                修改密码
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<!-- ==================== MODALS ==================== -->
+
+<!-- Add Node Modal -->
+<div id="addNodeModal" class="hidden fixed inset-0 z-[60] flex items-center justify-center p-4">
+  <div class="modal-backdrop absolute inset-0" onclick="closeModal('addNodeModal')"></div>
+  <div class="relative bg-panel-800 border border-panel-500 rounded-xl shadow-2xl w-full max-w-lg animate-slide-up">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-panel-500">
+      <h3 class="text-sm font-semibold text-white">添加节点</h3>
+      <button onclick="closeModal('addNodeModal')" class="text-panel-400 hover:text-white text-lg">&times;</button>
+    </div>
+    <div class="p-5 space-y-4">
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">名称 *</label>
+          <input id="addNodeName" type="text" placeholder="node-bj-01"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">公网 IP *</label>
+          <input id="addNodeIP" type="text" placeholder="1.2.3.4"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">行政区划代码</label>
+          <input id="addNodeDiv" type="text" placeholder="410105"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">运营商</label>
+          <select id="addNodeISP"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100">
+            <option value="telecom">电信</option>
+            <option value="unicom">联通</option>
+            <option value="mobile">移动</option>
+            <option value="pengboshi">鹏博士</option>
+            <option value="cernet">教育网</option>
+            <option value="broadcast">广电</option>
+            <option value="unknown">未知</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid grid-cols-3 gap-4">
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">带宽上限 (Mbps)</label>
+          <input id="addNodeBW" type="number" placeholder="1000"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">流量配额 (字节)</label>
+          <input id="addNodeQuota" type="number" placeholder="1099511627776"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">重置日</label>
+          <input id="addNodeResetDay" type="number" min="1" max="28" placeholder="1"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+      </div>
+    </div>
+    <div class="flex justify-end gap-2 px-5 py-4 border-t border-panel-500">
+      <button onclick="closeModal('addNodeModal')"
+        class="px-4 py-2 text-sm text-panel-300 hover:text-white rounded-lg hover:bg-panel-600 transition-colors">取消</button>
+      <button onclick="createNode()"
+        class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors">确认</button>
+    </div>
+  </div>
+</div>
+
+<!-- Token Display Modal -->
+<div id="tokenModal" class="hidden fixed inset-0 z-[60] flex items-center justify-center p-4">
+  <div class="modal-backdrop absolute inset-0" onclick="closeModal('tokenModal')"></div>
+  <div class="relative bg-panel-800 border border-panel-500 rounded-xl shadow-2xl w-full max-w-lg animate-slide-up">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-panel-500">
+      <h3 class="text-sm font-semibold text-white">节点Token</h3>
+      <button onclick="closeModal('tokenModal')" class="text-panel-400 hover:text-white text-lg">&times;</button>
+    </div>
+    <div class="p-5 space-y-4">
+      <div>
+        <p class="text-xs text-amber-400 mb-3">此Token仅显示一次，请立即复制保存。</p>
+        <div class="flex items-center gap-2">
+          <code id="tokenDisplay" class="flex-1 bg-panel-900 border border-panel-500 rounded-lg px-3 py-2.5 text-xs text-emerald-400 break-all select-all"></code>
+          <button onclick="copyToken()"
+            class="shrink-0 bg-panel-600 hover:bg-panel-500 text-panel-100 text-xs rounded-lg px-3 py-2.5 transition-colors">复制</button>
+        </div>
+      </div>
+      <div>
+        <p class="text-xs text-panel-300 mb-2">一键安装命令（在目标节点执行）：</p>
+        <div class="flex items-start gap-2">
+          <code id="installCmdDisplay" class="flex-1 bg-panel-900 border border-panel-500 rounded-lg px-3 py-2.5 text-xs text-blue-400 break-all select-all whitespace-pre-wrap"></code>
+          <button onclick="copyInstallCmd()"
+            class="shrink-0 bg-panel-600 hover:bg-panel-500 text-panel-100 text-xs rounded-lg px-3 py-2.5 transition-colors">复制安装命令</button>
+        </div>
+      </div>
+    </div>
+    <div class="flex justify-end px-5 py-4 border-t border-panel-500">
+      <button onclick="closeModal('tokenModal')"
+        class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors">确认</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add Rule Modal -->
+<div id="addRuleModal" class="hidden fixed inset-0 z-[60] flex items-center justify-center p-4">
+  <div class="modal-backdrop absolute inset-0" onclick="closeModal('addRuleModal')"></div>
+  <div class="relative bg-panel-800 border border-panel-500 rounded-xl shadow-2xl w-full max-w-lg animate-slide-up">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-panel-500">
+      <h3 class="text-sm font-semibold text-white">添加转发规则</h3>
+      <button onclick="closeModal('addRuleModal')" class="text-panel-400 hover:text-white text-lg">&times;</button>
+    </div>
+    <div class="p-5 space-y-4">
+      <div>
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">节点 *</label>
+        <select id="addRuleNode"
+          class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100"></select>
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">监听端口 *</label>
+          <input id="addRulePort" type="number" placeholder="8096"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">协议</label>
+          <select id="addRuleProto"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100">
+            <option value="tcp">TCP</option>
+            <option value="udp">UDP</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">后端地址 *</label>
+          <input id="addRuleHost" type="text" placeholder="192.168.1.100"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">后端端口 *</label>
+          <input id="addRuleBackPort" type="number" placeholder="8096"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">工具</label>
+          <select id="addRuleTool"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100">
+            <option value="gost">gost</option>
+            <option value="realm">realm</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">TLS 模式</label>
+          <select id="addRuleTlsMode"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100">
+            <option value="passthrough">TCP 透传</option>
+            <option value="terminate">TLS 终结</option>
+          </select>
+          <p id="tlsModeHint" class="text-xs text-panel-400 mt-1">Emby 后端自带 HTTPS，前置只搬运字节，无需证书</p>
+        </div>
+      </div>
+    </div>
+    <div class="flex justify-end gap-2 px-5 py-4 border-t border-panel-500">
+      <button onclick="closeModal('addRuleModal')"
+        class="px-4 py-2 text-sm text-panel-300 hover:text-white rounded-lg hover:bg-panel-600 transition-colors">取消</button>
+      <button onclick="createRule()"
+        class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors">确认</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add Group Modal -->
+<div id="addGroupModal" class="hidden fixed inset-0 z-[60] flex items-center justify-center p-4">
+  <div class="modal-backdrop absolute inset-0" onclick="closeModal('addGroupModal')"></div>
+  <div class="relative bg-panel-800 border border-panel-500 rounded-xl shadow-2xl w-full max-w-lg animate-slide-up">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-panel-500">
+      <h3 class="text-sm font-semibold text-white">添加线路组</h3>
+      <button onclick="closeModal('addGroupModal')" class="text-panel-400 hover:text-white text-lg">&times;</button>
+    </div>
+    <div class="p-5 space-y-4">
+      <div>
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">名称 *</label>
+        <input id="addGroupName" type="text" placeholder="bj-telecom-group"
+          class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">匹配区域 (省份代码)</label>
+          <input id="addGroupRegion" type="text" placeholder="41 (可选)"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">匹配运营商</label>
+          <select id="addGroupISP"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100">
+            <option value="">不限</option>
+            <option value="telecom">电信</option>
+            <option value="unicom">联通</option>
+            <option value="mobile">移动</option>
+            <option value="pengboshi">鹏博士</option>
+            <option value="cernet">教育网</option>
+            <option value="broadcast">广电</option>
+          </select>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">优先级 (数值越小优先级越高)</label>
+        <input id="addGroupPrio" type="number" value="0"
+          class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+      </div>
+      <div>
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">成员节点 ID (逗号分隔)</label>
+        <input id="addGroupMembers" type="text" placeholder="粘贴节点 ID，用逗号分隔"
+          class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        <p id="addGroupMemberHints" class="text-xs text-panel-400 mt-1"></p>
+      </div>
+      <div>
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">回退组</label>
+        <select id="addGroupFallback"
+          class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100">
+          <option value="">无</option>
+        </select>
+      </div>
+    </div>
+    <div class="flex justify-end gap-2 px-5 py-4 border-t border-panel-500">
+      <button onclick="closeModal('addGroupModal')"
+        class="px-4 py-2 text-sm text-panel-300 hover:text-white rounded-lg hover:bg-panel-600 transition-colors">取消</button>
+      <button onclick="createGroup()"
+        class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors">确认</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add Zone Modal -->
+<div id="addZoneModal" class="hidden fixed inset-0 z-[60] flex items-center justify-center p-4">
+  <div class="modal-backdrop absolute inset-0" onclick="closeModal('addZoneModal')"></div>
+  <div class="relative bg-panel-800 border border-panel-500 rounded-xl shadow-2xl w-full max-w-md animate-slide-up">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-panel-500">
+      <h3 class="text-sm font-semibold text-white">添加 DNS 域名</h3>
+      <button onclick="closeModal('addZoneModal')" class="text-panel-400 hover:text-white text-lg">&times;</button>
+    </div>
+    <div class="p-5 space-y-4">
+      <div>
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">域名 *</label>
+        <input id="addZoneApex" type="text" placeholder="emby.example.com"
+          class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+      </div>
+      <div>
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">默认 TTL (秒)</label>
+        <input id="addZoneTTL" type="number" value="60"
+          class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+      </div>
+      <div>
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">NS 记录 (逗号分隔，可选)</label>
+        <input id="addZoneNS" type="text" placeholder="ns1.example.com, ns2.example.com"
+          class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+      </div>
+    </div>
+    <div class="flex justify-end gap-2 px-5 py-4 border-t border-panel-500">
+      <button onclick="closeModal('addZoneModal')"
+        class="px-4 py-2 text-sm text-panel-300 hover:text-white rounded-lg hover:bg-panel-600 transition-colors">取消</button>
+      <button onclick="createZone()"
+        class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors">确认</button>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm Delete Modal -->
+<div id="confirmModal" class="hidden fixed inset-0 z-[60] flex items-center justify-center p-4">
+  <div class="modal-backdrop absolute inset-0" onclick="closeModal('confirmModal')"></div>
+  <div class="relative bg-panel-800 border border-panel-500 rounded-xl shadow-2xl w-full max-w-sm animate-slide-up">
+    <div class="p-5 text-center">
+      <div class="w-12 h-12 rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center mx-auto mb-4">
+        <span class="text-red-400 text-xl">&#9888;</span>
+      </div>
+      <h3 class="text-sm font-semibold text-white mb-2">确认删除</h3>
+      <p id="confirmMsg" class="text-sm text-panel-300 mb-5"></p>
+      <div class="flex justify-center gap-3">
+        <button onclick="closeModal('confirmModal')"
+          class="px-4 py-2 text-sm text-panel-300 hover:text-white rounded-lg hover:bg-panel-600 transition-colors">取消</button>
+        <button id="confirmBtn"
+          class="bg-red-600 hover:bg-red-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors">删除</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div id="toastContainer" class="fixed top-4 right-4 z-[100] space-y-2 pointer-events-none"></div>
+
+<!-- ==================== JAVASCRIPT ==================== -->
+<script>
+/* ========== State ========== */
+let _nodes = [];
+let _rules = [];
+let _groups = [];
+let _zones = [];
+let _health = [];
+let _refreshTimer = null;
+let _currentPage = 'dashboard';
+
+/* ========== API ========== */
+async function api(method, path, body) {
+  const opt = { method, headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin' };
+  if (body) opt.body = JSON.stringify(body);
+  const res = await fetch(path, opt);
+  if (res.status === 401) {
+    showView('login');
+    throw new Error('unauthorized');
+  }
+  if (!res.ok) {
+    const err = new Error(await res.text() || 'HTTP ' + res.status);
+    err.status = res.status;
+    throw err;
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+/* ========== View Switching ========== */
+function showView(which) {
+  const loginView = document.getElementById('loginView');
+  const appView = document.getElementById('appView');
+  if (which === 'login') {
+    loginView.classList.remove('hidden');
+    appView.classList.add('hidden');
+    stopAutoRefresh();
+  } else {
+    loginView.classList.add('hidden');
+    appView.classList.remove('hidden');
+    startAutoRefresh();
+  }
+}
+
+/* ========== SPA Routing ========== */
+function navigateTo(page) {
+  _currentPage = page;
+  document.querySelectorAll('.page-section').forEach(s => s.classList.remove('active'));
+  const target = document.getElementById('page-' + page);
+  if (target) target.classList.add('active');
+
+  document.querySelectorAll('.nav-link').forEach(a => {
+    a.classList.toggle('active', a.dataset.page === page);
+  });
+
+  // Close sidebar on mobile
+  if (window.innerWidth < 1024) {
+    closeSidebar();
+  }
+}
+
+function handleHash() {
+  const hash = location.hash.replace('#', '') || 'dashboard';
+  navigateTo(hash);
+}
+window.addEventListener('hashchange', handleHash);
+
+/* ========== Sidebar ========== */
+function toggleSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  const overlay = document.getElementById('sidebarOverlay');
+  const isOpen = !sidebar.classList.contains('-translate-x-full');
+  if (isOpen) {
+    closeSidebar();
+  } else {
+    sidebar.classList.remove('-translate-x-full');
+    overlay.classList.remove('hidden');
+  }
+}
+function closeSidebar() {
+  document.getElementById('sidebar').classList.add('-translate-x-full');
+  document.getElementById('sidebarOverlay').classList.add('hidden');
+}
+
+/* ========== Toast ========== */
+function toast(message, type) {
+  type = type || 'info';
+  const colors = {
+    success: 'bg-emerald-600/90 border-emerald-500/50',
+    error: 'bg-red-600/90 border-red-500/50',
+    info: 'bg-blue-600/90 border-blue-500/50',
+    warning: 'bg-amber-600/90 border-amber-500/50'
+  };
+  const el = document.createElement('div');
+  el.className = 'pointer-events-auto toast-enter ' + (colors[type] || colors.info) + ' border rounded-lg px-4 py-3 text-sm text-white shadow-lg max-w-sm';
+  el.textContent = message;
+  document.getElementById('toastContainer').appendChild(el);
+  setTimeout(function() {
+    el.classList.remove('toast-enter');
+    el.classList.add('toast-exit');
+    setTimeout(function() { el.remove(); }, 300);
+  }, 3000);
+}
+
+/* ========== Modals ========== */
+function openModal(id) {
+  document.getElementById(id).classList.remove('hidden');
+  // Populate dynamic selects
+  if (id === 'addRuleModal') populateRuleNodeSelect();
+  if (id === 'addGroupModal') populateGroupSelects();
+}
+function closeModal(id) {
+  document.getElementById(id).classList.add('hidden');
+}
+
+/* ========== Helpers ========== */
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function formatBytes(bytes) {
+  if (bytes == null || bytes === 0) return '0 B';
+  var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  var i = Math.floor(Math.log(bytes) / Math.log(1024));
+  if (i >= units.length) i = units.length - 1;
+  return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+}
+
+function formatBps(bps) {
+  if (bps == null || bps === 0) return '0 bps';
+  if (bps >= 1e9) return (bps / 1e9).toFixed(1) + ' Gbps';
+  if (bps >= 1e6) return (bps / 1e6).toFixed(1) + ' Mbps';
+  if (bps >= 1e3) return (bps / 1e3).toFixed(1) + ' Kbps';
+  return bps + ' bps';
+}
+
+function nodeNameById(id) {
+  var n = _nodes.find(function(n) { return n.id === id; });
+  return n ? n.name : id.slice(0, 8) + '...';
+}
+
+function groupNameById(id) {
+  var g = _groups.find(function(g) { return g.id === id; });
+  return g ? g.name : id.slice(0, 8) + '...';
+}
+
+function statusBadge(status) {
+  switch (status) {
+    case 'online':
+      return '<span class="inline-flex items-center gap-1.5 text-xs"><span class="w-2 h-2 rounded-full bg-emerald-400 status-dot-online"></span><span class="text-emerald-400">在线</span></span>';
+    case 'offline':
+      return '<span class="inline-flex items-center gap-1.5 text-xs"><span class="w-2 h-2 rounded-full bg-red-400"></span><span class="text-red-400">离线</span></span>';
+    default:
+      return '<span class="inline-flex items-center gap-1.5 text-xs"><span class="w-2 h-2 rounded-full bg-panel-400"></span><span class="text-panel-300">未知</span></span>';
+  }
+}
+
+function availabilityBadge(state) {
+  switch (state) {
+    case 'available':
+      return '<span class="inline-flex items-center gap-1.5 text-xs"><span class="w-2 h-2 rounded-full bg-emerald-400"></span><span class="text-emerald-400">正常</span></span>';
+    case 'soft_excluded':
+      return '<span class="inline-flex items-center gap-1.5 text-xs"><span class="w-2 h-2 rounded-full bg-amber-400"></span><span class="text-amber-400">软排除</span></span>';
+    case 'hard_excluded':
+      return '<span class="inline-flex items-center gap-1.5 text-xs"><span class="w-2 h-2 rounded-full bg-red-400"></span><span class="text-red-400">硬排除</span></span>';
+    default:
+      return '<span class="text-xs text-panel-400">' + esc(state) + '</span>';
+  }
+}
+
+function progressBar(ratio, label) {
+  if (ratio == null || isNaN(ratio)) return '<span class="text-xs text-panel-400">-</span>';
+  var pct = Math.min(100, Math.max(0, ratio * 100));
+  var color = 'bg-emerald-500';
+  if (pct >= 90) color = 'bg-red-500';
+  else if (pct >= 70) color = 'bg-amber-500';
+  else if (pct >= 50) color = 'bg-blue-500';
+  return '<div class="w-full">' +
+    '<div class="flex justify-between text-xs mb-1"><span class="text-panel-300">' + esc(label || '') + '</span><span class="text-panel-200">' + pct.toFixed(1) + '%</span></div>' +
+    '<div class="w-full h-2 bg-panel-600 rounded-full overflow-hidden">' +
+    '<div class="progress-bar-fill h-full rounded-full transition-all duration-500 ' + color + '" style="width:' + pct + '%"></div>' +
+    '</div></div>';
+}
+
+/* ========== Auth ========== */
+async function doLogin() {
+  var u = document.getElementById('loginUser').value;
+  var p = document.getElementById('loginPass').value;
+  var errEl = document.getElementById('loginError');
+  errEl.classList.add('hidden');
+  try {
+    await api('POST', '/api/login', { username: u, password: p });
+    showView('app');
+    await refreshAll();
+    handleHash();
+  } catch (e) {
+    errEl.textContent = '登录失败：用户名或密码错误';
+    errEl.classList.remove('hidden');
+  }
+}
+
+async function doLogout() {
+  try {
+    await api('POST', '/api/logout');
+  } catch (e) { /* ignore */ }
+  showView('login');
+}
+
+/* ========== Change Password ========== */
+async function doChangePassword() {
+  var cur = document.getElementById('cpCurrent').value;
+  var np = document.getElementById('cpNew').value;
+  var confirm = document.getElementById('cpConfirm').value;
+
+  if (!cur || !np || !confirm) {
+    toast('请填写所有密码字段', 'error');
+    return;
+  }
+  if (np !== confirm) {
+    toast('新密码与确认密码不一致', 'error');
+    return;
+  }
+  if (np.length < 6) {
+    toast('新密码不符合要求（至少6位）', 'error');
+    return;
+  }
+
+  try {
+    await api('POST', '/api/change-password', { current_password: cur, new_password: np });
+    toast('密码修改成功，请重新登录', 'success');
+    document.getElementById('cpCurrent').value = '';
+    document.getElementById('cpNew').value = '';
+    document.getElementById('cpConfirm').value = '';
+    setTimeout(function() { showView('login'); }, 2000);
+  } catch (e) {
+    if (e.status === 403) {
+      toast('当前密码错误', 'error');
+    } else if (e.status === 400) {
+      toast('新密码不符合要求（至少6位）', 'error');
+    } else {
+      toast('操作失败: ' + e.message, 'error');
+    }
+  }
+}
+
+/* ========== Data Refresh ========== */
+async function refreshAll() {
+  try {
+    var results = await Promise.all([
+      api('GET', '/api/nodes'),
+      api('GET', '/api/rules'),
+      api('GET', '/api/line-groups'),
+      api('GET', '/api/zones'),
+      api('GET', '/api/health')
+    ]);
+    _nodes = results[0] || [];
+    _rules = results[1] || [];
+    _groups = results[2] || [];
+    _zones = results[3] || [];
+    _health = results[4] || [];
+    renderAll();
+  } catch (e) {
+    if (e.message !== 'unauthorized') {
+      console.error('Refresh failed:', e);
+    }
+  }
+}
+
+function renderAll() {
+  renderDashboard();
+  renderNodes();
+  renderRules();
+  renderGroups();
+  renderZones();
+  renderSettings();
+}
+
+/* ========== Auto-refresh ========== */
+function startAutoRefresh() {
+  stopAutoRefresh();
+  _refreshTimer = setInterval(refreshAll, 10000);
+}
+function stopAutoRefresh() {
+  if (_refreshTimer) {
+    clearInterval(_refreshTimer);
+    _refreshTimer = null;
+  }
+}
+
+/* ========== Dashboard ========== */
+function renderDashboard() {
+  var total = _health.length;
+  var online = 0, offline = 0, saturated = 0;
+  _health.forEach(function(h) {
+    if (h.status === 'online' || h.connected) online++;
+    else offline++;
+    if (h.saturation_state === 'saturated') saturated++;
+  });
+
+  document.getElementById('statTotal').textContent = total;
+  document.getElementById('statOnline').textContent = online;
+  document.getElementById('statOffline').textContent = offline;
+  document.getElementById('statSaturated').textContent = saturated;
+
+  var grid = document.getElementById('dashNodeGrid');
+  if (_health.length === 0) {
+    grid.innerHTML = '<div class="text-sm text-panel-400 py-8 text-center col-span-full">暂无节点</div>';
+    return;
+  }
+
+  grid.innerHTML = _health.map(function(h) {
+    var node = _nodes.find(function(n) { return n.id === h.id; });
+    var bwRatio = null;
+    if (node && node.bandwidth_cap_mbps && node.bandwidth_cap_mbps > 0) {
+      bwRatio = (h.throughput_bps / 8) / (node.bandwidth_cap_mbps * 1e6 / 8);
+    }
+    var quotaRatio = h.quota_used_ratio;
+    var driftWarn = '';
+    if (node && node.desired_config_gen !== node.applied_config_gen) {
+      driftWarn = ' <span class="text-amber-400 text-xs" title="检测到配置漂移">&#9888;</span>';
+    }
+
+    var isOnline = h.status === 'online' || h.connected;
+
+    return '<div class="bg-panel-700 border border-panel-500 rounded-xl p-4 card-hover animate-fade-in">' +
+      '<div class="flex items-start justify-between mb-3">' +
+        '<div>' +
+          '<div class="text-sm font-medium text-white">' + esc(h.name) + '</div>' +
+          '<div class="text-xs text-panel-400 mt-0.5">' + esc(h.public_ip) + '</div>' +
+        '</div>' +
+        '<div class="flex items-center gap-2">' +
+          availabilityBadge(h.availability_state) +
+        '</div>' +
+      '</div>' +
+      '<div class="flex items-center gap-2 mb-3">' +
+        (isOnline
+          ? '<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-xs text-emerald-400"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 status-dot-online"></span>在线</span>'
+          : '<span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-red-500/10 border border-red-500/20 text-xs text-red-400"><span class="w-1.5 h-1.5 rounded-full bg-red-400"></span>离线</span>') +
+        (h.saturation_state === 'saturated'
+          ? '<span class="inline-flex items-center px-2 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/20 text-xs text-amber-400">饱和</span>'
+          : '') +
+      '</div>' +
+      '<div class="space-y-2.5">' +
+        (bwRatio != null
+          ? progressBar(bwRatio, '吞吐量: ' + formatBps(h.throughput_bps))
+          : '<div class="text-xs text-panel-400">吞吐量: ' + formatBps(h.throughput_bps) + ' <span class="text-panel-500">(无上限)</span></div>') +
+        (quotaRatio != null
+          ? progressBar(quotaRatio, '配额使用: ' + formatBytes(h.accumulated_usage_bytes))
+          : '<div class="text-xs text-panel-400">已用流量: ' + formatBytes(h.accumulated_usage_bytes) + ' <span class="text-panel-500">(无配额)</span></div>') +
+      '</div>' +
+      (node ? '<div class="mt-3 pt-2.5 border-t border-panel-600 flex justify-between text-xs text-panel-400">' +
+        '<span>配置版本: ' + node.desired_config_gen + '/' + node.applied_config_gen + driftWarn + '</span>' +
+        '<span>' + esc(node.isp) + '</span>' +
+      '</div>' : '') +
+    '</div>';
+  }).join('');
+}
+
+/* ========== Nodes ========== */
+function renderNodes() {
+  var body = document.getElementById('nodesTableBody');
+  if (_nodes.length === 0) {
+    body.innerHTML = '<tr><td colspan="9" class="px-4 py-8 text-center text-panel-400">暂无节点</td></tr>';
+    return;
+  }
+  body.innerHTML = _nodes.map(function(n) {
+    var health = _health.find(function(h) { return h.id === n.id; });
+    var driftWarn = n.desired_config_gen !== n.applied_config_gen
+      ? ' <span class="text-amber-400" title="配置漂移警告">&#9888;</span>' : '';
+    return '<tr class="data-row" data-name="' + esc(n.name.toLowerCase()) + '">' +
+      '<td class="px-4 py-3 text-panel-100 font-medium">' + esc(n.name) + '</td>' +
+      '<td class="px-4 py-3 text-panel-300 font-mono text-xs">' + esc(n.public_ip) + '</td>' +
+      '<td class="px-4 py-3 text-panel-300 text-xs">' + (n.region ? n.region.province_code || '-' : '-') + '</td>' +
+      '<td class="px-4 py-3"><span class="text-xs px-2 py-0.5 rounded bg-panel-600 text-panel-200">' + esc(n.isp) + '</span></td>' +
+      '<td class="px-4 py-3">' + statusBadge(n.status) + '</td>' +
+      '<td class="px-4 py-3 text-xs text-panel-300">' + n.desired_config_gen + '/' + n.applied_config_gen + driftWarn + '</td>' +
+      '<td class="px-4 py-3 text-xs text-panel-300">' + (n.bandwidth_cap_mbps ? n.bandwidth_cap_mbps + ' Mbps' : '-') + '</td>' +
+      '<td class="px-4 py-3 text-xs text-panel-300">' + (n.traffic_quota_bytes ? formatBytes(n.traffic_quota_bytes) : '-') + '</td>' +
+      '<td class="px-4 py-3 text-right">' +
+        '<div class="flex items-center justify-end gap-1">' +
+          '<button onclick="showInstallCmd(\'' + esc(n.id) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-400 transition-colors" title="安装命令">安装命令</button>' +
+          '<button onclick="regenToken(\'' + esc(n.id) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-panel-600 hover:bg-panel-500 text-panel-200 hover:text-white transition-colors" title="轮换Token">&#8635; 轮换Token</button>' +
+          '<button onclick="confirmDelete(\'node\', \'' + esc(n.id) + '\', \'' + esc(n.name) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors" title="删除">&#10005;</button>' +
+        '</div>' +
+      '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+function filterNodes() {
+  var q = document.getElementById('nodeSearch').value.toLowerCase();
+  document.querySelectorAll('#nodesTableBody .data-row').forEach(function(row) {
+    var name = row.dataset.name || '';
+    row.style.display = name.includes(q) ? '' : 'none';
+  });
+}
+
+/* ========== Rules ========== */
+function renderRules() {
+  var body = document.getElementById('rulesTableBody');
+  if (_rules.length === 0) {
+    body.innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-panel-400">暂无规则</td></tr>';
+    return;
+  }
+  body.innerHTML = _rules.map(function(r) {
+    var tlsBadge = (r.tls_mode === 'terminate')
+      ? '<span class="text-xs px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">终结</span>'
+      : '<span class="text-xs px-2 py-0.5 rounded bg-panel-600 text-panel-200">透传</span>';
+    return '<tr class="data-row">' +
+      '<td class="px-4 py-3 text-panel-100 font-medium text-xs">' + esc(nodeNameById(r.node_id)) + '</td>' +
+      '<td class="px-4 py-3 text-panel-300 font-mono text-xs">' + r.listen_port + '</td>' +
+      '<td class="px-4 py-3"><span class="text-xs px-2 py-0.5 rounded uppercase ' +
+        (r.protocol === 'tcp' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' : 'bg-purple-500/10 text-purple-400 border border-purple-500/20') +
+        '">' + esc(r.protocol) + '</span></td>' +
+      '<td class="px-4 py-3 text-panel-300 font-mono text-xs">' + esc(r.backend_host) + ':' + r.backend_port + '</td>' +
+      '<td class="px-4 py-3"><span class="text-xs px-2 py-0.5 rounded bg-panel-600 text-panel-200">' + esc(r.tool) + '</span></td>' +
+      '<td class="px-4 py-3">' + tlsBadge + '</td>' +
+      '<td class="px-4 py-3 text-right">' +
+        '<button onclick="confirmDelete(\'rule\', \'' + esc(r.id) + '\', \'端口 ' + r.listen_port + ' 的规则\')" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">&#10005; 删除</button>' +
+      '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+/* ========== Groups ========== */
+function renderGroups() {
+  var body = document.getElementById('groupsTableBody');
+  if (_groups.length === 0) {
+    body.innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-panel-400">暂无线路组</td></tr>';
+    return;
+  }
+  body.innerHTML = _groups.map(function(g) {
+    var memberNames = (g.member_node_ids || []).map(function(mid) { return nodeNameById(mid); });
+    var memberCount = memberNames.length;
+    var memberTooltip = memberNames.join(', ');
+    return '<tr class="data-row">' +
+      '<td class="px-4 py-3 text-panel-100 font-medium">' + esc(g.name) + '</td>' +
+      '<td class="px-4 py-3 text-panel-300 text-xs">' + (g.match_region != null ? g.match_region : '<span class="text-panel-500">不限</span>') + '</td>' +
+      '<td class="px-4 py-3 text-panel-300 text-xs">' + (g.match_isp != null ? esc(g.match_isp) : '<span class="text-panel-500">不限</span>') + '</td>' +
+      '<td class="px-4 py-3 text-panel-300 text-xs">' + g.priority + '</td>' +
+      '<td class="px-4 py-3 text-xs"><span class="text-panel-200" title="' + esc(memberTooltip) + '">' + memberCount + ' 个节点</span>' +
+        (memberCount > 0 ? '<span class="text-panel-500 ml-1">(' + esc(memberNames.slice(0, 3).join(', ')) + (memberCount > 3 ? '...' : '') + ')</span>' : '') +
+      '</td>' +
+      '<td class="px-4 py-3 text-panel-300 text-xs">' + (g.fallback_group ? esc(groupNameById(g.fallback_group)) : '<span class="text-panel-500">无</span>') + '</td>' +
+      '<td class="px-4 py-3 text-right">' +
+        '<button onclick="confirmDelete(\'group\', \'' + esc(g.id) + '\', \'' + esc(g.name) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">&#10005; 删除</button>' +
+      '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+/* ========== Zones ========== */
+function renderZones() {
+  var body = document.getElementById('zonesTableBody');
+  if (_zones.length === 0) {
+    body.innerHTML = '<tr><td colspan="4" class="px-4 py-8 text-center text-panel-400">暂无 DNS 域名</td></tr>';
+    return;
+  }
+  body.innerHTML = _zones.map(function(z) {
+    var nsDisplay = (z.ns && z.ns.length > 0) ? z.ns.join(', ') : '<span class="text-panel-500">无</span>';
+    return '<tr class="data-row">' +
+      '<td class="px-4 py-3 text-panel-100 font-medium font-mono text-xs">' + esc(z.apex_domain) + '</td>' +
+      '<td class="px-4 py-3 text-panel-300 text-xs">' + z.default_ttl + '秒</td>' +
+      '<td class="px-4 py-3 text-panel-300 text-xs">' + nsDisplay + '</td>' +
+      '<td class="px-4 py-3 text-right">' +
+        '<button onclick="confirmDelete(\'zone\', \'' + esc(z.id) + '\', \'' + esc(z.apex_domain) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">&#10005; 删除</button>' +
+      '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+/* ========== Settings ========== */
+function renderSettings() {
+  document.getElementById('settingsNodeCount').textContent = _nodes.length;
+  document.getElementById('settingsRuleCount').textContent = _rules.length;
+  document.getElementById('settingsGroupCount').textContent = _groups.length;
+  document.getElementById('settingsZoneCount').textContent = _zones.length;
+  refreshCfSettings();
+  refreshCertStatus();
+}
+
+async function refreshCfSettings() {
+  try {
+    var data = await api('GET', '/api/settings/cf');
+    if (data.configured) {
+      document.getElementById('cfToken').value = data.cf_token || '';
+      document.getElementById('cfZoneId').value = data.cf_zone_id || '';
+      document.getElementById('cfDomainInput').value = data.cf_domain || '';
+      document.getElementById('cfSubdomain').value = data.cf_subdomain || 'emby';
+      document.getElementById('cfNsName').value = data.cf_ns_name || 'ns1';
+      document.getElementById('cfPanelIp').value = data.cf_panel_ip || '';
+      document.getElementById('cfStatusBadge').innerHTML = '<span class="inline-flex items-center gap-1.5"><span class="w-2 h-2 rounded-full bg-emerald-400"></span><span class="text-emerald-400">已配置</span></span>';
+      document.getElementById('cfHint').classList.add('hidden');
+    } else {
+      document.getElementById('cfToken').value = '';
+      document.getElementById('cfZoneId').value = '';
+      document.getElementById('cfDomainInput').value = '';
+      document.getElementById('cfSubdomain').value = 'emby';
+      document.getElementById('cfNsName').value = 'ns1';
+      document.getElementById('cfPanelIp').value = '';
+      document.getElementById('cfStatusBadge').innerHTML = '<span class="text-panel-400">未配置</span>';
+      document.getElementById('cfHint').classList.remove('hidden');
+    }
+  } catch (e) {
+    document.getElementById('cfStatusBadge').innerHTML = '<span class="text-panel-400">未配置</span>';
+    document.getElementById('cfHint').classList.remove('hidden');
+  }
+}
+
+function toggleCfTokenVisibility() {
+  var input = document.getElementById('cfToken');
+  var toggle = document.getElementById('cfTokenToggle');
+  if (input.type === 'password') {
+    input.type = 'text';
+    toggle.textContent = '隐藏';
+  } else {
+    input.type = 'password';
+    toggle.textContent = '显示';
+  }
+}
+
+async function saveCfSettings() {
+  var token = document.getElementById('cfToken').value.trim();
+  var zoneId = document.getElementById('cfZoneId').value.trim();
+  var domain = document.getElementById('cfDomainInput').value.trim();
+
+  if (!token || !zoneId || !domain) {
+    toast('API Token、Zone ID 和域名为必填项', 'error');
+    return;
+  }
+
+  var btn = document.getElementById('cfSaveBtn');
+  var origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '保存中...';
+
+  try {
+    var result = await api('PUT', '/api/settings/cf', {
+      cf_token: token,
+      cf_zone_id: zoneId,
+      cf_domain: domain,
+      cf_subdomain: document.getElementById('cfSubdomain').value.trim() || 'emby',
+      cf_ns_name: document.getElementById('cfNsName').value.trim() || 'ns1',
+      cf_panel_ip: document.getElementById('cfPanelIp').value.trim()
+    });
+
+    var statusEl = document.getElementById('cfSyncStatus');
+    statusEl.classList.remove('hidden');
+    statusEl.innerHTML =
+      '<div>DNS 同步: <span class="' + (result.dns_sync && result.dns_sync.startsWith('success') ? 'text-emerald-400' : 'text-amber-400') + '">' + esc(result.dns_sync || '-') + '</span></div>' +
+      '<div>证书状态: <span class="' + (result.cert_status === 'valid' || result.cert_status === 'issued' ? 'text-emerald-400' : 'text-amber-400') + '">' + esc(result.cert_status || '-') + '</span></div>';
+
+    toast('Cloudflare 配置已保存', 'success');
+    await refreshCfSettings();
+    await refreshCertStatus();
+  } catch (e) {
+    toast('保存失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function clearCfSettings() {
+  if (!confirm('确定要清除所有 Cloudflare 配置吗？这将禁用 DNS 自动管理和证书自动申请。')) return;
+  try {
+    await api('DELETE', '/api/settings/cf');
+    toast('Cloudflare 配置已清除', 'success');
+    document.getElementById('cfSyncStatus').classList.add('hidden');
+    await refreshCfSettings();
+  } catch (e) {
+    toast('清除失败: ' + e.message, 'error');
+  }
+}
+
+async function refreshCertStatus() {
+  try {
+    var status = await api('GET', '/api/cert/status');
+    if (status.has_cert) {
+      document.getElementById('certStatusText').innerHTML = '<span class="text-emerald-400">已配置</span>';
+      document.getElementById('certDetails').classList.remove('hidden');
+      document.getElementById('certSubject').textContent = status.subject || '-';
+      document.getElementById('certExpires').textContent = status.expires_at || '-';
+      var daysEl = document.getElementById('certDays');
+      daysEl.textContent = status.days_remaining + ' 天';
+      if (status.days_remaining < 30) {
+        daysEl.classList.add('text-amber-400');
+      } else {
+        daysEl.classList.remove('text-amber-400');
+      }
+    } else {
+      document.getElementById('certStatusText').innerHTML = '<span class="text-panel-400">未配置</span>';
+      document.getElementById('certDetails').classList.add('hidden');
+    }
+  } catch (e) {
+    document.getElementById('certStatusText').innerHTML = '<span class="text-panel-400">未配置</span>';
+  }
+}
+
+async function doCertRenew() {
+  var btn = document.getElementById('certRenewBtn');
+  var origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '申请中...';
+  try {
+    var result = await api('POST', '/api/acme/renew');
+    toast('证书更新成功，到期时间: ' + (result.expires_at || '-'), 'success');
+    await refreshCertStatus();
+  } catch (e) {
+    toast('证书更新失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function doGeocnUpdate() {
+  var btn = document.getElementById('geocnUpdateBtn');
+  var origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '下载中...';
+  try {
+    var result = await api('POST', '/api/geocn/update');
+    var sizeMb = (result.size_bytes / 1024 / 1024).toFixed(1);
+    toast('IP 数据库更新成功 (' + sizeMb + ' MB)', 'success');
+  } catch (e) {
+    toast('更新失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+/* ========== Create Operations ========== */
+async function createNode() {
+  var name = document.getElementById('addNodeName').value.trim();
+  var ip = document.getElementById('addNodeIP').value.trim();
+  if (!name || !ip) { toast('名称和 IP 为必填项', 'error'); return; }
+
+  var body = {
+    name: name,
+    public_ip: ip,
+    division_code: parseInt(document.getElementById('addNodeDiv').value || '0', 10),
+    isp: document.getElementById('addNodeISP').value
+  };
+
+  var bw = document.getElementById('addNodeBW').value;
+  if (bw) body.bandwidth_cap_mbps = parseInt(bw, 10);
+
+  var quota = document.getElementById('addNodeQuota').value;
+  if (quota) body.traffic_quota_bytes = parseInt(quota, 10);
+
+  var resetDay = document.getElementById('addNodeResetDay').value;
+  if (resetDay) body.quota_reset_day = parseInt(resetDay, 10);
+
+  try {
+    var result = await api('POST', '/api/nodes', body);
+    closeModal('addNodeModal');
+    clearNodeForm();
+    // Show token + install command
+    document.getElementById('tokenDisplay').textContent = result.token;
+    var installCmd = buildInstallCmd(result.node.id, result.token);
+    document.getElementById('installCmdDisplay').textContent = installCmd;
+    // Reset the token label
+    document.getElementById('tokenDisplay').parentElement.previousElementSibling.innerHTML = '<span class="text-xs text-amber-400 mb-3">此Token仅显示一次，请立即复制保存。</span>';
+    openModal('tokenModal');
+    toast('节点 "' + name + '" 创建成功', 'success');
+    await refreshAll();
+  } catch (e) {
+    toast('操作失败: ' + e.message, 'error');
+  }
+}
+
+function clearNodeForm() {
+  document.getElementById('addNodeName').value = '';
+  document.getElementById('addNodeIP').value = '';
+  document.getElementById('addNodeDiv').value = '';
+  document.getElementById('addNodeBW').value = '';
+  document.getElementById('addNodeQuota').value = '';
+  document.getElementById('addNodeResetDay').value = '';
+}
+
+async function createRule() {
+  var nodeId = document.getElementById('addRuleNode').value;
+  var port = document.getElementById('addRulePort').value;
+  var host = document.getElementById('addRuleHost').value.trim();
+  var bport = document.getElementById('addRuleBackPort').value;
+  if (!nodeId || !port || !host || !bport) { toast('所有字段均为必填', 'error'); return; }
+
+  try {
+    await api('POST', '/api/rules', {
+      node_id: nodeId,
+      listen_port: parseInt(port, 10),
+      protocol: document.getElementById('addRuleProto').value,
+      backend_host: host,
+      backend_port: parseInt(bport, 10),
+      tool: document.getElementById('addRuleTool').value,
+      tls_mode: document.getElementById('addRuleTlsMode').value
+    });
+    closeModal('addRuleModal');
+    document.getElementById('addRulePort').value = '';
+    document.getElementById('addRuleHost').value = '';
+    document.getElementById('addRuleBackPort').value = '';
+    toast('规则创建成功', 'success');
+    await refreshAll();
+  } catch (e) {
+    toast('操作失败: ' + e.message, 'error');
+  }
+}
+
+async function createGroup() {
+  var name = document.getElementById('addGroupName').value.trim();
+  if (!name) { toast('名称为必填项', 'error'); return; }
+
+  var body = {
+    name: name,
+    priority: parseInt(document.getElementById('addGroupPrio').value || '0', 10),
+    member_node_ids: document.getElementById('addGroupMembers').value
+      ? document.getElementById('addGroupMembers').value.split(',').map(function(s) { return s.trim(); }).filter(Boolean)
+      : []
+  };
+
+  var region = document.getElementById('addGroupRegion').value.trim();
+  if (region) body.match_region = parseInt(region, 10);
+
+  var isp = document.getElementById('addGroupISP').value;
+  if (isp) body.match_isp = isp;
+
+  var fallback = document.getElementById('addGroupFallback').value;
+  if (fallback) body.fallback_group = fallback;
+
+  try {
+    await api('POST', '/api/line-groups', body);
+    closeModal('addGroupModal');
+    document.getElementById('addGroupName').value = '';
+    document.getElementById('addGroupRegion').value = '';
+    document.getElementById('addGroupMembers').value = '';
+    toast('线路组 "' + name + '" 创建成功', 'success');
+    await refreshAll();
+  } catch (e) {
+    toast('操作失败: ' + e.message, 'error');
+  }
+}
+
+async function createZone() {
+  var apex = document.getElementById('addZoneApex').value.trim();
+  if (!apex) { toast('域名为必填项', 'error'); return; }
+
+  var nsRaw = document.getElementById('addZoneNS').value.trim();
+  var ns = nsRaw ? nsRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+
+  try {
+    await api('POST', '/api/zones', {
+      apex_domain: apex,
+      default_ttl: parseInt(document.getElementById('addZoneTTL').value || '60', 10),
+      ns: ns
+    });
+    closeModal('addZoneModal');
+    document.getElementById('addZoneApex').value = '';
+    document.getElementById('addZoneNS').value = '';
+    toast('域名 "' + apex + '" 创建成功', 'success');
+    await refreshAll();
+  } catch (e) {
+    toast('操作失败: ' + e.message, 'error');
+  }
+}
+
+/* ========== Delete ========== */
+var _pendingDelete = null;
+
+function confirmDelete(type, id, name) {
+  _pendingDelete = { type: type, id: id };
+  var typeNames = { node: '节点', rule: '规则', group: '线路组', zone: '域名' };
+  document.getElementById('confirmMsg').textContent = '确定要删除' + (typeNames[type] || type) + ' "' + name + '" 吗？此操作不可撤销。';
+  document.getElementById('confirmBtn').onclick = doDelete;
+  openModal('confirmModal');
+}
+
+async function doDelete() {
+  if (!_pendingDelete) return;
+  var type = _pendingDelete.type;
+  var id = _pendingDelete.id;
+  _pendingDelete = null;
+  closeModal('confirmModal');
+
+  try {
+    var path;
+    switch (type) {
+      case 'node': path = '/api/nodes/' + id; break;
+      case 'rule': path = '/api/rules/' + id; break;
+      case 'group': path = '/api/line-groups/' + id; break;
+      case 'zone': path = '/api/zones/' + id; break;
+      default: return;
+    }
+    await api('DELETE', path);
+    var typeNames = { node: '节点', rule: '规则', group: '线路组', zone: '域名' };
+    toast((typeNames[type] || type) + '删除成功', 'success');
+    await refreshAll();
+  } catch (e) {
+    toast('删除失败: ' + e.message, 'error');
+  }
+}
+
+/* ========== Token Regen ========== */
+async function regenToken(nodeId) {
+  try {
+    var result = await api('POST', '/api/nodes/' + nodeId + '/token');
+    document.getElementById('tokenDisplay').textContent = result.token;
+    var installCmd = buildInstallCmd(nodeId, result.token);
+    document.getElementById('installCmdDisplay').textContent = installCmd;
+    document.getElementById('tokenDisplay').parentElement.previousElementSibling.innerHTML = '<span class="text-xs text-amber-400 mb-3">此Token仅显示一次，请立即复制保存。</span>';
+    openModal('tokenModal');
+    toast('Token 轮换成功', 'success');
+  } catch (e) {
+    toast('Token 轮换失败: ' + e.message, 'error');
+  }
+}
+
+function copyToken() {
+  var text = document.getElementById('tokenDisplay').textContent;
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(function() {
+      toast('复制成功', 'success');
+    });
+  } else {
+    // Fallback
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    toast('复制成功', 'success');
+  }
+}
+
+/* ========== Install Command ========== */
+var _lastCreatedNodeId = null;
+var _lastCreatedToken = null;
+
+function buildInstallCmd(nodeId, token) {
+  var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  var panelUrl = proto + '://' + location.host + '/agent';
+  var tokenStr = token || '<YOUR_TOKEN>';
+  return 'curl -sL https://' + location.host + '/install.sh | bash -s -- \\\n  --panel-url ' + panelUrl + ' \\\n  --node-id ' + nodeId + ' --token ' + tokenStr;
+}
+
+function showInstallCmd(nodeId) {
+  var cmd = buildInstallCmd(nodeId, null);
+  document.getElementById('tokenDisplay').textContent = '<YOUR_TOKEN>';
+  document.getElementById('installCmdDisplay').textContent = cmd;
+  document.getElementById('tokenDisplay').parentElement.previousElementSibling.innerHTML = '<span class="text-xs text-panel-400">Token 已隐藏，如需重新获取请轮换 Token</span>';
+  openModal('tokenModal');
+}
+
+function copyInstallCmd() {
+  var text = document.getElementById('installCmdDisplay').textContent;
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(function() {
+      toast('安装命令已复制', 'success');
+    });
+  } else {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    toast('安装命令已复制', 'success');
+  }
+}
+
+/* ========== TLS Mode Hint ========== */
+document.addEventListener('DOMContentLoaded', function() {
+  var sel = document.getElementById('addRuleTlsMode');
+  if (sel) {
+    sel.addEventListener('change', function() {
+      var hint = document.getElementById('tlsModeHint');
+      if (sel.value === 'terminate') {
+        hint.textContent = '前置用面板签的证书终结 HTTPS，再转到后端。需要先在系统设置配置 SSL 证书';
+      } else {
+        hint.textContent = 'Emby 后端自带 HTTPS，前置只搬运字节，无需证书';
+      }
+    });
+  }
+});
+
+/* ========== Dynamic Selects ========== */
+function populateRuleNodeSelect() {
+  var sel = document.getElementById('addRuleNode');
+  sel.innerHTML = _nodes.map(function(n) {
+    return '<option value="' + esc(n.id) + '">' + esc(n.name) + ' (' + esc(n.public_ip) + ')</option>';
+  }).join('');
+}
+
+function populateGroupSelects() {
+  // Member node hints
+  var hints = _nodes.map(function(n) { return n.name + ': ' + n.id.slice(0, 12) + '...'; }).join(' | ');
+  document.getElementById('addGroupMemberHints').textContent = hints ? '可用节点: ' + hints : '暂无可用节点';
+
+  // Fallback group select
+  var sel = document.getElementById('addGroupFallback');
+  sel.innerHTML = '<option value="">无</option>' +
+    _groups.map(function(g) {
+      return '<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>';
+    }).join('');
+}
+
+/* ========== Init ========== */
+refreshAll()
+  .then(function() {
+    showView('app');
+    handleHash();
+  })
+  .catch(function() {
+    showView('login');
+  });
+</script>
+</body>
+</html>
