@@ -669,25 +669,18 @@ tailwind.config = {
             class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
         </div>
       </div>
-      <div class="grid grid-cols-2 gap-4">
-        <div>
-          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">行政区划代码</label>
-          <input id="addNodeDiv" type="text" placeholder="410105"
-            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
-        </div>
-        <div>
-          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">运营商</label>
-          <select id="addNodeISP"
-            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100">
-            <option value="telecom">电信</option>
-            <option value="unicom">联通</option>
-            <option value="mobile">移动</option>
-            <option value="pengboshi">鹏博士</option>
-            <option value="cernet">教育网</option>
-            <option value="broadcast">广电</option>
-            <option value="unknown">未知</option>
-          </select>
-        </div>
+      <div>
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">运营商</label>
+        <select id="addNodeISP"
+          class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100">
+          <option value="telecom">电信</option>
+          <option value="unicom">联通</option>
+          <option value="mobile">移动</option>
+          <option value="pengboshi">鹏博士</option>
+          <option value="cernet">教育网</option>
+          <option value="broadcast">广电</option>
+          <option value="unknown">未知</option>
+        </select>
       </div>
       <div class="grid grid-cols-3 gap-4">
         <div>
@@ -803,10 +796,10 @@ tailwind.config = {
           <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">TLS 模式</label>
           <select id="addRuleTlsMode"
             class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100">
-            <option value="passthrough">TCP 透传</option>
-            <option value="terminate">TLS 终结</option>
+            <option value="passthrough">直接转发</option>
+            <option value="terminate">HTTPS 代理</option>
           </select>
-          <p id="tlsModeHint" class="text-xs text-panel-400 mt-1">Emby 后端自带 HTTPS，前置只搬运字节，无需证书</p>
+          <p id="tlsModeHint" class="text-xs text-panel-400 mt-1">直接转发流量，不处理加密。适用于后端已有 HTTPS 的情况（推荐）</p>
         </div>
       </div>
     </div>
@@ -835,9 +828,10 @@ tailwind.config = {
       </div>
       <div class="grid grid-cols-2 gap-4">
         <div>
-          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">匹配区域 (省份代码)</label>
-          <input id="addGroupRegion" type="text" placeholder="41 (可选)"
-            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">匹配区域</label>
+          <select id="addGroupRegion"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100">
+          </select>
         </div>
         <div>
           <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">匹配运营商</label>
@@ -859,10 +853,10 @@ tailwind.config = {
           class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
       </div>
       <div>
-        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">成员节点 ID (逗号分隔)</label>
-        <input id="addGroupMembers" type="text" placeholder="粘贴节点 ID，用逗号分隔"
-          class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
-        <p id="addGroupMemberHints" class="text-xs text-panel-400 mt-1"></p>
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">成员节点</label>
+        <div id="addGroupMembersBox" class="max-h-40 overflow-y-auto border border-panel-500 rounded-lg p-2 bg-panel-700">
+          <span class="text-xs text-panel-400">暂无可用节点</span>
+        </div>
       </div>
       <div>
         <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">回退组</label>
@@ -1061,10 +1055,10 @@ function esc(s) {
 
 function formatBytes(bytes) {
   if (bytes == null || bytes === 0) return '0 B';
-  var units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  var i = Math.floor(Math.log(bytes) / Math.log(1024));
-  if (i >= units.length) i = units.length - 1;
-  return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  if (bytes < 1024*1024*1024) return (bytes/(1024*1024)).toFixed(1) + ' MB';
+  return (bytes/(1024*1024*1024)).toFixed(2) + ' GB';
 }
 
 function formatBps(bps) {
@@ -1073,6 +1067,29 @@ function formatBps(bps) {
   if (bps >= 1e6) return (bps / 1e6).toFixed(1) + ' Mbps';
   if (bps >= 1e3) return (bps / 1e3).toFixed(1) + ' Kbps';
   return bps + ' bps';
+}
+
+var PROVINCES = [
+  {code: '', label: '不限区域'},
+  {code: '11', label: '北京'}, {code: '12', label: '天津'}, {code: '13', label: '河北'},
+  {code: '14', label: '山西'}, {code: '15', label: '内蒙古'},
+  {code: '21', label: '辽宁'}, {code: '22', label: '吉林'}, {code: '23', label: '黑龙江'},
+  {code: '31', label: '上海'}, {code: '32', label: '江苏'}, {code: '33', label: '浙江'},
+  {code: '34', label: '安徽'}, {code: '35', label: '福建'}, {code: '36', label: '江西'},
+  {code: '37', label: '山东'},
+  {code: '41', label: '河南'}, {code: '42', label: '湖北'}, {code: '43', label: '湖南'},
+  {code: '44', label: '广东'}, {code: '45', label: '广西'}, {code: '46', label: '海南'},
+  {code: '50', label: '重庆'}, {code: '51', label: '四川'}, {code: '52', label: '贵州'},
+  {code: '53', label: '云南'}, {code: '54', label: '西藏'},
+  {code: '61', label: '陕西'}, {code: '62', label: '甘肃'}, {code: '63', label: '青海'},
+  {code: '64', label: '宁夏'}, {code: '65', label: '新疆'},
+];
+
+function provinceLabel(code) {
+  if (code == null || code === '' || code === 0) return null;
+  var s = String(code);
+  var p = PROVINCES.find(function(p) { return p.code === s; });
+  return p ? p.label : s;
 }
 
 function nodeNameById(id) {
@@ -1345,8 +1362,8 @@ function renderRules() {
   }
   body.innerHTML = _rules.map(function(r) {
     var tlsBadge = (r.tls_mode === 'terminate')
-      ? '<span class="text-xs px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">终结</span>'
-      : '<span class="text-xs px-2 py-0.5 rounded bg-panel-600 text-panel-200">透传</span>';
+      ? '<span class="text-xs px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">HTTPS 代理</span>'
+      : '<span class="text-xs px-2 py-0.5 rounded bg-panel-600 text-panel-200">直接转发</span>';
     return '<tr class="data-row">' +
       '<td class="px-4 py-3 text-panel-100 font-medium text-xs">' + esc(nodeNameById(r.node_id)) + '</td>' +
       '<td class="px-4 py-3 text-panel-300 font-mono text-xs">' + r.listen_port + '</td>' +
@@ -1374,9 +1391,10 @@ function renderGroups() {
     var memberNames = (g.member_node_ids || []).map(function(mid) { return nodeNameById(mid); });
     var memberCount = memberNames.length;
     var memberTooltip = memberNames.join(', ');
+    var regionDisplay = provinceLabel(g.match_region);
     return '<tr class="data-row">' +
       '<td class="px-4 py-3 text-panel-100 font-medium">' + esc(g.name) + '</td>' +
-      '<td class="px-4 py-3 text-panel-300 text-xs">' + (g.match_region != null ? g.match_region : '<span class="text-panel-500">不限</span>') + '</td>' +
+      '<td class="px-4 py-3 text-panel-300 text-xs">' + (regionDisplay ? esc(regionDisplay) : '<span class="text-panel-500">不限</span>') + '</td>' +
       '<td class="px-4 py-3 text-panel-300 text-xs">' + (g.match_isp != null ? esc(g.match_isp) : '<span class="text-panel-500">不限</span>') + '</td>' +
       '<td class="px-4 py-3 text-panel-300 text-xs">' + g.priority + '</td>' +
       '<td class="px-4 py-3 text-xs"><span class="text-panel-200" title="' + esc(memberTooltip) + '">' + memberCount + ' 个节点</span>' +
@@ -1411,14 +1429,18 @@ function renderZones() {
 }
 
 /* ========== Settings ========== */
+var _cfSettingsLoaded = false;
 function renderSettings() {
   document.getElementById('settingsNodeCount').textContent = _nodes.length;
   document.getElementById('settingsRuleCount').textContent = _rules.length;
   document.getElementById('settingsGroupCount').textContent = _groups.length;
   document.getElementById('settingsZoneCount').textContent = _zones.length;
   loadVersionInfo();
-  refreshCfSettings();
-  refreshCertStatus();
+  if (!_cfSettingsLoaded) {
+    _cfSettingsLoaded = true;
+    refreshCfSettings();
+    refreshCertStatus();
+  }
 }
 
 async function refreshCfSettings() {
@@ -1673,7 +1695,7 @@ async function createNode() {
   var body = {
     name: name,
     public_ip: ip,
-    division_code: parseInt(document.getElementById('addNodeDiv').value || '0', 10),
+    division_code: 0,
     isp: document.getElementById('addNodeISP').value
   };
 
@@ -1707,7 +1729,6 @@ async function createNode() {
 function clearNodeForm() {
   document.getElementById('addNodeName').value = '';
   document.getElementById('addNodeIP').value = '';
-  document.getElementById('addNodeDiv').value = '';
   document.getElementById('addNodeBW').value = '';
   document.getElementById('addNodeQuota').value = '';
   document.getElementById('addNodeResetDay').value = '';
@@ -1745,15 +1766,18 @@ async function createGroup() {
   var name = document.getElementById('addGroupName').value.trim();
   if (!name) { toast('名称为必填项', 'error'); return; }
 
+  var checkedNodes = [];
+  document.querySelectorAll('.grp-node-cb:checked').forEach(function(cb) {
+    checkedNodes.push(cb.value);
+  });
+
   var body = {
     name: name,
     priority: parseInt(document.getElementById('addGroupPrio').value || '0', 10),
-    member_node_ids: document.getElementById('addGroupMembers').value
-      ? document.getElementById('addGroupMembers').value.split(',').map(function(s) { return s.trim(); }).filter(Boolean)
-      : []
+    member_node_ids: checkedNodes
   };
 
-  var region = document.getElementById('addGroupRegion').value.trim();
+  var region = document.getElementById('addGroupRegion').value;
   if (region) body.match_region = parseInt(region, 10);
 
   var isp = document.getElementById('addGroupISP').value;
@@ -1767,7 +1791,7 @@ async function createGroup() {
     closeModal('addGroupModal');
     document.getElementById('addGroupName').value = '';
     document.getElementById('addGroupRegion').value = '';
-    document.getElementById('addGroupMembers').value = '';
+    document.querySelectorAll('.grp-node-cb').forEach(function(cb) { cb.checked = false; });
     toast('线路组 "' + name + '" 创建成功', 'success');
     await refreshAll();
   } catch (e) {
@@ -1910,9 +1934,9 @@ document.addEventListener('DOMContentLoaded', function() {
     sel.addEventListener('change', function() {
       var hint = document.getElementById('tlsModeHint');
       if (sel.value === 'terminate') {
-        hint.textContent = '前置用面板签的证书终结 HTTPS，再转到后端。需要先在系统设置配置 SSL 证书';
+        hint.textContent = '前置节点使用 SSL 证书提供 HTTPS 访问，再转发到后端。适用于后端仅有 HTTP 的情况';
       } else {
-        hint.textContent = 'Emby 后端自带 HTTPS，前置只搬运字节，无需证书';
+        hint.textContent = '直接转发流量，不处理加密。适用于后端已有 HTTPS 的情况（推荐）';
       }
     });
   }
@@ -1927,9 +1951,24 @@ function populateRuleNodeSelect() {
 }
 
 function populateGroupSelects() {
-  // Member node hints
-  var hints = _nodes.map(function(n) { return n.name + ': ' + n.id.slice(0, 12) + '...'; }).join(' | ');
-  document.getElementById('addGroupMemberHints').textContent = hints ? '可用节点: ' + hints : '暂无可用节点';
+  // Province dropdown
+  var regionSel = document.getElementById('addGroupRegion');
+  regionSel.innerHTML = PROVINCES.map(function(p) {
+    return '<option value="' + esc(p.code) + '">' + esc(p.label) + '</option>';
+  }).join('');
+
+  // Member node checkboxes
+  var box = document.getElementById('addGroupMembersBox');
+  if (_nodes.length === 0) {
+    box.innerHTML = '<span class="text-xs text-panel-400">暂无可用节点</span>';
+  } else {
+    box.innerHTML = _nodes.map(function(n) {
+      return '<label class="flex items-center gap-2 py-1">' +
+        '<input type="checkbox" value="' + esc(n.id) + '" class="grp-node-cb">' +
+        '<span class="text-sm text-panel-100">' + esc(n.name) + ' (' + esc(n.public_ip) + ')</span>' +
+      '</label>';
+    }).join('');
+  }
 
   // Fallback group select
   var sel = document.getElementById('addGroupFallback');
