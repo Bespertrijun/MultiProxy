@@ -619,7 +619,7 @@ pub async fn persist_capacity(
         "UPDATE front_node SET
             accumulated_usage_bytes = ?, counter_epoch = ?, last_tx_bytes_total = ?,
             last_rx_bytes_total = ?, has_counter_baseline = ?, current_throughput_bps = ?,
-            saturation_state = ?, availability_state = ?, last_seen = ?
+            saturation_state = ?, availability_state = ?, last_seen = ?, status = 'online'
          WHERE id = ?",
     )
     .bind(state.accumulated_usage_bytes as i64)
