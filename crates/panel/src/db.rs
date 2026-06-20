@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS forward_rule (
 CREATE TABLE IF NOT EXISTS line_group (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
+    zone_id         TEXT,
     match_region    INTEGER,
     match_isp       TEXT,
     member_node_ids TEXT NOT NULL DEFAULT '[]',
@@ -151,8 +152,10 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
     }
 
     // Column migrations for existing databases.
-    let alter_stmts =
-        &["ALTER TABLE front_node ADD COLUMN quota_direction TEXT NOT NULL DEFAULT 'Both'"];
+    let alter_stmts = &[
+        "ALTER TABLE front_node ADD COLUMN quota_direction TEXT NOT NULL DEFAULT 'Both'",
+        "ALTER TABLE line_group ADD COLUMN zone_id TEXT",
+    ];
     for stmt in alter_stmts {
         let _ = sqlx::query(stmt).execute(pool).await;
     }
@@ -812,15 +815,16 @@ pub async fn delete_rule(pool: &SqlitePool, id: &str) -> Result<()> {
 pub async fn upsert_line_group(pool: &SqlitePool, g: &LineGroup) -> Result<()> {
     let members = serde_json::to_string(&g.member_node_ids).unwrap_or_else(|_| "[]".into());
     sqlx::query(
-        "INSERT INTO line_group(id, name, match_region, match_isp, member_node_ids, priority, fallback_group)
-         VALUES(?,?,?,?,?,?,?)
+        "INSERT INTO line_group(id, name, zone_id, match_region, match_isp, member_node_ids, priority, fallback_group)
+         VALUES(?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET
-            name=excluded.name, match_region=excluded.match_region, match_isp=excluded.match_isp,
-            member_node_ids=excluded.member_node_ids, priority=excluded.priority,
-            fallback_group=excluded.fallback_group",
+            name=excluded.name, zone_id=excluded.zone_id, match_region=excluded.match_region,
+            match_isp=excluded.match_isp, member_node_ids=excluded.member_node_ids,
+            priority=excluded.priority, fallback_group=excluded.fallback_group",
     )
     .bind(&g.id)
     .bind(&g.name)
+    .bind(&g.zone_id)
     .bind(g.match_region.map(i64::from))
     .bind(g.match_isp.map(|i| isp_str(i).to_string()))
     .bind(members)
@@ -837,6 +841,7 @@ fn row_to_group(row: &sqlx::sqlite::SqliteRow) -> LineGroup {
     LineGroup {
         id: row.get("id"),
         name: row.get("name"),
+        zone_id: row.get::<Option<String>, _>("zone_id"),
         match_region: row.get::<Option<i64>, _>("match_region").map(|v| v as u16),
         match_isp: row
             .get::<Option<String>, _>("match_isp")

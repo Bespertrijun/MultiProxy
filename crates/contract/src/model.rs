@@ -182,6 +182,9 @@ pub enum Tool {
 pub struct LineGroup {
     pub id: LineGroupId,
     pub name: String,
+    /// Which DNS zone this line group belongs to. `None` = applies to all zones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_id: Option<String>,
     /// `None` = matches any region.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_region: Option<u16>,

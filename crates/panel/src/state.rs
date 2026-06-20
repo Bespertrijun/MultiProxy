@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use contract::model::LineGroup;
+use contract::model::{DnsZone, LineGroup};
 use contract::protocol::DEFAULT_HEARTBEAT_INTERVAL_SECS;
 use contract::snapshot::AvailabilitySnapshot;
 use geoip::ProviderHandle;
@@ -52,6 +52,8 @@ pub struct AppState {
     pub provider: Arc<ProviderHandle>,
     /// Current line groups (shared with DNS; swapped on CRUD).
     pub groups: Arc<ArcSwap<Vec<LineGroup>>>,
+    /// Current DNS zones (shared with DNS; swapped on CRUD).
+    pub zones: Arc<ArcSwap<Vec<DnsZone>>>,
     /// Monotonic snapshot generation counter.
     pub snapshot_gen: Arc<AtomicU64>,
     /// Live WS connections by node_id.
@@ -80,6 +82,7 @@ impl AppState {
         snapshot: Arc<ArcSwap<AvailabilitySnapshot>>,
         provider: Arc<ProviderHandle>,
         groups: Arc<ArcSwap<Vec<LineGroup>>>,
+        zones: Arc<ArcSwap<Vec<DnsZone>>>,
         geocn_path: String,
         vault: Arc<Vault>,
         agent_bin_dir: String,
@@ -89,6 +92,7 @@ impl AppState {
             snapshot,
             provider,
             groups,
+            zones,
             snapshot_gen: Arc::new(AtomicU64::new(0)),
             conns: Arc::new(Mutex::new(HashMap::new())),
             runtimes: Arc::new(Mutex::new(HashMap::new())),

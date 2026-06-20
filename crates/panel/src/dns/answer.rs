@@ -9,7 +9,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use contract::isp::Isp;
-use contract::model::{LineGroup, Region};
+use contract::model::{DnsZone, LineGroup, Region};
 use contract::snapshot::AvailabilitySnapshot;
 use geoip::GeoIpProvider;
 
@@ -64,11 +64,26 @@ pub fn match_line_group<'a>(
 pub fn resolve(
     provider: &dyn GeoIpProvider,
     groups: &[LineGroup],
+    zones: &[DnsZone],
     snapshot: &AvailabilitySnapshot,
     client_addr: IpAddr,
+    query_name: &str,
 ) -> Resolution {
+    let zone_id = zones
+        .iter()
+        .find(|z| query_name.ends_with(&z.apex_domain) || query_name == z.apex_domain)
+        .map(|z| z.id.as_str());
+    let filtered: Vec<&LineGroup> = groups
+        .iter()
+        .filter(|g| match (&g.zone_id, zone_id) {
+            (Some(gz), Some(qz)) => gz == qz,
+            (None, _) => true,
+            (Some(_), None) => false,
+        })
+        .collect();
     let (region, isp) = provider.lookup(client_addr);
-    let Some(group) = match_line_group(groups, &region, isp) else {
+    let flat: Vec<LineGroup> = filtered.into_iter().cloned().collect();
+    let Some(group) = match_line_group(&flat, &region, isp) else {
         return Resolution::ServFail;
     };
 
@@ -129,6 +144,7 @@ mod tests {
         LineGroup {
             id: id.into(),
             name: id.into(),
+            zone_id: None,
             match_region: region,
             match_isp: isp,
             member_node_ids: vec![],
@@ -197,22 +213,43 @@ mod tests {
         let groups = vec![group("g1", Some(41), Some(Isp::Telecom), 0, None)];
         let snap = snap_with("g1", vec![Ipv4Addr::new(1, 1, 1, 1)]);
         let p = FakeProvider(region(41), Isp::Telecom);
-        let r = resolve(&p, &groups, &snap, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let zones = vec![];
+        let r = resolve(
+            &p,
+            &groups,
+            &zones,
+            &snap,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "test.example.com",
+        );
         assert_eq!(r, Resolution::Answer(vec![Ipv4Addr::new(1, 1, 1, 1)]));
     }
 
     #[test]
     fn empty_falls_back_then_servfail() {
         let groups = vec![group("g1", Some(41), Some(Isp::Telecom), 0, Some("g2"))];
-        // g1 empty, g2 has a record → fallback served.
         let snap = snap_with("g2", vec![Ipv4Addr::new(2, 2, 2, 2)]);
         let p = FakeProvider(region(41), Isp::Telecom);
-        let r = resolve(&p, &groups, &snap, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let zones = vec![];
+        let r = resolve(
+            &p,
+            &groups,
+            &zones,
+            &snap,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "test.example.com",
+        );
         assert_eq!(r, Resolution::Answer(vec![Ipv4Addr::new(2, 2, 2, 2)]));
 
-        // Now g2 also empty → SERVFAIL.
         let empty = AvailabilitySnapshot::default();
-        let r2 = resolve(&p, &groups, &empty, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let r2 = resolve(
+            &p,
+            &groups,
+            &zones,
+            &empty,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "test.example.com",
+        );
         assert_eq!(r2, Resolution::ServFail);
     }
 
@@ -220,8 +257,16 @@ mod tests {
     fn no_matching_group_servfails() {
         let groups = vec![group("g1", Some(41), Some(Isp::Telecom), 0, None)];
         let snap = AvailabilitySnapshot::default();
-        let p = FakeProvider(region(31), Isp::Mobile); // 上海移动, no match
-        let r = resolve(&p, &groups, &snap, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let p = FakeProvider(region(31), Isp::Mobile);
+        let zones = vec![];
+        let r = resolve(
+            &p,
+            &groups,
+            &zones,
+            &snap,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "test.example.com",
+        );
         assert_eq!(r, Resolution::ServFail);
     }
 }

@@ -153,6 +153,8 @@ pub async fn build(cfg: PanelConfig) -> Result<Panel, String> {
     let snapshot = scheduler::new_snapshot_handle();
     let groups_vec = db::list_line_groups(&db).await.map_err(|e| e.to_string())?;
     let groups = Arc::new(ArcSwap::from_pointee(groups_vec));
+    let zones_vec = db::list_zones(&db).await.map_err(|e| e.to_string())?;
+    let zones = Arc::new(ArcSwap::from_pointee(zones_vec));
 
     let geocn_path = cfg
         .geocn_path
@@ -163,6 +165,7 @@ pub async fn build(cfg: PanelConfig) -> Result<Panel, String> {
         snapshot.clone(),
         provider.clone(),
         groups.clone(),
+        zones.clone(),
         geocn_path,
         vault.clone(),
         cfg.agent_bin_dir.clone(),
@@ -303,7 +306,7 @@ pub async fn build(cfg: PanelConfig) -> Result<Panel, String> {
     }
 
     // 4. Bind :53 on the isolated DNS runtime.
-    let handler = GeoDnsHandler::new(snapshot, provider, groups, cfg.ttl_secs);
+    let handler = GeoDnsHandler::new(snapshot, provider, groups, zones, cfg.ttl_secs);
     let dns = spawn_dns(handler, cfg.dns.clone())?;
     let dns_liveness = dns.liveness.clone();
     let dns_udp_port = dns.udp_port;

@@ -67,7 +67,8 @@ fn spawn(
     groups: Arc<ArcSwap<Vec<LineGroup>>>,
     snapshot: Arc<ArcSwap<AvailabilitySnapshot>>,
 ) -> (u16, panel::dns::runtime::DnsRuntimeHandle) {
-    let handler = GeoDnsHandler::new(snapshot, provider, groups, 60);
+    let zones = Arc::new(ArcSwap::from_pointee(Vec::<contract::model::DnsZone>::new()));
+    let handler = GeoDnsHandler::new(snapshot, provider, groups, zones, 60);
     let cfg = DnsConfig {
         bind_addr: "127.0.0.1".into(),
         port: 0,
@@ -124,6 +125,7 @@ async fn ecs_query_returns_line_a_set_and_echoes_scope() {
     let group = LineGroup {
         id: "g_hncc".into(),
         name: "henan-telecom".into(),
+        zone_id: None,
         match_region: Some(41),
         match_isp: Some(Isp::Telecom),
         member_node_ids: vec!["n1".into()],
@@ -166,6 +168,7 @@ async fn flipping_health_changes_answer_within_one_query() {
     let group = LineGroup {
         id: "g_shmobile".into(),
         name: "shanghai-mobile".into(),
+        zone_id: None,
         match_region: Some(31),
         match_isp: Some(Isp::Mobile),
         member_node_ids: vec!["n2".into()],
@@ -216,6 +219,7 @@ async fn no_ecs_uses_source_ip_fallback() {
     let group = LineGroup {
         id: "g_gd".into(),
         name: "gd-telecom".into(),
+        zone_id: None,
         match_region: Some(44),
         match_isp: Some(Isp::Telecom),
         member_node_ids: vec!["n3".into()],

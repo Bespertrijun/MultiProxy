@@ -465,6 +465,8 @@ async fn delete_rule(State(state): State<AppState>, Path(id): Path<String>) -> R
 struct CreateGroupReq {
     name: String,
     #[serde(default)]
+    zone_id: Option<String>,
+    #[serde(default)]
     match_region: Option<u16>,
     #[serde(default)]
     match_isp: Option<Isp>,
@@ -483,6 +485,7 @@ async fn create_group(
     let group = LineGroup {
         id: auth::new_token(),
         name: req.name,
+        zone_id: req.zone_id,
         match_region: req.match_region,
         match_isp: req.match_isp,
         member_node_ids: req.member_node_ids,
@@ -542,6 +545,7 @@ async fn create_zone(
         default_ttl: req.default_ttl,
     };
     db::upsert_zone(&state.db, &zone).await?;
+    refresh_zones(&state).await;
 
     if let Some(cf_cfg) = state.cf_config().await {
         let cf_client = cloudflare::CfClient::new(&cf_cfg.token, &cf_cfg.zone_id);
@@ -564,6 +568,7 @@ async fn delete_zone(State(state): State<AppState>, Path(id): Path<String>) -> R
         .into_iter()
         .find(|z| z.id == id);
     db::delete_zone(&state.db, &id).await?;
+    refresh_zones(&state).await;
 
     if let (Some(z), Some(cf_cfg)) = (zone, state.cf_config().await) {
         let cf_client = cloudflare::CfClient::new(&cf_cfg.token, &cf_cfg.zone_id);
@@ -576,6 +581,12 @@ async fn delete_zone(State(state): State<AppState>, Path(id): Path<String>) -> R
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn refresh_zones(state: &AppState) {
+    if let Ok(zones) = db::list_zones(&state.db).await {
+        state.zones.store(std::sync::Arc::new(zones));
+    }
 }
 
 // ---------- health / dashboard view (AC-5/AC-13 panel side) ----------

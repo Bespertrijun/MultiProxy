@@ -202,14 +202,6 @@ tailwind.config = {
         <span class="w-5 text-center text-base">&#9881;</span>
         <span>节点管理</span>
       </a>
-      <a href="#rules" class="nav-link flex items-center gap-3 px-3 py-2.5 rounded-r-lg text-sm text-panel-200" data-page="rules">
-        <span class="w-5 text-center text-base">&#8644;</span>
-        <span>转发规则</span>
-      </a>
-      <a href="#groups" class="nav-link flex items-center gap-3 px-3 py-2.5 rounded-r-lg text-sm text-panel-200" data-page="groups">
-        <span class="w-5 text-center text-base">&#9776;</span>
-        <span>线路组</span>
-      </a>
       <a href="#zones" class="nav-link flex items-center gap-3 px-3 py-2.5 rounded-r-lg text-sm text-panel-200" data-page="zones">
         <span class="w-5 text-center text-base">&#9741;</span>
         <span>DNS 域名</span>
@@ -317,84 +309,32 @@ tailwind.config = {
             </table>
           </div>
         </div>
-      </section>
 
-      <!-- ======== RULES ======== -->
-      <section id="page-rules" class="page-section">
-        <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-          <div>
-            <h2 class="text-lg font-semibold text-white font-display">转发规则</h2>
-            <p class="text-sm text-panel-300 mt-0.5">按节点配置端口转发规则</p>
+        <!-- Inline forwarding rules grouped by node -->
+        <div class="mt-6">
+          <div class="mb-4 flex items-center justify-between">
+            <div>
+              <h3 class="text-sm font-medium text-panel-200">转发规则</h3>
+              <p class="text-xs text-panel-400 mt-0.5">按节点配置的端口转发规则</p>
+            </div>
+            <button onclick="openModal('addRuleModal')"
+              class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-3 py-1.5 transition-colors whitespace-nowrap">
+              + 添加规则
+            </button>
           </div>
-          <button onclick="openModal('addRuleModal')"
-            class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors whitespace-nowrap self-start">
-            + 添加规则
-          </button>
-        </div>
-
-        <div class="bg-panel-800 border border-panel-500 rounded-xl overflow-hidden">
-          <div class="overflow-x-auto">
-            <table class="w-full text-sm">
-              <thead>
-                <tr class="border-b border-panel-500 text-xs text-panel-300 uppercase tracking-wider">
-                  <th class="text-left px-4 py-3 font-medium">节点</th>
-                  <th class="text-left px-4 py-3 font-medium">监听端口</th>
-                  <th class="text-left px-4 py-3 font-medium">协议</th>
-                  <th class="text-left px-4 py-3 font-medium">后端地址</th>
-                  <th class="text-left px-4 py-3 font-medium">工具</th>
-                  <th class="text-left px-4 py-3 font-medium">TLS</th>
-                  <th class="text-right px-4 py-3 font-medium">操作</th>
-                </tr>
-              </thead>
-              <tbody id="rulesTableBody" class="divide-y divide-panel-600">
-                <tr><td colspan="7" class="px-4 py-8 text-center text-panel-400">正在加载...</td></tr>
-              </tbody>
-            </table>
+          <div id="nodeRulesContainer" class="space-y-3">
+            <div class="text-sm text-panel-400 py-4 text-center">正在加载...</div>
           </div>
         </div>
       </section>
 
-      <!-- ======== LINE GROUPS ======== -->
-      <section id="page-groups" class="page-section">
-        <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-          <div>
-            <h2 class="text-lg font-semibold text-white font-display">线路组</h2>
-            <p class="text-sm text-panel-300 mt-0.5">GeoDNS 区域/运营商路由分组</p>
-          </div>
-          <button onclick="openModal('addGroupModal')"
-            class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors whitespace-nowrap self-start">
-            + 添加线路组
-          </button>
-        </div>
-
-        <div class="bg-panel-800 border border-panel-500 rounded-xl overflow-hidden">
-          <div class="overflow-x-auto">
-            <table class="w-full text-sm">
-              <thead>
-                <tr class="border-b border-panel-500 text-xs text-panel-300 uppercase tracking-wider">
-                  <th class="text-left px-4 py-3 font-medium">名称</th>
-                  <th class="text-left px-4 py-3 font-medium">匹配区域</th>
-                  <th class="text-left px-4 py-3 font-medium">匹配运营商</th>
-                  <th class="text-left px-4 py-3 font-medium">优先级</th>
-                  <th class="text-left px-4 py-3 font-medium">成员节点</th>
-                  <th class="text-left px-4 py-3 font-medium">回退组</th>
-                  <th class="text-right px-4 py-3 font-medium">操作</th>
-                </tr>
-              </thead>
-              <tbody id="groupsTableBody" class="divide-y divide-panel-600">
-                <tr><td colspan="7" class="px-4 py-8 text-center text-panel-400">正在加载...</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </section>
 
       <!-- ======== DNS ZONES ======== -->
       <section id="page-zones" class="page-section">
         <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <div>
             <h2 class="text-lg font-semibold text-white font-display">DNS 域名</h2>
-            <p class="text-sm text-panel-300 mt-0.5">权威 GeoDNS 域名管理</p>
+            <p class="text-sm text-panel-300 mt-0.5">权威 GeoDNS 域名与线路组管理</p>
           </div>
           <button onclick="openModal('addZoneModal')"
             class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors whitespace-nowrap self-start">
@@ -402,22 +342,8 @@ tailwind.config = {
           </button>
         </div>
 
-        <div class="bg-panel-800 border border-panel-500 rounded-xl overflow-hidden">
-          <div class="overflow-x-auto">
-            <table class="w-full text-sm">
-              <thead>
-                <tr class="border-b border-panel-500 text-xs text-panel-300 uppercase tracking-wider">
-                  <th class="text-left px-4 py-3 font-medium">域名</th>
-                  <th class="text-left px-4 py-3 font-medium">TTL</th>
-                  <th class="text-left px-4 py-3 font-medium">NS 记录</th>
-                  <th class="text-right px-4 py-3 font-medium">操作</th>
-                </tr>
-              </thead>
-              <tbody id="zonesTableBody" class="divide-y divide-panel-600">
-                <tr><td colspan="4" class="px-4 py-8 text-center text-panel-400">正在加载...</td></tr>
-              </tbody>
-            </table>
-          </div>
+        <div id="zonesContainer" class="space-y-4">
+          <div class="text-sm text-panel-400 py-8 text-center">正在加载...</div>
         </div>
       </section>
 
@@ -882,6 +808,7 @@ tailwind.config = {
       <button onclick="closeModal('addGroupModal')" class="text-panel-400 hover:text-white text-lg">&times;</button>
     </div>
     <div class="p-5 space-y-4">
+      <input type="hidden" id="addGroupZoneId" value="" />
       <div>
         <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">名称 *</label>
         <input id="addGroupName" type="text" placeholder="bj-telecom-group"
@@ -1106,6 +1033,9 @@ function openModal(id) {
 }
 function closeModal(id) {
   document.getElementById(id).classList.add('hidden');
+  if (id === 'addGroupModal') {
+    document.getElementById('addGroupZoneId').value = '';
+  }
 }
 
 /* ========== Helpers ========== */
@@ -1288,8 +1218,6 @@ async function refreshAll() {
 function renderAll() {
   renderDashboard();
   renderNodes();
-  renderRules();
-  renderGroups();
   renderZones();
   renderSettings();
 }
@@ -1418,30 +1346,113 @@ function renderTopology() {
 function renderNodes() {
   var body = document.getElementById('nodesTableBody');
   if (_nodes.length === 0) {
-    body.innerHTML = '<tr><td colspan="9" class="px-4 py-8 text-center text-panel-400">暂无节点</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-panel-400">暂无节点</td></tr>';
+  } else {
+    body.innerHTML = _nodes.map(function(n) {
+      var health = _health.find(function(h) { return h.id === n.id; });
+      var driftWarn = n.desired_config_gen !== n.applied_config_gen
+        ? ' <span class="text-amber-400" title="配置漂移警告">&#9888;</span>' : '';
+      return '<tr class="data-row" data-name="' + esc(n.name.toLowerCase()) + '">' +
+        '<td class="px-4 py-3 text-panel-100 font-medium">' + esc(n.name) + '</td>' +
+        '<td class="px-4 py-3 text-panel-300 font-mono text-xs">' + esc(n.public_ip) + '</td>' +
+        '<td class="px-4 py-3">' + statusBadge(n.status) + '</td>' +
+        '<td class="px-4 py-3 text-xs text-panel-300">' + n.desired_config_gen + '/' + n.applied_config_gen + driftWarn + '</td>' +
+        '<td class="px-4 py-3 text-xs text-panel-300">' + (n.bandwidth_cap_mbps ? n.bandwidth_cap_mbps + ' Mbps' : '-') + '</td>' +
+        '<td class="px-4 py-3 text-xs text-panel-300">' + (n.traffic_quota_bytes ? formatBytes(n.traffic_quota_bytes) : '-') + '</td>' +
+        '<td class="px-4 py-3 text-right">' +
+          '<div class="flex items-center justify-end gap-1">' +
+            '<button onclick="showInstallCmd(\'' + esc(n.id) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-400 transition-colors" title="安装命令">安装命令</button>' +
+            '<button onclick="regenToken(\'' + esc(n.id) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-panel-600 hover:bg-panel-500 text-panel-200 hover:text-white transition-colors" title="轮换Token">&#8635; 轮换Token</button>' +
+            '<button onclick="openEditNode(\'' + esc(n.id) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 transition-colors" title="编辑">&#9998;</button>' +
+            '<button onclick="confirmDelete(\'node\', \'' + esc(n.id) + '\', \'' + esc(n.name) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors" title="删除">&#10005;</button>' +
+          '</div>' +
+        '</td>' +
+      '</tr>';
+    }).join('');
+  }
+  renderNodeRules();
+}
+
+function renderNodeRules() {
+  var container = document.getElementById('nodeRulesContainer');
+  if (_rules.length === 0) {
+    container.innerHTML = '<div class="text-sm text-panel-400 py-4 text-center">暂无转发规则</div>';
     return;
   }
-  body.innerHTML = _nodes.map(function(n) {
-    var health = _health.find(function(h) { return h.id === n.id; });
-    var driftWarn = n.desired_config_gen !== n.applied_config_gen
-      ? ' <span class="text-amber-400" title="配置漂移警告">&#9888;</span>' : '';
-    return '<tr class="data-row" data-name="' + esc(n.name.toLowerCase()) + '">' +
-      '<td class="px-4 py-3 text-panel-100 font-medium">' + esc(n.name) + '</td>' +
-      '<td class="px-4 py-3 text-panel-300 font-mono text-xs">' + esc(n.public_ip) + '</td>' +
-      '<td class="px-4 py-3">' + statusBadge(n.status) + '</td>' +
-      '<td class="px-4 py-3 text-xs text-panel-300">' + n.desired_config_gen + '/' + n.applied_config_gen + driftWarn + '</td>' +
-      '<td class="px-4 py-3 text-xs text-panel-300">' + (n.bandwidth_cap_mbps ? n.bandwidth_cap_mbps + ' Mbps' : '-') + '</td>' +
-      '<td class="px-4 py-3 text-xs text-panel-300">' + (n.traffic_quota_bytes ? formatBytes(n.traffic_quota_bytes) : '-') + '</td>' +
-      '<td class="px-4 py-3 text-right">' +
-        '<div class="flex items-center justify-end gap-1">' +
-          '<button onclick="showInstallCmd(\'' + esc(n.id) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-400 transition-colors" title="安装命令">安装命令</button>' +
-          '<button onclick="regenToken(\'' + esc(n.id) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-panel-600 hover:bg-panel-500 text-panel-200 hover:text-white transition-colors" title="轮换Token">&#8635; 轮换Token</button>' +
-          '<button onclick="openEditNode(\'' + esc(n.id) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 transition-colors" title="编辑">&#9998;</button>' +
-          '<button onclick="confirmDelete(\'node\', \'' + esc(n.id) + '\', \'' + esc(n.name) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors" title="删除">&#10005;</button>' +
+  // Group rules by node
+  var rulesByNode = {};
+  _rules.forEach(function(r) {
+    if (!rulesByNode[r.node_id]) rulesByNode[r.node_id] = [];
+    rulesByNode[r.node_id].push(r);
+  });
+
+  var html = Object.keys(rulesByNode).map(function(nodeId) {
+    var nodeRules = rulesByNode[nodeId];
+    var nodeName = nodeNameById(nodeId);
+    var rows = nodeRules.map(function(r) {
+      var tlsBadge = (r.tls_mode === 'terminate')
+        ? '<span class="text-xs px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">HTTPS 代理</span>'
+        : '<span class="text-xs px-2 py-0.5 rounded bg-panel-600 text-panel-200">直接转发</span>';
+      return '<tr class="data-row">' +
+        '<td class="px-4 py-2.5 text-panel-300 font-mono text-xs">' + r.listen_port + '</td>' +
+        '<td class="px-4 py-2.5"><span class="text-xs px-2 py-0.5 rounded uppercase ' +
+          (r.protocol === 'tcp' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' : 'bg-purple-500/10 text-purple-400 border border-purple-500/20') +
+          '">' + esc(r.protocol) + '</span></td>' +
+        '<td class="px-4 py-2.5 text-panel-300 font-mono text-xs">' + esc(r.backend_host) + ':' + r.backend_port + '</td>' +
+        '<td class="px-4 py-2.5"><span class="text-xs px-2 py-0.5 rounded bg-panel-600 text-panel-200">' + esc(r.tool) + '</span></td>' +
+        '<td class="px-4 py-2.5">' + tlsBadge + '</td>' +
+        '<td class="px-4 py-2.5 text-right">' +
+          '<button onclick="confirmDelete(\'rule\', \'' + esc(r.id) + '\', \'端口 ' + r.listen_port + ' 的规则\')" class="text-xs px-2 py-1 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">&#10005;</button>' +
+        '</td>' +
+      '</tr>';
+    }).join('');
+
+    return '<div class="bg-panel-800 border border-panel-500 rounded-xl overflow-hidden">' +
+      '<div class="px-4 py-3 border-b border-panel-600 flex items-center justify-between">' +
+        '<div class="flex items-center gap-2">' +
+          '<span class="text-sm font-medium text-panel-100">' + esc(nodeName) + '</span>' +
+          '<span class="text-xs text-panel-400">' + nodeRules.length + ' 条规则</span>' +
         '</div>' +
-      '</td>' +
-    '</tr>';
+        '<button onclick="openAddRuleForNode(\'' + esc(nodeId) + '\')" class="text-xs px-2.5 py-1 rounded-md bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 transition-colors">+ 添加规则</button>' +
+      '</div>' +
+      '<div class="overflow-x-auto">' +
+        '<table class="w-full text-sm">' +
+          '<thead><tr class="border-b border-panel-600 text-xs text-panel-300 uppercase tracking-wider">' +
+            '<th class="text-left px-4 py-2 font-medium">监听端口</th>' +
+            '<th class="text-left px-4 py-2 font-medium">协议</th>' +
+            '<th class="text-left px-4 py-2 font-medium">后端地址</th>' +
+            '<th class="text-left px-4 py-2 font-medium">工具</th>' +
+            '<th class="text-left px-4 py-2 font-medium">TLS</th>' +
+            '<th class="text-right px-4 py-2 font-medium">操作</th>' +
+          '</tr></thead>' +
+          '<tbody class="divide-y divide-panel-600">' + rows + '</tbody>' +
+        '</table>' +
+      '</div>' +
+    '</div>';
   }).join('');
+
+  // Show nodes with no rules
+  var nodesWithoutRules = _nodes.filter(function(n) { return !rulesByNode[n.id]; });
+  if (nodesWithoutRules.length > 0) {
+    html += '<div class="bg-panel-800 border border-panel-500 rounded-xl p-4">' +
+      '<div class="flex items-center justify-between">' +
+        '<span class="text-sm text-panel-400">无规则的节点: ' +
+          nodesWithoutRules.map(function(n) { return esc(n.name); }).join(', ') +
+        '</span>' +
+      '</div>' +
+    '</div>';
+  }
+
+  container.innerHTML = html;
+}
+
+function openAddRuleForNode(nodeId) {
+  openModal('addRuleModal');
+  // Pre-select the node after the select is populated
+  setTimeout(function() {
+    var sel = document.getElementById('addRuleNode');
+    if (sel) sel.value = nodeId;
+  }, 50);
 }
 
 async function openEditNode(id) {
@@ -1492,79 +1503,86 @@ function filterNodes() {
   });
 }
 
-/* ========== Rules ========== */
-function renderRules() {
-  var body = document.getElementById('rulesTableBody');
-  if (_rules.length === 0) {
-    body.innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-panel-400">暂无规则</td></tr>';
-    return;
-  }
-  body.innerHTML = _rules.map(function(r) {
-    var tlsBadge = (r.tls_mode === 'terminate')
-      ? '<span class="text-xs px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">HTTPS 代理</span>'
-      : '<span class="text-xs px-2 py-0.5 rounded bg-panel-600 text-panel-200">直接转发</span>';
-    return '<tr class="data-row">' +
-      '<td class="px-4 py-3 text-panel-100 font-medium text-xs">' + esc(nodeNameById(r.node_id)) + '</td>' +
-      '<td class="px-4 py-3 text-panel-300 font-mono text-xs">' + r.listen_port + '</td>' +
-      '<td class="px-4 py-3"><span class="text-xs px-2 py-0.5 rounded uppercase ' +
-        (r.protocol === 'tcp' ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' : 'bg-purple-500/10 text-purple-400 border border-purple-500/20') +
-        '">' + esc(r.protocol) + '</span></td>' +
-      '<td class="px-4 py-3 text-panel-300 font-mono text-xs">' + esc(r.backend_host) + ':' + r.backend_port + '</td>' +
-      '<td class="px-4 py-3"><span class="text-xs px-2 py-0.5 rounded bg-panel-600 text-panel-200">' + esc(r.tool) + '</span></td>' +
-      '<td class="px-4 py-3">' + tlsBadge + '</td>' +
-      '<td class="px-4 py-3 text-right">' +
-        '<button onclick="confirmDelete(\'rule\', \'' + esc(r.id) + '\', \'端口 ' + r.listen_port + ' 的规则\')" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">&#10005; 删除</button>' +
-      '</td>' +
-    '</tr>';
-  }).join('');
-}
-
-/* ========== Groups ========== */
-function renderGroups() {
-  var body = document.getElementById('groupsTableBody');
-  if (_groups.length === 0) {
-    body.innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-panel-400">暂无线路组</td></tr>';
-    return;
-  }
-  body.innerHTML = _groups.map(function(g) {
-    var memberNames = (g.member_node_ids || []).map(function(mid) { return nodeNameById(mid); });
-    var memberCount = memberNames.length;
-    var memberTooltip = memberNames.join(', ');
-    var regionDisplay = provinceLabel(g.match_region);
-    return '<tr class="data-row">' +
-      '<td class="px-4 py-3 text-panel-100 font-medium">' + esc(g.name) + '</td>' +
-      '<td class="px-4 py-3 text-panel-300 text-xs">' + (regionDisplay ? esc(regionDisplay) : '<span class="text-panel-500">不限</span>') + '</td>' +
-      '<td class="px-4 py-3 text-panel-300 text-xs">' + (g.match_isp != null ? esc(g.match_isp) : '<span class="text-panel-500">不限</span>') + '</td>' +
-      '<td class="px-4 py-3 text-panel-300 text-xs">' + g.priority + '</td>' +
-      '<td class="px-4 py-3 text-xs"><span class="text-panel-200" title="' + esc(memberTooltip) + '">' + memberCount + ' 个节点</span>' +
-        (memberCount > 0 ? '<span class="text-panel-500 ml-1">(' + esc(memberNames.slice(0, 3).join(', ')) + (memberCount > 3 ? '...' : '') + ')</span>' : '') +
-      '</td>' +
-      '<td class="px-4 py-3 text-panel-300 text-xs">' + (g.fallback_group ? esc(groupNameById(g.fallback_group)) : '<span class="text-panel-500">无</span>') + '</td>' +
-      '<td class="px-4 py-3 text-right">' +
-        '<button onclick="confirmDelete(\'group\', \'' + esc(g.id) + '\', \'' + esc(g.name) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">&#10005; 删除</button>' +
-      '</td>' +
-    '</tr>';
-  }).join('');
-}
-
-/* ========== Zones ========== */
+/* ========== Zones (with inline line groups) ========== */
 function renderZones() {
-  var body = document.getElementById('zonesTableBody');
+  var container = document.getElementById('zonesContainer');
   if (_zones.length === 0) {
-    body.innerHTML = '<tr><td colspan="4" class="px-4 py-8 text-center text-panel-400">暂无 DNS 域名</td></tr>';
+    container.innerHTML = '<div class="text-sm text-panel-400 py-8 text-center">暂无 DNS 域名</div>';
     return;
   }
-  body.innerHTML = _zones.map(function(z) {
-    var nsDisplay = (z.ns && z.ns.length > 0) ? z.ns.join(', ') : '<span class="text-panel-500">无</span>';
-    return '<tr class="data-row">' +
-      '<td class="px-4 py-3 text-panel-100 font-medium font-mono text-xs">' + esc(z.apex_domain) + '</td>' +
-      '<td class="px-4 py-3 text-panel-300 text-xs">' + z.default_ttl + '秒</td>' +
-      '<td class="px-4 py-3 text-panel-300 text-xs">' + nsDisplay + '</td>' +
-      '<td class="px-4 py-3 text-right">' +
-        '<button onclick="confirmDelete(\'zone\', \'' + esc(z.id) + '\', \'' + esc(z.apex_domain) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">&#10005; 删除</button>' +
-      '</td>' +
-    '</tr>';
+
+  var html = _zones.map(function(z) {
+    var nsDisplay = (z.ns && z.ns.length > 0) ? z.ns.map(function(n) { return esc(n); }).join(', ') : '<span class="text-panel-500">无</span>';
+    // Filter groups belonging to this zone (by zone_id match, or legacy groups with no zone_id)
+    var zoneGroups = _groups.filter(function(g) { return g.zone_id === z.id; });
+    var legacyGroups = _groups.filter(function(g) { return !g.zone_id; });
+
+    var groupRows = '';
+    var allGroups = zoneGroups.concat(legacyGroups);
+    if (allGroups.length > 0) {
+      var tableRows = allGroups.map(function(g) {
+        var memberNames = (g.member_node_ids || []).map(function(mid) { return nodeNameById(mid); });
+        var regionDisplay = provinceLabel(g.match_region);
+        var isLegacy = !g.zone_id;
+        return '<tr class="data-row">' +
+          '<td class="px-4 py-2.5 text-panel-100 text-xs font-medium">' + esc(g.name) +
+            (isLegacy ? ' <span class="text-panel-500 text-[10px]">(全局)</span>' : '') +
+          '</td>' +
+          '<td class="px-4 py-2.5 text-panel-300 text-xs">' + (regionDisplay ? esc(regionDisplay) : '<span class="text-panel-500">不限</span>') + '</td>' +
+          '<td class="px-4 py-2.5 text-panel-300 text-xs">' + (g.match_isp != null ? esc(g.match_isp) : '<span class="text-panel-500">不限</span>') + '</td>' +
+          '<td class="px-4 py-2.5 text-xs">' +
+            '<span class="text-panel-200" title="' + esc(memberNames.join(', ')) + '">' +
+              (memberNames.length > 0 ? esc(memberNames.slice(0, 3).join(', ')) + (memberNames.length > 3 ? '...' : '') : '<span class="text-panel-500">无</span>') +
+            '</span>' +
+          '</td>' +
+          '<td class="px-4 py-2.5 text-panel-300 text-xs">' + g.priority + '</td>' +
+          '<td class="px-4 py-2.5 text-right">' +
+            '<button onclick="confirmDelete(\'group\', \'' + esc(g.id) + '\', \'' + esc(g.name) + '\')" class="text-xs px-2 py-1 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">&#10005;</button>' +
+          '</td>' +
+        '</tr>';
+      }).join('');
+
+      groupRows = '<div class="overflow-x-auto">' +
+        '<table class="w-full text-sm">' +
+          '<thead><tr class="border-b border-panel-600 text-xs text-panel-300 uppercase tracking-wider">' +
+            '<th class="text-left px-4 py-2 font-medium">名称</th>' +
+            '<th class="text-left px-4 py-2 font-medium">匹配区域</th>' +
+            '<th class="text-left px-4 py-2 font-medium">匹配运营商</th>' +
+            '<th class="text-left px-4 py-2 font-medium">节点</th>' +
+            '<th class="text-left px-4 py-2 font-medium">优先级</th>' +
+            '<th class="text-right px-4 py-2 font-medium">操作</th>' +
+          '</tr></thead>' +
+          '<tbody class="divide-y divide-panel-600">' + tableRows + '</tbody>' +
+        '</table>' +
+      '</div>';
+    } else {
+      groupRows = '<div class="px-4 py-3 text-sm text-panel-400 text-center">暂无线路组</div>';
+    }
+
+    return '<div class="bg-panel-800 border border-panel-500 rounded-xl overflow-hidden animate-fade-in">' +
+      '<div class="px-5 py-4 border-b border-panel-600 flex items-start justify-between">' +
+        '<div>' +
+          '<div class="text-sm font-medium text-white font-mono">' + esc(z.apex_domain) + '</div>' +
+          '<div class="text-xs text-panel-400 mt-1">TTL: ' + z.default_ttl + '秒 &middot; NS: ' + nsDisplay + '</div>' +
+        '</div>' +
+        '<div class="flex items-center gap-2">' +
+          '<button onclick="confirmDelete(\'zone\', \'' + esc(z.id) + '\', \'' + esc(z.apex_domain) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">&#10005; 删除</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="px-4 py-3 border-b border-panel-600 flex items-center justify-between">' +
+        '<span class="text-xs font-medium text-panel-300 uppercase tracking-wider">线路组</span>' +
+        '<button onclick="openAddGroupForZone(\'' + esc(z.id) + '\')" class="text-xs px-2.5 py-1 rounded-md bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 transition-colors">+ 添加线路组</button>' +
+      '</div>' +
+      groupRows +
+    '</div>';
   }).join('');
+
+  container.innerHTML = html;
+}
+
+function openAddGroupForZone(zoneId) {
+  document.getElementById('addGroupZoneId').value = zoneId;
+  openModal('addGroupModal');
 }
 
 /* ========== Settings ========== */
@@ -1918,6 +1936,9 @@ async function createGroup() {
     member_node_ids: checkedNodes
   };
 
+  var zoneId = document.getElementById('addGroupZoneId').value;
+  if (zoneId) body.zone_id = zoneId;
+
   var region = document.getElementById('addGroupRegion').value;
   if (region) body.match_region = parseInt(region, 10);
 
@@ -1932,6 +1953,7 @@ async function createGroup() {
     closeModal('addGroupModal');
     document.getElementById('addGroupName').value = '';
     document.getElementById('addGroupRegion').value = '';
+    document.getElementById('addGroupZoneId').value = '';
     document.querySelectorAll('.grp-node-cb').forEach(function(cb) { cb.checked = false; });
     toast('线路组 "' + name + '" 创建成功', 'success');
     await refreshAll();

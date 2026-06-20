@@ -582,6 +582,7 @@ mod tests {
         let group = LineGroup {
             id: "g1".into(),
             name: "g1".into(),
+            zone_id: None,
             match_region: None,
             match_isp: None,
             member_node_ids: vec!["n1".into(), "n2".into()],

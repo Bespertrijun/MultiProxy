@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use contract::model::LineGroup;
+use contract::model::{DnsZone, LineGroup};
 use contract::snapshot::AvailabilitySnapshot;
 use geoip::ProviderHandle;
 use hickory_proto::op::{Edns, Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode};
@@ -30,6 +30,8 @@ pub struct GeoDnsHandler {
     pub provider: Arc<ProviderHandle>,
     /// Current line groups (swapped by the panel when CRUD changes them).
     pub groups: Arc<ArcSwap<Vec<LineGroup>>>,
+    /// DNS zones for domain→zone matching.
+    pub zones: Arc<ArcSwap<Vec<DnsZone>>>,
     /// Resolution-domain A-record TTL (Q4, default 60s).
     pub ttl: Arc<AtomicU64>,
     /// Observability counters (ECS hit/miss), for the metrics surface (§12).
@@ -44,12 +46,14 @@ impl GeoDnsHandler {
         snapshot: Arc<ArcSwap<AvailabilitySnapshot>>,
         provider: Arc<ProviderHandle>,
         groups: Arc<ArcSwap<Vec<LineGroup>>>,
+        zones: Arc<ArcSwap<Vec<DnsZone>>>,
         ttl_secs: u32,
     ) -> Self {
         Self {
             snapshot,
             provider,
             groups,
+            zones,
             ttl: Arc::new(AtomicU64::new(u64::from(ttl_secs))),
             ecs_hits: Arc::new(AtomicU64::new(0)),
             ecs_misses: Arc::new(AtomicU64::new(0)),
@@ -122,8 +126,16 @@ impl RequestHandler for GeoDnsHandler {
         let snapshot = self.snapshot.load();
         let provider = self.provider.current();
         let groups = self.groups.load();
-        let resolution =
-            answer::resolve(provider.as_ref(), groups.as_ref(), &snapshot, client.addr);
+        let zones = self.zones.load();
+        let query_name_str = name.to_ascii().trim_end_matches('.').to_lowercase();
+        let resolution = answer::resolve(
+            provider.as_ref(),
+            groups.as_ref(),
+            zones.as_ref(),
+            &snapshot,
+            client.addr,
+            &query_name_str,
+        );
 
         match resolution {
             Resolution::Answer(ipv4s) => {
