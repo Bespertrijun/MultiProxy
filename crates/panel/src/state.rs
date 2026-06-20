@@ -77,6 +77,7 @@ pub struct AppState {
 impl AppState {
     /// Build state around an open DB pool and the shared DNS handles.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: SqlitePool,
         snapshot: Arc<ArcSwap<AvailabilitySnapshot>>,
