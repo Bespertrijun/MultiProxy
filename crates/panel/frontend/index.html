@@ -680,6 +680,15 @@ tailwind.config = {
             class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
         </div>
         <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">计费方向</label>
+          <select id="addNodeQuotaDir"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100">
+            <option value="Both">双向 (上行+下行)</option>
+            <option value="TxOnly">仅上行</option>
+            <option value="RxOnly">仅下行</option>
+          </select>
+        </div>
+        <div>
           <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">重置日</label>
           <input id="addNodeResetDay" type="number" min="1" max="28" placeholder="1"
             class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
@@ -1689,6 +1698,8 @@ async function createNode() {
 
   var quota = document.getElementById('addNodeQuota').value;
   if (quota) body.traffic_quota_bytes = Math.round(parseFloat(quota) * 1073741824);
+
+  body.quota_direction = document.getElementById('addNodeQuotaDir').value;
 
   var resetDay = document.getElementById('addNodeResetDay').value;
   if (resetDay) body.quota_reset_day = parseInt(resetDay, 10);

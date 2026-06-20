@@ -264,6 +264,7 @@ async fn handle_status_report(state: &AppState, node_id: &str, report: &StatusRe
             &mut exit,
             node.bandwidth_cap_mbps,
             cap,
+            node.quota_direction,
         );
         rt.sat_enter_windows = enter;
         rt.sat_exit_windows = exit;

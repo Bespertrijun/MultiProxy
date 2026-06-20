@@ -80,6 +80,7 @@ pub fn apply_capacity(
     sat_exit_windows: &mut u8,
     bandwidth_cap_mbps: Option<u32>,
     cap: &Capacity,
+    direction: contract::model::QuotaDirection,
 ) -> CapacityOutcome {
     let mut state = prior.clone();
     let mut reset_detected = false;
@@ -98,10 +99,14 @@ pub fn apply_capacity(
         let rx_delta = cap.rx_bytes_total.checked_sub(prior.last_rx_bytes_total);
         match (tx_delta, rx_delta) {
             (Some(tx), Some(rx)) => {
+                let delta = match direction {
+                    contract::model::QuotaDirection::Both => tx.saturating_add(rx),
+                    contract::model::QuotaDirection::TxOnly => tx,
+                    contract::model::QuotaDirection::RxOnly => rx,
+                };
                 state.accumulated_usage_bytes = state
                     .accumulated_usage_bytes
-                    .saturating_add(tx)
-                    .saturating_add(rx);
+                    .saturating_add(delta);
                 state.last_tx_bytes_total = cap.tx_bytes_total;
                 state.last_rx_bytes_total = cap.rx_bytes_total;
             }
@@ -334,7 +339,7 @@ pub fn node_status_from_runtime(
 mod tests {
     use super::*;
     use contract::isp::Isp;
-    use contract::model::Region;
+    use contract::model::{QuotaDirection, Region};
     use contract::protocol::CapacitySource;
     use std::net::Ipv4Addr;
 
@@ -351,6 +356,7 @@ mod tests {
             applied_config_gen: 0,
             bandwidth_cap_mbps: Some(100),
             traffic_quota_bytes: quota,
+            quota_direction: QuotaDirection::Both,
             quota_reset_day: Some(1),
             soft_quota_pct: 90,
             hard_quota_pct: 100,
@@ -397,6 +403,7 @@ mod tests {
             &mut x,
             Some(100),
             &cap(1, 1000, 2000, 0),
+            QuotaDirection::Both,
         );
         assert_eq!(out.state.accumulated_usage_bytes, 0);
         assert!(out.state.has_counter_baseline);
@@ -414,6 +421,7 @@ mod tests {
             &mut x,
             Some(100),
             &cap(1, 1000, 2000, 0),
+            QuotaDirection::Both,
         )
         .state;
         let out = apply_capacity(
@@ -423,6 +431,7 @@ mod tests {
             &mut x,
             Some(100),
             &cap(1, 1500, 2200, 0),
+            QuotaDirection::Both,
         );
         // delta tx=500 + rx=200 = 700
         assert_eq!(out.state.accumulated_usage_bytes, 700);
@@ -441,6 +450,7 @@ mod tests {
             &mut x,
             Some(100),
             &cap(50, 9000, 1000, 0),
+            QuotaDirection::Both,
         )
         .state;
         prior = apply_capacity(
@@ -450,6 +460,7 @@ mod tests {
             &mut x,
             Some(100),
             &cap(50, 9500, 1000, 0),
+            QuotaDirection::Both,
         )
         .state;
         assert_eq!(prior.accumulated_usage_bytes, 500);
@@ -461,6 +472,7 @@ mod tests {
             &mut x,
             Some(100),
             &cap(3, 10, 20, 0),
+            QuotaDirection::Both,
         );
         assert!(out.reset_detected);
         // No double-count, no negative: accumulation unchanged (re-baselined).
@@ -479,6 +491,7 @@ mod tests {
             &mut x,
             Some(100),
             &cap(1, 1000, 1000, 0),
+            QuotaDirection::Both,
         )
         .state;
         let out = apply_capacity(
@@ -488,6 +501,7 @@ mod tests {
             &mut x,
             Some(100),
             &cap(1, 10, 10, 0),
+            QuotaDirection::Both,
         );
         assert!(out.reset_detected);
         assert_eq!(out.state.accumulated_usage_bytes, 0);

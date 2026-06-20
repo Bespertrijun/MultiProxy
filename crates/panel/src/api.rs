@@ -240,6 +240,8 @@ struct CreateNodeReq {
     #[serde(default)]
     traffic_quota_bytes: Option<u64>,
     #[serde(default)]
+    quota_direction: Option<contract::model::QuotaDirection>,
+    #[serde(default)]
     quota_reset_day: Option<u8>,
 }
 
@@ -271,6 +273,7 @@ async fn create_node(
         applied_config_gen: 0,
         bandwidth_cap_mbps: req.bandwidth_cap_mbps,
         traffic_quota_bytes: req.traffic_quota_bytes,
+        quota_direction: req.quota_direction.unwrap_or_default(),
         quota_reset_day: req.quota_reset_day,
         soft_quota_pct: 90,
         hard_quota_pct: 100,

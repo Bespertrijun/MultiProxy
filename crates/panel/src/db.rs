@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS front_node (
     -- capacity config (operator-set, rev3 §B)
     bandwidth_cap_mbps       INTEGER,
     traffic_quota_bytes      INTEGER,
+    quota_direction          TEXT NOT NULL DEFAULT 'Both',
     quota_reset_day          INTEGER,
     soft_quota_pct           INTEGER NOT NULL DEFAULT 90,
     hard_quota_pct           INTEGER NOT NULL DEFAULT 100,
@@ -191,6 +192,20 @@ fn isp_from(s: &str) -> Isp {
         "aliyun" => Isp::Aliyun,
         "cstnet" => Isp::Cstnet,
         _ => Isp::Unknown,
+    }
+}
+fn quota_dir_str(d: contract::model::QuotaDirection) -> &'static str {
+    match d {
+        contract::model::QuotaDirection::Both => "Both",
+        contract::model::QuotaDirection::TxOnly => "TxOnly",
+        contract::model::QuotaDirection::RxOnly => "RxOnly",
+    }
+}
+fn quota_dir_from(s: &str) -> contract::model::QuotaDirection {
+    match s {
+        "TxOnly" => contract::model::QuotaDirection::TxOnly,
+        "RxOnly" => contract::model::QuotaDirection::RxOnly,
+        _ => contract::model::QuotaDirection::Both,
     }
 }
 fn sat_str(s: SaturationState) -> &'static str {
@@ -420,6 +435,7 @@ fn row_to_node(row: &sqlx::sqlite::SqliteRow) -> FrontNode {
         traffic_quota_bytes: row
             .get::<Option<i64>, _>("traffic_quota_bytes")
             .map(|v| v as u64),
+        quota_direction: quota_dir_from(&row.get::<String, _>("quota_direction")),
         quota_reset_day: row
             .get::<Option<i64>, _>("quota_reset_day")
             .map(|v| v as u8),
@@ -441,14 +457,15 @@ pub async fn upsert_node(pool: &SqlitePool, n: &FrontNode) -> Result<()> {
         "INSERT INTO front_node(
             id, name, public_ip, division_code, province_code, isp, status, last_seen,
             desired_config_gen, applied_config_gen, bandwidth_cap_mbps, traffic_quota_bytes,
-            quota_reset_day, soft_quota_pct, hard_quota_pct, accumulated_usage_bytes,
+            quota_direction, quota_reset_day, soft_quota_pct, hard_quota_pct, accumulated_usage_bytes,
             current_throughput_bps, saturation_state, availability_state)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET
             name=excluded.name, public_ip=excluded.public_ip,
             division_code=excluded.division_code, province_code=excluded.province_code,
             isp=excluded.isp, bandwidth_cap_mbps=excluded.bandwidth_cap_mbps,
-            traffic_quota_bytes=excluded.traffic_quota_bytes, quota_reset_day=excluded.quota_reset_day,
+            traffic_quota_bytes=excluded.traffic_quota_bytes, quota_direction=excluded.quota_direction,
+            quota_reset_day=excluded.quota_reset_day,
             soft_quota_pct=excluded.soft_quota_pct, hard_quota_pct=excluded.hard_quota_pct",
     )
     .bind(&n.id)
@@ -463,6 +480,7 @@ pub async fn upsert_node(pool: &SqlitePool, n: &FrontNode) -> Result<()> {
     .bind(n.applied_config_gen as i64)
     .bind(n.bandwidth_cap_mbps.map(i64::from))
     .bind(n.traffic_quota_bytes.map(|v| v as i64))
+    .bind(quota_dir_str(n.quota_direction))
     .bind(n.quota_reset_day.map(i64::from))
     .bind(i64::from(n.soft_quota_pct))
     .bind(i64::from(n.hard_quota_pct))

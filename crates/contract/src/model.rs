@@ -32,6 +32,8 @@ pub struct FrontNode {
     pub bandwidth_cap_mbps: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_quota_bytes: Option<u64>,
+    #[serde(default)]
+    pub quota_direction: QuotaDirection,
     /// Billing-cycle reset day-of-month (1–28). `None` = no quota tracking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_reset_day: Option<u8>,
@@ -56,6 +58,14 @@ const fn default_soft_quota_pct() -> u8 {
 }
 const fn default_hard_quota_pct() -> u8 {
     100
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum QuotaDirection {
+    #[default]
+    Both,
+    TxOnly,
+    RxOnly,
 }
 
 /// Administrative region decoded from GeoCN's integer `division_code` (D5/CRITICAL-2).
