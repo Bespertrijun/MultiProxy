@@ -40,7 +40,11 @@ async fn detect_public_ip() -> Option<String> {
         .ok()?
         .trim()
         .to_string();
-    if ip.is_empty() { None } else { Some(ip) }
+    if ip.is_empty() {
+        None
+    } else {
+        Some(ip)
+    }
 }
 
 /// Maximum download size (100 MB) to prevent abuse.
