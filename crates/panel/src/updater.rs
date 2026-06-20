@@ -68,9 +68,7 @@ pub async fn check_update() -> Result<UpdateInfo, String> {
 
 /// Download a release asset by name and save it to `dest`. Returns bytes written.
 pub async fn download_asset(tag: &str, asset_name: &str, dest: &Path) -> Result<u64, String> {
-    let url = format!(
-        "https://github.com/{GITHUB_REPO}/releases/download/{tag}/{asset_name}"
-    );
+    let url = format!("https://github.com/{GITHUB_REPO}/releases/download/{tag}/{asset_name}");
 
     let client = reqwest::Client::builder()
         .timeout(DOWNLOAD_TIMEOUT)
