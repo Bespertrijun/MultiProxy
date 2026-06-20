@@ -104,9 +104,7 @@ pub fn apply_capacity(
                     contract::model::QuotaDirection::TxOnly => tx,
                     contract::model::QuotaDirection::RxOnly => rx,
                 };
-                state.accumulated_usage_bytes = state
-                    .accumulated_usage_bytes
-                    .saturating_add(delta);
+                state.accumulated_usage_bytes = state.accumulated_usage_bytes.saturating_add(delta);
                 state.last_tx_bytes_total = cap.tx_bytes_total;
                 state.last_rx_bytes_total = cap.rx_bytes_total;
             }
