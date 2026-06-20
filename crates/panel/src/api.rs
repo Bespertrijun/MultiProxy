@@ -789,9 +789,8 @@ fn mask_token(token: &str) -> String {
     if token.len() <= 8 {
         return "****".to_string();
     }
-    let first = &token[..4];
     let last = &token[token.len() - 4..];
-    format!("{first}****{last}")
+    format!("****{last}")
 }
 
 #[derive(Serialize)]
