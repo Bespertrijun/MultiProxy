@@ -57,7 +57,10 @@ const GEOCN_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 pub fn router(state: AppState) -> Router {
     let guarded = Router::new()
         .route("/api/nodes", get(list_nodes).post(create_node))
-        .route("/api/nodes/{id}", get(get_node).delete(delete_node))
+        .route(
+            "/api/nodes/{id}",
+            get(get_node).put(update_node).delete(delete_node),
+        )
         .route("/api/nodes/{id}/token", post(regen_token))
         .route("/api/rules", get(list_rules).post(create_rule))
         .route("/api/rules/{id}", axum::routing::delete(delete_rule))
@@ -310,6 +313,51 @@ async fn get_node(
     Path(id): Path<String>,
 ) -> Result<Json<FrontNode>> {
     Ok(Json(db::get_node(&state.db, &id).await?))
+}
+
+#[derive(Deserialize)]
+struct UpdateNodeReq {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    public_ip: Option<String>,
+    #[serde(default)]
+    bandwidth_cap_mbps: Option<u32>,
+    #[serde(default)]
+    traffic_quota_bytes: Option<u64>,
+    #[serde(default)]
+    quota_direction: Option<contract::model::QuotaDirection>,
+    #[serde(default)]
+    quota_reset_day: Option<u8>,
+}
+
+async fn update_node(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateNodeReq>,
+) -> Result<Json<FrontNode>> {
+    let mut node = db::get_node(&state.db, &id).await?;
+    if let Some(name) = req.name {
+        if !name.trim().is_empty() {
+            node.name = name;
+        }
+    }
+    if let Some(ip) = req.public_ip {
+        if !ip.trim().is_empty() {
+            node.public_ip = ip;
+        }
+    }
+    node.bandwidth_cap_mbps = req.bandwidth_cap_mbps.or(node.bandwidth_cap_mbps);
+    node.traffic_quota_bytes = req.traffic_quota_bytes.or(node.traffic_quota_bytes);
+    if let Some(dir) = req.quota_direction {
+        node.quota_direction = dir;
+    }
+    if let Some(day) = req.quota_reset_day {
+        node.quota_reset_day = Some(day);
+    }
+    db::upsert_node(&state.db, &node).await?;
+    rebuild_and_store_snapshot(&state).await;
+    Ok(Json(node))
 }
 
 async fn delete_node(State(state): State<AppState>, Path(id): Path<String>) -> Result<StatusCode> {

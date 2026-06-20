@@ -704,6 +704,64 @@ tailwind.config = {
   </div>
 </div>
 
+<!-- Edit Node Modal -->
+<div id="editNodeModal" class="hidden fixed inset-0 z-[60] flex items-center justify-center p-4">
+  <div class="modal-backdrop absolute inset-0" onclick="closeModal('editNodeModal')"></div>
+  <div class="relative bg-panel-800 border border-panel-500 rounded-xl shadow-2xl w-full max-w-md animate-slide-up">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-panel-500">
+      <h3 class="text-sm font-semibold text-white">编辑节点</h3>
+      <button onclick="closeModal('editNodeModal')" class="text-panel-400 hover:text-white text-lg">&times;</button>
+    </div>
+    <div class="p-5 space-y-4">
+      <input type="hidden" id="editNodeId" />
+      <div>
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">名称</label>
+        <input id="editNodeName" type="text"
+          class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+      </div>
+      <div>
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">公网 IP</label>
+        <input id="editNodeIP" type="text"
+          class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">带宽上限 (Mbps)</label>
+          <input id="editNodeBW" type="number"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">流量配额 (GB)</label>
+          <input id="editNodeQuota" type="number"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">计费方向</label>
+          <select id="editNodeQuotaDir"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100">
+            <option value="Both">双向 (上行+下行)</option>
+            <option value="TxOnly">仅上行</option>
+            <option value="RxOnly">仅下行</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">重置日</label>
+          <input id="editNodeResetDay" type="number" min="1" max="28"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+        </div>
+      </div>
+    </div>
+    <div class="flex justify-end gap-2 px-5 py-4 border-t border-panel-500">
+      <button onclick="closeModal('editNodeModal')"
+        class="px-4 py-2 text-sm text-panel-300 hover:text-white rounded-lg hover:bg-panel-600 transition-colors">取消</button>
+      <button onclick="saveEditNode()"
+        class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors">保存</button>
+    </div>
+  </div>
+</div>
+
 <!-- Token Display Modal -->
 <div id="tokenModal" class="hidden fixed inset-0 z-[60] flex items-center justify-center p-4">
   <div class="modal-backdrop absolute inset-0" onclick="closeModal('tokenModal')"></div>
@@ -1332,11 +1390,52 @@ function renderNodes() {
         '<div class="flex items-center justify-end gap-1">' +
           '<button onclick="showInstallCmd(\'' + esc(n.id) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-400 transition-colors" title="安装命令">安装命令</button>' +
           '<button onclick="regenToken(\'' + esc(n.id) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-panel-600 hover:bg-panel-500 text-panel-200 hover:text-white transition-colors" title="轮换Token">&#8635; 轮换Token</button>' +
+          '<button onclick="openEditNode(\'' + esc(n.id) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 transition-colors" title="编辑">&#9998;</button>' +
           '<button onclick="confirmDelete(\'node\', \'' + esc(n.id) + '\', \'' + esc(n.name) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors" title="删除">&#10005;</button>' +
         '</div>' +
       '</td>' +
     '</tr>';
   }).join('');
+}
+
+async function openEditNode(id) {
+  try {
+    var node = await api('GET', '/api/nodes/' + id);
+    document.getElementById('editNodeId').value = node.id;
+    document.getElementById('editNodeName').value = node.name;
+    document.getElementById('editNodeIP').value = node.public_ip;
+    document.getElementById('editNodeBW').value = node.bandwidth_cap_mbps || '';
+    document.getElementById('editNodeQuota').value = node.traffic_quota_bytes ? (node.traffic_quota_bytes / 1073741824).toFixed(2) : '';
+    document.getElementById('editNodeQuotaDir').value = node.quota_direction || 'Both';
+    document.getElementById('editNodeResetDay').value = node.quota_reset_day || '';
+    openModal('editNodeModal');
+  } catch (e) {
+    toast('加载节点失败: ' + e.message, 'error');
+  }
+}
+
+async function saveEditNode() {
+  var id = document.getElementById('editNodeId').value;
+  var body = {
+    name: document.getElementById('editNodeName').value.trim(),
+    public_ip: document.getElementById('editNodeIP').value.trim()
+  };
+  var bw = document.getElementById('editNodeBW').value;
+  if (bw) body.bandwidth_cap_mbps = parseInt(bw, 10);
+  var quota = document.getElementById('editNodeQuota').value;
+  if (quota) body.traffic_quota_bytes = Math.round(parseFloat(quota) * 1073741824);
+  body.quota_direction = document.getElementById('editNodeQuotaDir').value;
+  var resetDay = document.getElementById('editNodeResetDay').value;
+  if (resetDay) body.quota_reset_day = parseInt(resetDay, 10);
+
+  try {
+    await api('PUT', '/api/nodes/' + id, body);
+    closeModal('editNodeModal');
+    toast('节点已更新', 'success');
+    await refreshAll();
+  } catch (e) {
+    toast('更新失败: ' + e.message, 'error');
+  }
 }
 
 function filterNodes() {
