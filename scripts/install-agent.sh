@@ -1,21 +1,24 @@
 #!/bin/bash
 set -euo pipefail
 
-# multiProxy Agent 一键安装脚本
-# 用法: curl -sL https://github.com/Bespertrijun/MultiProxy/releases/latest/download/install-agent.sh | bash -s -- \
+# multiProxy Agent 一键安装/卸载脚本
+# 安装: curl -sL https://github.com/Bespertrijun/MultiProxy/releases/latest/download/install-agent.sh | bash -s -- \
 #   --panel-url wss://panel.example.com/agent \
 #   --node-id NODE_ID --token TOKEN
 #
+# 卸载: curl -sL .../install-agent.sh | bash -s -- --uninstall
+#
 # 可选参数:
 #   --config-dir <DIR>    配置目录 (默认 /etc/multiproxy)
-#   --no-gost             跳过下载 gost
-#   --no-systemd          不安装 systemd 服务
+#   --no-gost             跳过下载 gost/realm
+#   --no-systemd          不安装系统服务
 
 REPO="Bespertrijun/MultiProxy"
 PANEL_URL="" NODE_ID="" TOKEN=""
 CONFIG_DIR="/etc/multiproxy"
 SKIP_GOST=false
 SKIP_SYSTEMD=false
+UNINSTALL=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -25,21 +28,75 @@ while [[ $# -gt 0 ]]; do
     --config-dir) CONFIG_DIR="$2"; shift 2;;
     --no-gost) SKIP_GOST=true; shift;;
     --no-systemd) SKIP_SYSTEMD=true; shift;;
+    --uninstall) UNINSTALL=true; shift;;
     *) echo "未知参数: $1"; exit 1;;
   esac
 done
 
+# ========== 卸载 ==========
+if [[ "$UNINSTALL" == "true" ]]; then
+  echo "================================================"
+  echo "  multiProxy Agent 卸载"
+  echo "================================================"
+
+  # 停止并移除服务
+  if command -v systemctl &>/dev/null && systemctl is-active multiproxy-agent &>/dev/null 2>&1; then
+    systemctl stop multiproxy-agent
+    systemctl disable multiproxy-agent
+    rm -f /etc/systemd/system/multiproxy-agent.service
+    systemctl daemon-reload
+    echo "  ✓ 已移除 systemd 服务"
+  elif command -v rc-service &>/dev/null && [[ -f /etc/init.d/multiproxy-agent ]]; then
+    rc-service multiproxy-agent stop 2>/dev/null || true
+    rc-update del multiproxy-agent default 2>/dev/null || true
+    rm -f /etc/init.d/multiproxy-agent
+    echo "  ✓ 已移除 OpenRC 服务"
+  elif [[ -f /run/multiproxy-agent.pid ]]; then
+    kill "$(cat /run/multiproxy-agent.pid)" 2>/dev/null || true
+    rm -f /run/multiproxy-agent.pid
+    echo "  ✓ 已停止后台进程"
+  fi
+
+  # 删除二进制
+  rm -f /usr/local/bin/agent
+  echo "  ✓ 已删除 /usr/local/bin/agent"
+
+  # 询问是否删除 gost/realm
+  if [[ -f /usr/local/bin/gost ]]; then
+    rm -f /usr/local/bin/gost
+    echo "  ✓ 已删除 /usr/local/bin/gost"
+  fi
+  if [[ -f /usr/local/bin/realm ]]; then
+    rm -f /usr/local/bin/realm
+    echo "  ✓ 已删除 /usr/local/bin/realm"
+  fi
+
+  # 删除配置和日志
+  if [[ -d "$CONFIG_DIR" ]]; then
+    rm -rf "$CONFIG_DIR"
+    echo "  ✓ 已删除配置目录 $CONFIG_DIR"
+  fi
+  rm -f /var/log/multiproxy-agent.log
+
+  echo ""
+  echo "  ✓ 卸载完成!"
+  echo "================================================"
+  exit 0
+fi
+
+# ========== 安装 ==========
 if [[ -z "$PANEL_URL" || -z "$NODE_ID" || -z "$TOKEN" ]]; then
   echo "错误: 必须指定 --panel-url, --node-id, --token"
   echo "用法: curl -sL .../install-agent.sh | bash -s -- --panel-url URL --node-id ID --token TOKEN"
+  echo "卸载: curl -sL .../install-agent.sh | bash -s -- --uninstall"
   exit 1
 fi
 
 # 检测架构
 ARCH=$(uname -m)
 case "$ARCH" in
-  x86_64|amd64) BINARY="agent-linux-x86_64"; GOST_ARCH="amd64";;
-  aarch64|arm64) BINARY="agent-linux-aarch64"; GOST_ARCH="arm64";;
+  x86_64|amd64) BINARY="agent-linux-x86_64"; GOST_ARCH="amd64"; REALM_ARCH="x86_64";;
+  aarch64|arm64) BINARY="agent-linux-aarch64"; GOST_ARCH="arm64"; REALM_ARCH="aarch64";;
   *) echo "不支持的架构: $ARCH"; exit 1;;
 esac
 
@@ -58,20 +115,46 @@ curl -fSL "$DOWNLOAD_URL" -o /usr/local/bin/agent
 chmod +x /usr/local/bin/agent
 echo "  ✓ 已下载: /usr/local/bin/agent ($(du -h /usr/local/bin/agent | cut -f1))"
 
-# 下载 gost
+# 下载 gost + realm
 if [[ "$SKIP_GOST" == "false" ]]; then
   echo ""
-  echo "[2/3] 下载 gost..."
-  GOST_URL="https://github.com/go-gost/gost/releases/latest/download/gost_linux_${GOST_ARCH}"
-  if curl -fSL "$GOST_URL" -o /usr/local/bin/gost 2>/dev/null; then
-    chmod +x /usr/local/bin/gost
-    echo "  ✓ 已下载: /usr/local/bin/gost"
+  echo "[2/3] 下载转发工具..."
+
+  # gost
+  GOST_TAG=$(curl -sI -o /dev/null -w "%{redirect_url}" --max-redirs 0 "https://github.com/go-gost/gost/releases/latest" 2>/dev/null | grep -oE '[^/]+$')
+  if [[ -n "$GOST_TAG" ]]; then
+    GOST_VER="${GOST_TAG#v}"
+    GOST_URL="https://github.com/go-gost/gost/releases/download/${GOST_TAG}/gost_${GOST_VER}_linux_${GOST_ARCH}.tar.gz"
+    if curl -fSL "$GOST_URL" -o /tmp/gost.tar.gz 2>/dev/null; then
+      tar -xzf /tmp/gost.tar.gz -C /usr/local/bin/ gost
+      chmod +x /usr/local/bin/gost
+      rm -f /tmp/gost.tar.gz
+      echo "  ✓ gost ${GOST_TAG}"
+    else
+      echo "  ⚠ gost 下载失败"
+    fi
   else
-    echo "  ⚠ gost 下载失败,请手动安装 gost 或 realm"
+    echo "  ⚠ 无法获取 gost 最新版本"
+  fi
+
+  # realm
+  REALM_TAG=$(curl -sI -o /dev/null -w "%{redirect_url}" --max-redirs 0 "https://github.com/zhboner/realm/releases/latest" 2>/dev/null | grep -oE '[^/]+$')
+  if [[ -n "$REALM_TAG" ]]; then
+    REALM_URL="https://github.com/zhboner/realm/releases/download/${REALM_TAG}/realm-${REALM_ARCH}-unknown-linux-musl.tar.gz"
+    if curl -fSL "$REALM_URL" -o /tmp/realm.tar.gz 2>/dev/null; then
+      tar -xzf /tmp/realm.tar.gz -C /usr/local/bin/
+      chmod +x /usr/local/bin/realm
+      rm -f /tmp/realm.tar.gz
+      echo "  ✓ realm ${REALM_TAG}"
+    else
+      echo "  ⚠ realm 下载失败"
+    fi
+  else
+    echo "  ⚠ 无法获取 realm 最新版本"
   fi
 else
   echo ""
-  echo "[2/3] 跳过 gost 下载 (--no-gost)"
+  echo "[2/3] 跳过转发工具下载 (--no-gost)"
 fi
 
 # 创建配置目录
@@ -160,9 +243,8 @@ echo "  ✓ 安装完成!"
 echo ""
 echo "  二进制:  /usr/local/bin/agent"
 echo "  Gost:    /usr/local/bin/gost"
+echo "  Realm:   /usr/local/bin/realm"
 echo "  配置:    $CONFIG_DIR"
-echo "  服务:    multiproxy-agent.service"
 echo ""
-echo "  自更新:  agent --self-update --panel-url \"$PANEL_URL\""
-echo "  日志:    journalctl -u multiproxy-agent -f"
+echo "  卸载:    curl -sL .../install-agent.sh | bash -s -- --uninstall"
 echo "================================================"
