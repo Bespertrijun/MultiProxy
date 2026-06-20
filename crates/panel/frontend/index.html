@@ -295,7 +295,6 @@ tailwind.config = {
                 <tr class="border-b border-panel-500 text-xs text-panel-300 uppercase tracking-wider">
                   <th class="text-left px-4 py-3 font-medium">名称</th>
                   <th class="text-left px-4 py-3 font-medium">IP地址</th>
-                  <th class="text-left px-4 py-3 font-medium">区域</th>
                   <th class="text-left px-4 py-3 font-medium">状态</th>
                   <th class="text-left px-4 py-3 font-medium">配置版本</th>
                   <th class="text-left px-4 py-3 font-medium">带宽上限</th>
@@ -304,7 +303,7 @@ tailwind.config = {
                 </tr>
               </thead>
               <tbody id="nodesTableBody" class="divide-y divide-panel-600">
-                <tr><td colspan="8" class="px-4 py-8 text-center text-panel-400">正在加载...</td></tr>
+                <tr><td colspan="7" class="px-4 py-8 text-center text-panel-400">正在加载...</td></tr>
               </tbody>
             </table>
           </div>
@@ -1381,7 +1380,6 @@ function renderNodes() {
     return '<tr class="data-row" data-name="' + esc(n.name.toLowerCase()) + '">' +
       '<td class="px-4 py-3 text-panel-100 font-medium">' + esc(n.name) + '</td>' +
       '<td class="px-4 py-3 text-panel-300 font-mono text-xs">' + esc(n.public_ip) + '</td>' +
-      '<td class="px-4 py-3 text-panel-300 text-xs">' + (n.region ? n.region.province_code || '-' : '-') + '</td>' +
       '<td class="px-4 py-3">' + statusBadge(n.status) + '</td>' +
       '<td class="px-4 py-3 text-xs text-panel-300">' + n.desired_config_gen + '/' + n.applied_config_gen + driftWarn + '</td>' +
       '<td class="px-4 py-3 text-xs text-panel-300">' + (n.bandwidth_cap_mbps ? n.bandwidth_cap_mbps + ' Mbps' : '-') + '</td>' +
