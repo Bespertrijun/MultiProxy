@@ -268,6 +268,15 @@ tailwind.config = {
         <div id="dashNodeGrid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
           <div class="text-sm text-panel-400 py-8 text-center col-span-full">正在加载节点...</div>
         </div>
+
+        <!-- Route topology -->
+        <div class="mt-6">
+          <h3 class="text-sm font-medium text-panel-200 mb-3">链路总览</h3>
+          <p class="text-xs text-panel-400 mb-3">所有域名共享线路组配置，通过不同端口区分后端服务</p>
+          <div id="dashTopology" class="space-y-3">
+            <div class="text-sm text-panel-400 py-4 text-center">正在加载...</div>
+          </div>
+        </div>
       </section>
 
       <!-- ======== NODES ======== -->
@@ -1362,6 +1371,45 @@ function renderDashboard() {
         '<span>配置版本: ' + node.desired_config_gen + '/' + node.applied_config_gen + driftWarn + '</span>' +
         '<span>v' + node.desired_config_gen + '</span>' +
       '</div>' : '') +
+    '</div>';
+  }).join('');
+  renderTopology();
+}
+
+function renderTopology() {
+  var el = document.getElementById('dashTopology');
+  if (_zones.length === 0) {
+    el.innerHTML = '<div class="text-sm text-panel-400 py-4 text-center">暂无 DNS 域名，请在设置中配置 Cloudflare 或手动添加 DNS 域名</div>';
+    return;
+  }
+  el.innerHTML = _zones.map(function(zone) {
+    var groupRows = _groups.map(function(g) {
+      var nodeRows = (g.member_node_ids || []).map(function(nid) {
+        var node = _nodes.find(function(n) { return n.id === nid; });
+        if (!node) return '';
+        var nodeRules = _rules.filter(function(r) { return r.node_id === nid; });
+        var rulesText = nodeRules.length > 0
+          ? nodeRules.map(function(r) { return ':' + r.listen_port + ' → ' + r.backend_host + ':' + r.backend_port; }).join(', ')
+          : '<span class="text-panel-500">无规则</span>';
+        var health = _health.find(function(h) { return h.id === nid; });
+        var dot = health && (health.status === 'online' || health.connected)
+          ? '<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block"></span>'
+          : '<span class="w-1.5 h-1.5 rounded-full bg-red-400 inline-block"></span>';
+        return '<div class="ml-8 flex items-center gap-2 text-xs text-panel-300">' +
+          '<span class="text-panel-500">└─</span> ' + dot + ' ' + esc(node.name) +
+          ' <span class="text-panel-500">(' + esc(node.public_ip) + ')</span> ' +
+          '<span class="text-panel-400">' + rulesText + '</span></div>';
+      }).join('');
+      if (!nodeRows) return '';
+      var matchLabel = esc(g.name);
+      return '<div class="ml-4">' +
+        '<div class="flex items-center gap-2 text-xs text-blue-400">' +
+          '<span class="text-panel-500">└─</span> ' + matchLabel +
+        '</div>' + nodeRows + '</div>';
+    }).join('');
+    return '<div class="bg-panel-700 border border-panel-500 rounded-xl p-4">' +
+      '<div class="text-sm font-medium text-white mb-2">' + esc(zone.apex_domain) + '</div>' +
+      (groupRows || '<div class="ml-4 text-xs text-panel-500">暂无线路组</div>') +
     '</div>';
   }).join('');
 }
