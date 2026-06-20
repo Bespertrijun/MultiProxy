@@ -22,6 +22,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: mlugg/setup-zig@v2
+      - name: Sync version from tag
+        run: sed -i "s/^version = .*/version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
       - run: cargo install cargo-zigbuild
       - run: cargo zigbuild -p agent --release --target ${{ matrix.target }}
       - run: cp target/${{ matrix.target }}/release/agent ${{ matrix.artifact }}
@@ -38,6 +40,8 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - uses: mlugg/setup-zig@v2
+      - name: Sync version from tag
+        run: sed -i "s/^version = .*/version = \"${GITHUB_REF_NAME#v}\"/" Cargo.toml
       - run: cargo install cargo-zigbuild
       - uses: Swatinem/rust-cache@v2
       - run: cargo zigbuild -p panel --release --target x86_64-unknown-linux-musl
