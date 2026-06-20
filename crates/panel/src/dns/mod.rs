@@ -7,6 +7,7 @@
 //! both lock-free on the query path.
 
 pub mod answer;
+pub mod diag;
 pub mod ecs;
 pub mod handler;
 pub mod runtime;

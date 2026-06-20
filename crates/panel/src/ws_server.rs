@@ -304,6 +304,8 @@ async fn handle_status_report(state: &AppState, node_id: &str, report: &StatusRe
 /// watchdog only clears when applied == desired). Gap 7.2.
 async fn handle_config_ack(state: &AppState, node_id: &str, applied_gen: u64) {
     let _ = db::set_applied_gen(&state.db, node_id, applied_gen).await;
+    // applied_config_gen drives the drift indicator in the UI.
+    state.notify_change();
 }
 
 /// Drift watchdog (gap 7.2): every `T_ACK_SECS`, if the node is still connected and
@@ -373,6 +375,8 @@ pub async fn rebuild_and_store_snapshot(state: &AppState) {
         state.heartbeat_interval_secs,
     );
     state.snapshot.store(std::sync::Arc::new(snap));
+    // Central choke point for node/group/zone/health changes → push to the UI.
+    state.notify_change();
 }
 
 /// Unix-millis now.

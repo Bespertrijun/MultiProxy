@@ -2,7 +2,7 @@
 //! with the DNS runtime, and the live WS connection registry.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -11,7 +11,7 @@ use contract::protocol::DEFAULT_HEARTBEAT_INTERVAL_SECS;
 use contract::snapshot::AvailabilitySnapshot;
 use geoip::ProviderHandle;
 use sqlx::SqlitePool;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::crypto::Vault;
@@ -72,6 +72,11 @@ pub struct AppState {
     pub vault: Arc<Vault>,
     /// Directory containing agent binary files served at `/dl/`.
     pub agent_bin_dir: String,
+    /// Broadcast of data-change events for the UI's SSE stream (`/api/events`).
+    /// Each value is a monotonic sequence number; the UI refetches on any signal.
+    pub events: broadcast::Sender<u64>,
+    /// Monotonic counter backing the `events` broadcast payload.
+    pub event_seq: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -103,7 +108,18 @@ impl AppState {
             tls_pair: Arc::new(RwLock::new(None)),
             vault,
             agent_bin_dir,
+            // Capacity 16: a slow SSE client only needs the latest signal; on lag it
+            // gets a `Lagged` and refetches once, so dropped intermediate ticks are fine.
+            events: broadcast::channel(16).0,
+            event_seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Signal the UI that backend data changed, so connected SSE clients refetch.
+    /// Cheap and lock-free; a no-op when no clients are subscribed.
+    pub fn notify_change(&self) {
+        let seq = self.event_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.events.send(seq);
     }
 
     /// Read the cached TLS cert PEM (if any).

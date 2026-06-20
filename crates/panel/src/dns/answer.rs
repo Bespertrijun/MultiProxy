@@ -13,6 +13,8 @@ use contract::model::{DnsZone, LineGroup, Region};
 use contract::snapshot::AvailabilitySnapshot;
 use geoip::GeoIpProvider;
 
+use super::diag::{self, DiagStep};
+
 /// The resolution outcome for a query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
@@ -69,10 +71,61 @@ pub fn resolve(
     client_addr: IpAddr,
     query_name: &str,
 ) -> Resolution {
-    let zone_id = zones
+    let mut steps: Vec<DiagStep> = Vec::new();
+    let resolution = resolve_traced(
+        provider,
+        groups,
+        zones,
+        snapshot,
+        client_addr,
+        query_name,
+        &mut steps,
+    );
+    let (ok, summary) = match &resolution {
+        Resolution::Answer(ips) => (true, format!("已解析: {ips:?}")),
+        Resolution::ServFail => (false, "SERVFAIL (未返回任何 IP)".to_string()),
+    };
+    diag::record(query_name, client_addr, ok, &summary, steps);
+    resolution
+}
+
+/// The actual resolution, pushing a structured trace into `steps` at each decision
+/// point so the panel UI can show exactly where an answer — or a SERVFAIL — came from.
+fn resolve_traced(
+    provider: &dyn GeoIpProvider,
+    groups: &[LineGroup],
+    zones: &[DnsZone],
+    snapshot: &AvailabilitySnapshot,
+    client_addr: IpAddr,
+    query_name: &str,
+    steps: &mut Vec<DiagStep>,
+) -> Resolution {
+    let matched_zone = zones
         .iter()
-        .find(|z| query_name.ends_with(&z.apex_domain) || query_name == z.apex_domain)
-        .map(|z| z.id.as_str());
+        .find(|z| query_name.ends_with(&z.apex_domain) || query_name == z.apex_domain);
+    let zone_id = matched_zone.map(|z| z.id.as_str());
+    match matched_zone {
+        Some(z) => steps.push(DiagStep::new(
+            "ok",
+            "step1 域名匹配",
+            format!(
+                "查询 {query_name} 命中域名 {}（共 {} 个域名）",
+                z.apex_domain,
+                zones.len()
+            ),
+        )),
+        None => {
+            let names: Vec<&str> = zones.iter().map(|z| z.apex_domain.as_str()).collect();
+            steps.push(DiagStep::new(
+                "warn",
+                "step1 域名匹配",
+                format!(
+                    "查询 {query_name} 未命中任何域名（已配置: {names:?}）——按域名关联的线路组将被全部过滤"
+                ),
+            ));
+        }
+    }
+
     let filtered: Vec<&LineGroup> = groups
         .iter()
         .filter(|g| match (&g.zone_id, zone_id) {
@@ -81,14 +134,67 @@ pub fn resolve(
             (Some(_), None) => false,
         })
         .collect();
+    let kept: Vec<String> = filtered
+        .iter()
+        .map(|g| {
+            format!(
+                "{}(地区={:?},运营商={:?},成员数={})",
+                g.name,
+                g.match_region,
+                g.match_isp,
+                g.member_node_ids.len()
+            )
+        })
+        .collect();
+    steps.push(DiagStep::new(
+        if filtered.is_empty() { "fail" } else { "ok" },
+        "step2 线路组按域名过滤",
+        format!(
+            "共 {} 个线路组，关联到本域名的剩 {} 个 -> {kept:?}",
+            groups.len(),
+            filtered.len(),
+        ),
+    ));
+
     let (region, isp) = provider.lookup(client_addr);
+    steps.push(DiagStep::new(
+        "info",
+        "step3 客户端地理识别",
+        format!(
+            "省份码={} 运营商={isp:?}（须满足线路组的 匹配地区/匹配运营商）",
+            region.province_code,
+        ),
+    ));
+
     let flat: Vec<LineGroup> = filtered.into_iter().cloned().collect();
     let Some(group) = match_line_group(&flat, &region, isp) else {
+        steps.push(DiagStep::new(
+            "fail",
+            "step4 匹配线路组",
+            "没有线路组匹配（域名过滤 + 地区/运营商过滤后为空）-> SERVFAIL".to_string(),
+        ));
         return Resolution::ServFail;
     };
+    steps.push(DiagStep::new(
+        "ok",
+        "step4 匹配线路组",
+        format!(
+            "命中线路组 {}，成员节点={:?}",
+            group.name, group.member_node_ids
+        ),
+    ));
 
     // Primary line.
     let primary = ipv4_only(snapshot.available_for(&group.id));
+    steps.push(DiagStep::new(
+        if primary.is_empty() { "warn" } else { "ok" },
+        "step5 可用 IP 集",
+        format!(
+            "快照gen={} 全部={:?} 实际下发(IPv4)={primary:?}（为空=组内没有健康的成员节点）",
+            snapshot.generation,
+            snapshot.available_for(&group.id),
+        ),
+    ));
     if !primary.is_empty() {
         return Resolution::Answer(primary);
     }
@@ -99,11 +205,21 @@ pub fn resolve(
         .or(group.fallback_group.as_deref())
     {
         let fallback = ipv4_only(snapshot.available_for(fb));
+        steps.push(DiagStep::new(
+            if fallback.is_empty() { "fail" } else { "ok" },
+            "step6 兜底线路组",
+            format!("主线路为空，尝试兜底线路组 {fb}：下发={fallback:?}"),
+        ));
         if !fallback.is_empty() {
             return Resolution::Answer(fallback);
         }
     }
 
+    steps.push(DiagStep::new(
+        "fail",
+        "结果",
+        "SERVFAIL（没有可下发的 IP）".to_string(),
+    ));
     Resolution::ServFail
 }
 

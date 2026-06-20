@@ -69,6 +69,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/zones", get(list_zones).post(create_zone))
         .route("/api/zones/{id}", axum::routing::delete(delete_zone))
         .route("/api/health", get(health_view))
+        .route("/api/events", get(sse_events))
+        .route("/api/dns-diag", get(dns_diag_list).delete(dns_diag_clear))
         .route("/api/geocn/update", post(geocn_update))
         .route("/api/cf/sync", post(cf_sync))
         .route("/api/cert/status", get(cert_status))
@@ -301,6 +303,7 @@ async fn create_node(
     )
     .await?;
 
+    state.notify_change();
     Ok(Json(CreateNodeResp { node, token }))
 }
 
@@ -440,6 +443,7 @@ async fn create_rule(
     // Bump desired config gen (D2) and push to the connected agent (Q6).
     db::bump_desired_gen(&state.db, &req.node_id).await?;
     push_config_to(&state, &req.node_id).await;
+    state.notify_change();
     Ok(Json(rule))
 }
 
@@ -456,6 +460,7 @@ async fn delete_rule(State(state): State<AppState>, Path(id): Path<String>) -> R
         db::bump_desired_gen(&state.db, &nid).await?;
         push_config_to(&state, &nid).await;
     }
+    state.notify_change();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -587,6 +592,51 @@ async fn refresh_zones(state: &AppState) {
     if let Ok(zones) = db::list_zones(&state.db).await {
         state.zones.store(std::sync::Arc::new(zones));
     }
+    // Unlike groups, zones don't rebuild the snapshot, so signal the UI directly.
+    state.notify_change();
+}
+
+// ---------- SSE: push data-change signals to the UI (replaces 10s polling) ----------
+
+/// Stream backend change signals to the browser via Server-Sent Events.
+///
+/// Each `notify_change()` on the server emits one event; the UI refetches the
+/// resource lists on receipt (and diffs locally before re-rendering). On
+/// `Lagged` we still emit a tick so a slow client refetches once and catches up.
+/// `KeepAlive` comments keep the connection open through idle periods/proxies.
+async fn sse_events(
+    State(state): State<AppState>,
+) -> axum::response::Sse<
+    impl futures_util::Stream<
+        Item = std::result::Result<axum::response::sse::Event, std::convert::Infallible>,
+    >,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use tokio::sync::broadcast::error::RecvError;
+
+    let rx = state.events.subscribe();
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Ok(seq) => Some((Ok(Event::default().data(seq.to_string())), rx)),
+            // Slow client dropped some ticks: emit one anyway so it refetches and catches up.
+            Err(RecvError::Lagged(_)) => Some((Ok(Event::default().data("lagged")), rx)),
+            Err(RecvError::Closed) => None,
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+// ---------- DNS resolution diagnostics (recent query traces for the UI) ----------
+
+/// Return the most recent DNS resolution traces (newest first) for the diag panel.
+async fn dns_diag_list() -> Json<Vec<crate::dns::diag::DiagEntry>> {
+    Json(crate::dns::diag::recent())
+}
+
+/// Clear the buffered DNS resolution traces.
+async fn dns_diag_clear() -> StatusCode {
+    crate::dns::diag::clear();
+    StatusCode::NO_CONTENT
 }
 
 // ---------- health / dashboard view (AC-5/AC-13 panel side) ----------

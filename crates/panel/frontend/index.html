@@ -345,6 +345,27 @@ tailwind.config = {
         <div id="zonesContainer" class="space-y-4">
           <div class="text-sm text-panel-400 py-8 text-center">正在加载...</div>
         </div>
+
+        <!-- DNS 解析诊断 -->
+        <div class="mt-8 bg-panel-800 border border-panel-500 rounded-xl overflow-hidden">
+          <div class="px-5 py-4 border-b border-panel-600 flex items-center justify-between">
+            <div>
+              <h3 class="text-sm font-medium text-white">DNS 解析诊断</h3>
+              <p class="text-xs text-panel-400 mt-0.5">最近的解析记录，逐步显示查询为什么返回 IP 或 SERVFAIL。用 <span class="font-mono">nslookup &lt;域名&gt; &lt;面板IP&gt;</span> 触发后点刷新。</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-1.5 text-xs text-panel-300 cursor-pointer select-none">
+                <input type="checkbox" id="dnsDiagAuto" onchange="toggleDnsDiagAuto()" class="rounded border-panel-500 bg-panel-700 text-blue-500 focus:ring-0">
+                自动刷新
+              </label>
+              <button onclick="loadDnsDiag()" class="text-xs px-2.5 py-1.5 rounded-md bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 transition-colors">↻ 刷新</button>
+              <button onclick="clearDnsDiag()" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">清空</button>
+            </div>
+          </div>
+          <div id="dnsDiagContainer" class="p-4 space-y-3">
+            <div class="text-sm text-panel-400 py-4 text-center">点击“刷新”加载解析记录</div>
+          </div>
+        </div>
       </section>
 
       <!-- ======== SETTINGS ======== -->
@@ -929,6 +950,7 @@ let _groups = [];
 let _zones = [];
 let _health = [];
 let _refreshTimer = null;
+let _eventSource = null;
 let _currentPage = 'dashboard';
 
 /* ========== API ========== */
@@ -974,6 +996,14 @@ function navigateTo(page) {
   document.querySelectorAll('.nav-link').forEach(a => {
     a.classList.toggle('active', a.dataset.page === page);
   });
+
+  // Auto-load the DNS resolution diagnostics when opening the DNS page; stop its
+  // auto-refresh poll when navigating away.
+  if (page === 'zones') {
+    loadDnsDiag();
+  } else {
+    stopDnsDiagAuto();
+  }
 
   // Close sidebar on mobile
   if (window.innerWidth < 1024) {
@@ -1202,12 +1232,22 @@ async function refreshAll() {
       api('GET', '/api/zones'),
       api('GET', '/api/health')
     ]);
-    _nodes = results[0] || [];
-    _rules = results[1] || [];
-    _groups = results[2] || [];
-    _zones = results[3] || [];
-    _health = results[4] || [];
-    renderAll();
+    var newNodes = results[0] || [];
+    var newRules = results[1] || [];
+    var newGroups = results[2] || [];
+    var newZones = results[3] || [];
+    var newHealth = results[4] || [];
+    var changed = JSON.stringify(newNodes) !== JSON.stringify(_nodes)
+      || JSON.stringify(newRules) !== JSON.stringify(_rules)
+      || JSON.stringify(newGroups) !== JSON.stringify(_groups)
+      || JSON.stringify(newZones) !== JSON.stringify(_zones)
+      || JSON.stringify(newHealth) !== JSON.stringify(_health);
+    _nodes = newNodes;
+    _rules = newRules;
+    _groups = newGroups;
+    _zones = newZones;
+    _health = newHealth;
+    if (changed) renderAll();
   } catch (e) {
     if (e.message !== 'unauthorized') {
       console.error('Refresh failed:', e);
@@ -1225,13 +1265,27 @@ function renderAll() {
 /* ========== Auto-refresh ========== */
 function startAutoRefresh() {
   stopAutoRefresh();
-  _refreshTimer = setInterval(refreshAll, 10000);
+  // Push-based: the server signals via SSE only when data actually changes, so we
+  // refetch on demand instead of blindly polling. EventSource auto-reconnects on
+  // drop. A slow 60s poll is a safety net if SSE is blocked (e.g. by a proxy).
+  try {
+    _eventSource = new EventSource('/api/events');
+    _eventSource.onmessage = function () { refreshAll(); };
+  } catch (e) {
+    console.error('SSE unavailable, relying on fallback poll:', e);
+  }
+  _refreshTimer = setInterval(refreshAll, 60000);
 }
 function stopAutoRefresh() {
   if (_refreshTimer) {
     clearInterval(_refreshTimer);
     _refreshTimer = null;
   }
+  if (_eventSource) {
+    _eventSource.close();
+    _eventSource = null;
+  }
+  stopDnsDiagAuto();
 }
 
 /* ========== Dashboard ========== */
@@ -1269,7 +1323,7 @@ function renderDashboard() {
 
     var isOnline = h.status === 'online' || h.connected;
 
-    return '<div class="bg-panel-700 border border-panel-500 rounded-xl p-4 card-hover animate-fade-in">' +
+    return '<div class="bg-panel-700 border border-panel-500 rounded-xl p-4 card-hover">' +
       '<div class="flex items-start justify-between mb-3">' +
         '<div>' +
           '<div class="text-sm font-medium text-white">' + esc(h.name) + '</div>' +
@@ -1559,7 +1613,7 @@ function renderZones() {
       groupRows = '<div class="px-4 py-3 text-sm text-panel-400 text-center">暂无线路组</div>';
     }
 
-    return '<div class="bg-panel-800 border border-panel-500 rounded-xl overflow-hidden animate-fade-in">' +
+    return '<div class="bg-panel-800 border border-panel-500 rounded-xl overflow-hidden">' +
       '<div class="px-5 py-4 border-b border-panel-600 flex items-start justify-between">' +
         '<div>' +
           '<div class="text-sm font-medium text-white font-mono">' + esc(z.apex_domain) + '</div>' +
@@ -1578,6 +1632,74 @@ function renderZones() {
   }).join('');
 
   container.innerHTML = html;
+}
+
+/* ========== DNS resolution diagnostics ========== */
+var _dnsDiagTimer = null;
+
+function dnsDiagDot(status) {
+  var color = status === 'ok' ? 'bg-emerald-400'
+    : status === 'warn' ? 'bg-amber-400'
+    : status === 'fail' ? 'bg-red-400'
+    : 'bg-panel-400';
+  return '<span class="inline-block w-2 h-2 rounded-full mt-1 shrink-0 ' + color + '"></span>';
+}
+
+async function loadDnsDiag() {
+  var box = document.getElementById('dnsDiagContainer');
+  if (!box) return;
+  try {
+    var entries = await api('GET', '/api/dns-diag');
+    if (!entries || !entries.length) {
+      box.innerHTML = '<div class="text-sm text-panel-400 py-4 text-center">暂无解析记录。请用 nslookup/dig 向面板发起一次查询后再刷新。</div>';
+      return;
+    }
+    box.innerHTML = entries.map(function (e) {
+      var when = new Date(e.ts_ms).toLocaleTimeString();
+      var steps = (e.steps || []).map(function (s) {
+        return '<div class="flex items-start gap-2">' +
+          dnsDiagDot(s.status) +
+          '<div class="text-xs"><span class="text-panel-200 font-medium">' + esc(s.label) + '</span> ' +
+          '<span class="text-panel-400 font-mono break-all">' + esc(s.detail) + '</span></div>' +
+        '</div>';
+      }).join('');
+      return '<div class="border border-panel-600 rounded-lg overflow-hidden">' +
+        '<div class="px-3 py-2 flex items-center justify-between gap-2 ' + (e.ok ? 'bg-emerald-500/10' : 'bg-red-500/10') + '">' +
+          '<span class="text-xs font-mono ' + (e.ok ? 'text-emerald-400' : 'text-red-400') + ' break-all">' + esc(e.query) + ' &larr; ' + esc(e.client) + '</span>' +
+          '<span class="text-xs whitespace-nowrap ' + (e.ok ? 'text-emerald-400' : 'text-red-400') + '">' + esc(e.summary) + ' &middot; ' + when + '</span>' +
+        '</div>' +
+        '<div class="px-3 py-2 space-y-1.5 bg-panel-900/40">' + steps + '</div>' +
+      '</div>';
+    }).join('');
+  } catch (e) {
+    if (e.message !== 'unauthorized') {
+      box.innerHTML = '<div class="text-sm text-red-400 py-4 text-center">加载失败: ' + esc(e.message) + '</div>';
+    }
+  }
+}
+
+async function clearDnsDiag() {
+  try {
+    await api('DELETE', '/api/dns-diag');
+    loadDnsDiag();
+  } catch (e) {
+    if (e.message !== 'unauthorized') toast('清空失败: ' + e.message, 'error');
+  }
+}
+
+function toggleDnsDiagAuto() {
+  var on = document.getElementById('dnsDiagAuto').checked;
+  if (_dnsDiagTimer) { clearInterval(_dnsDiagTimer); _dnsDiagTimer = null; }
+  if (on) {
+    loadDnsDiag();
+    _dnsDiagTimer = setInterval(loadDnsDiag, 3000);
+  }
+}
+
+function stopDnsDiagAuto() {
+  if (_dnsDiagTimer) { clearInterval(_dnsDiagTimer); _dnsDiagTimer = null; }
+  var cb = document.getElementById('dnsDiagAuto');
+  if (cb) cb.checked = false;
 }
 
 function openAddGroupForZone(zoneId) {
