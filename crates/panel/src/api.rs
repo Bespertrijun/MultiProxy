@@ -491,6 +491,15 @@ async fn create_zone(
         default_ttl: req.default_ttl,
     };
     db::upsert_zone(&state.db, &zone).await?;
+
+    if let Some(cf_cfg) = state.cf_config().await {
+        let cf_client = cloudflare::CfClient::new(&cf_cfg.token, &cf_cfg.zone_id);
+        let ns_fqdn = format!("{}.{}", cf_cfg.ns_name, cf_cfg.domain);
+        let _ = cf_client
+            .upsert_record("NS", &zone.apex_domain, &ns_fqdn, false, 300)
+            .await;
+    }
+
     Ok(Json(zone))
 }
 
@@ -499,7 +508,22 @@ async fn list_zones(State(state): State<AppState>) -> Result<Json<Vec<DnsZone>>>
 }
 
 async fn delete_zone(State(state): State<AppState>, Path(id): Path<String>) -> Result<StatusCode> {
+    let zone = db::list_zones(&state.db)
+        .await?
+        .into_iter()
+        .find(|z| z.id == id);
     db::delete_zone(&state.db, &id).await?;
+
+    if let (Some(z), Some(cf_cfg)) = (zone, state.cf_config().await) {
+        let cf_client = cloudflare::CfClient::new(&cf_cfg.token, &cf_cfg.zone_id);
+        let records = cf_client.list_records("NS", &z.apex_domain).await;
+        if let Ok(recs) = records {
+            for r in recs {
+                let _ = cf_client.delete_record(&r.id).await;
+            }
+        }
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -914,6 +938,21 @@ async fn put_cf_settings(
             .map_or_else(|| "./certs".to_string(), |c| c.cert_dir),
     };
     state.set_cf_config(Some(cf_cfg.clone())).await;
+
+    // Auto-create DNS Zone in panel if not exists.
+    let zone_fqdn = format!("{}.{}", cf_cfg.subdomain, cf_cfg.domain);
+    let ns_fqdn = format!("{}.{}", cf_cfg.ns_name, cf_cfg.domain);
+    let existing_zones = db::list_zones(&state.db).await.unwrap_or_default();
+    if !existing_zones.iter().any(|z| z.apex_domain == zone_fqdn) {
+        let zone = DnsZone {
+            id: uuid::Uuid::new_v4().to_string(),
+            apex_domain: zone_fqdn,
+            soa: String::new(),
+            ns: vec![ns_fqdn],
+            default_ttl: 60,
+        };
+        let _ = db::upsert_zone(&state.db, &zone).await;
+    }
 
     // Try DNS sync (non-fatal).
     let dns_sync;
