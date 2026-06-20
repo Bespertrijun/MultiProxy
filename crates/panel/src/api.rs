@@ -25,6 +25,24 @@ use crate::{acme, cloudflare, db, ui, ws_server};
 /// Default download URL for GeoCN.mmdb (ljxi/GeoCN latest release).
 const GEOCN_DEFAULT_URL: &str = "https://github.com/ljxi/GeoCN/releases/latest/download/GeoCN.mmdb";
 
+async fn detect_public_ip() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let ip = client
+        .get("https://api.ipify.org")
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?
+        .trim()
+        .to_string();
+    if ip.is_empty() { None } else { Some(ip) }
+}
+
 /// Maximum download size (100 MB) to prevent abuse.
 const GEOCN_MAX_SIZE: u64 = 100 * 1024 * 1024;
 
@@ -871,15 +889,8 @@ async fn put_cf_settings(
         return e.into_response();
     }
 
-    // Resolve panel_ip for runtime use: use provided value, or fall back to current
-    // state value, or try to detect. For simplicity, use whatever was stored.
     let panel_ip = if req.cf_panel_ip.is_empty() {
-        // Try current state first.
-        state
-            .cf_config()
-            .await
-            .map(|c| c.panel_ip)
-            .unwrap_or_default()
+        detect_public_ip().await.unwrap_or_default()
     } else {
         req.cf_panel_ip
     };
