@@ -149,6 +149,15 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
         }
         sqlx::query(trimmed).execute(pool).await?;
     }
+
+    // Column migrations for existing databases.
+    let alter_stmts = &[
+        "ALTER TABLE front_node ADD COLUMN quota_direction TEXT NOT NULL DEFAULT 'Both'",
+    ];
+    for stmt in alter_stmts {
+        let _ = sqlx::query(stmt).execute(pool).await;
+    }
+
     Ok(())
 }
 
