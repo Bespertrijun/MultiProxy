@@ -666,6 +666,11 @@ async fn create_group(
     };
     db::upsert_line_group(&state.db, &group).await?;
     refresh_groups(&state).await?;
+    // Re-push to the new members so they pick up the zone's cert/config immediately
+    // (membership decides which cert a node is handed — see domains_for_node).
+    for nid in &group.member_node_ids {
+        push_config_to(&state, nid).await;
+    }
     Ok(Json(group))
 }
 
@@ -678,14 +683,16 @@ async fn update_group(
     Path(id): Path<String>,
     Json(req): Json<CreateGroupReq>,
 ) -> Result<Json<LineGroup>> {
-    // PUT semantics: the group must already exist.
-    if !db::list_line_groups(&state.db)
+    // PUT semantics: the group must already exist. Capture its prior members so we can
+    // re-push to nodes that were REMOVED (they must drop the cert), not just added ones.
+    let old_members = match db::list_line_groups(&state.db)
         .await?
-        .iter()
-        .any(|g| g.id == id)
+        .into_iter()
+        .find(|g| g.id == id)
     {
-        return Err(PanelError::NotFound("line group".into()));
-    }
+        Some(g) => g.member_node_ids,
+        None => return Err(PanelError::NotFound("line group".into())),
+    };
     let group = LineGroup {
         id,
         name: req.name,
@@ -698,12 +705,32 @@ async fn update_group(
     };
     db::upsert_line_group(&state.db, &group).await?;
     refresh_groups(&state).await?;
+    // Re-push to the union of old + new members so cert/config tracks membership.
+    let mut affected: Vec<&String> = old_members
+        .iter()
+        .chain(group.member_node_ids.iter())
+        .collect();
+    affected.sort();
+    affected.dedup();
+    for nid in affected {
+        push_config_to(&state, nid).await;
+    }
     Ok(Json(group))
 }
 
 async fn delete_group(State(state): State<AppState>, Path(id): Path<String>) -> Result<StatusCode> {
+    // Capture members before deletion so we can re-push (they drop the zone's cert).
+    let members = db::list_line_groups(&state.db)
+        .await?
+        .into_iter()
+        .find(|g| g.id == id)
+        .map(|g| g.member_node_ids)
+        .unwrap_or_default();
     db::delete_line_group(&state.db, &id).await?;
     refresh_groups(&state).await?;
+    for nid in &members {
+        push_config_to(&state, nid).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
