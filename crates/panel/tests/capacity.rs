@@ -47,6 +47,8 @@ async fn boot(db_path: &str) -> Harness {
         &contract::model::PanelUser {
             username: "admin".into(),
             password_hash: hash,
+            totp_secret: None,
+            totp_enabled: false,
         },
     )
     .await

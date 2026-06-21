@@ -28,6 +28,8 @@ async fn boot() -> (String, reqwest::Client) {
         &contract::model::PanelUser {
             username: "admin".into(),
             password_hash: hash,
+            totp_secret: None,
+            totp_enabled: false,
         },
     )
     .await

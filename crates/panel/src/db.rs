@@ -155,6 +155,8 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
     let alter_stmts = &[
         "ALTER TABLE front_node ADD COLUMN quota_direction TEXT NOT NULL DEFAULT 'Both'",
         "ALTER TABLE line_group ADD COLUMN zone_id TEXT",
+        "ALTER TABLE panel_user ADD COLUMN totp_secret TEXT",
+        "ALTER TABLE panel_user ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0",
     ];
     for stmt in alter_stmts {
         let _ = sqlx::query(stmt).execute(pool).await;
@@ -307,15 +309,39 @@ pub async fn upsert_user(pool: &SqlitePool, user: &PanelUser) -> Result<()> {
 /// # Errors
 /// Returns [`PanelError::NotFound`] if absent.
 pub async fn get_user(pool: &SqlitePool, username: &str) -> Result<PanelUser> {
-    let row = sqlx::query("SELECT username, password_hash FROM panel_user WHERE username = ?")
-        .bind(username)
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| PanelError::NotFound("user".into()))?;
+    let row = sqlx::query(
+        "SELECT username, password_hash, totp_secret, totp_enabled FROM panel_user WHERE username = ?",
+    )
+    .bind(username)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| PanelError::NotFound("user".into()))?;
     Ok(PanelUser {
         username: row.get("username"),
         password_hash: row.get("password_hash"),
+        totp_secret: row.get("totp_secret"),
+        totp_enabled: row.get::<i64, _>("totp_enabled") != 0,
     })
+}
+
+/// Set (or clear) a user's TOTP secret + enabled flag. The secret must already be
+/// encrypted by the caller; pass `None` to disable and wipe it.
+///
+/// # Errors
+/// Returns [`PanelError::Db`] on failure.
+pub async fn set_user_totp(
+    pool: &SqlitePool,
+    username: &str,
+    secret: Option<&str>,
+    enabled: bool,
+) -> Result<()> {
+    sqlx::query("UPDATE panel_user SET totp_secret = ?, totp_enabled = ? WHERE username = ?")
+        .bind(secret)
+        .bind(i64::from(enabled))
+        .bind(username)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Count users (used to decide whether to seed the default admin).

@@ -241,6 +241,12 @@ pub enum HealthCheckType {
 pub struct PanelUser {
     pub username: String,
     pub password_hash: String,
+    /// Base32 TOTP secret, ENCRYPTED at rest (`None` until 2FA enrolment starts).
+    #[serde(default)]
+    pub totp_secret: Option<String>,
+    /// Whether two-factor auth is active for this user (a code is required at login).
+    #[serde(default)]
+    pub totp_enabled: bool,
 }
 
 /// Q4 resolution-domain TTL default (seconds). User-adjudicated.

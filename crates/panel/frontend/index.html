@@ -155,6 +155,12 @@ tailwind.config = {
             class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3.5 py-2.5 text-sm text-panel-100 placeholder-panel-400"
             onkeydown="if(event.key==='Enter')doLogin()" />
         </div>
+        <div id="loginCodeWrap" class="hidden">
+          <label class="block text-xs font-medium text-panel-300 mb-1.5 uppercase tracking-wider">两步验证码</label>
+          <input id="loginCode" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位验证码"
+            class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3.5 py-2.5 text-sm text-panel-100 placeholder-panel-400 font-mono tracking-widest"
+            onkeydown="if(event.key==='Enter')doLogin()" />
+        </div>
         <button onclick="doLogin()"
           class="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg px-4 py-2.5 text-sm transition-colors">
           登录
@@ -595,6 +601,48 @@ tailwind.config = {
               </button>
             </div>
           </div>
+
+          <!-- Two-factor auth (2FA / TOTP) -->
+          <div class="bg-panel-800 border border-panel-500 rounded-xl p-5 md:col-span-2">
+            <div class="flex items-center justify-between mb-4">
+              <h3 class="text-sm font-medium text-panel-200 uppercase tracking-wider">两步验证 (2FA)</h3>
+              <span id="twofaBadge" class="text-xs text-panel-400">检查中…</span>
+            </div>
+            <p class="text-xs text-panel-400 mb-4">用 Google / 微软 Authenticator、Authy 等 App 扫码，登录时需额外输入 6 位动态验证码。</p>
+
+            <!-- Enable flow -->
+            <div id="twofaEnableBox" class="hidden max-w-md space-y-4">
+              <button onclick="start2fa()" id="twofaStartBtn"
+                class="bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors">
+                启用两步验证
+              </button>
+              <div id="twofaSetup" class="hidden space-y-3">
+                <div class="text-xs text-panel-300">① 用验证器 App 扫描二维码（或手动输入密钥）：</div>
+                <img id="twofaQr" alt="2FA QR" class="w-44 h-44 bg-white rounded-lg p-2" />
+                <div class="text-xs text-panel-400">密钥：<span id="twofaSecret" class="font-mono text-panel-200 break-all"></span></div>
+                <div class="text-xs text-panel-300">② 输入 App 显示的 6 位验证码确认：</div>
+                <input id="twofaEnableCode" type="text" inputmode="numeric" placeholder="6 位验证码"
+                  class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400 font-mono tracking-widest" />
+                <button onclick="confirm2fa()"
+                  class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors">
+                  确认启用
+                </button>
+              </div>
+            </div>
+
+            <!-- Disable flow -->
+            <div id="twofaDisableBox" class="hidden max-w-md space-y-4">
+              <div class="text-xs text-emerald-400">✓ 两步验证已启用</div>
+              <input id="twofaDisablePass" type="password" placeholder="当前密码"
+                class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400" />
+              <input id="twofaDisableCode" type="text" inputmode="numeric" placeholder="当前 6 位验证码"
+                class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400 font-mono tracking-widest" />
+              <button onclick="disable2fa()"
+                class="bg-red-600/80 hover:bg-red-600 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors">
+                关闭两步验证
+              </button>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -981,6 +1029,11 @@ function showView(which) {
     loginView.classList.remove('hidden');
     appView.classList.add('hidden');
     stopAutoRefresh();
+    // Reset the 2FA step so the next login starts clean.
+    var cw = document.getElementById('loginCodeWrap');
+    if (cw) cw.classList.add('hidden');
+    var cc = document.getElementById('loginCode');
+    if (cc) cc.value = '';
   } else {
     loginView.classList.add('hidden');
     appView.classList.remove('hidden');
@@ -1006,6 +1059,9 @@ function navigateTo(page) {
     loadDnsDiag();
   } else {
     stopDnsDiagAuto();
+  }
+  if (page === 'settings') {
+    load2faStatus();
   }
 
   // Close sidebar on mobile
@@ -1168,10 +1224,22 @@ function progressBar(ratio, label) {
 async function doLogin() {
   var u = document.getElementById('loginUser').value;
   var p = document.getElementById('loginPass').value;
+  var code = document.getElementById('loginCode').value;
+  var codeWrap = document.getElementById('loginCodeWrap');
   var errEl = document.getElementById('loginError');
   errEl.classList.add('hidden');
   try {
-    await api('POST', '/api/login', { username: u, password: p });
+    var res = await api('POST', '/api/login', { username: u, password: p, code: code });
+    if (res && res.need_2fa) {
+      // Password ok; second factor required. Reveal the code field.
+      codeWrap.classList.remove('hidden');
+      document.getElementById('loginCode').focus();
+      if (res.error === 'code_invalid') {
+        errEl.textContent = '验证码不正确，请重试';
+        errEl.classList.remove('hidden');
+      }
+      return;
+    }
     showView('app');
     await refreshAll();
     handleHash();
@@ -1222,6 +1290,70 @@ async function doChangePassword() {
     } else {
       toast('操作失败: ' + e.message, 'error');
     }
+  }
+}
+
+/* ========== Two-factor auth (2FA) ========== */
+async function load2faStatus() {
+  var badge = document.getElementById('twofaBadge');
+  var enableBox = document.getElementById('twofaEnableBox');
+  var disableBox = document.getElementById('twofaDisableBox');
+  if (!badge) return;
+  try {
+    var s = await api('GET', '/api/2fa/status');
+    if (s && s.enabled) {
+      badge.textContent = '已启用';
+      badge.className = 'text-xs text-emerald-400';
+      enableBox.classList.add('hidden');
+      disableBox.classList.remove('hidden');
+    } else {
+      badge.textContent = '未启用';
+      badge.className = 'text-xs text-amber-400';
+      disableBox.classList.add('hidden');
+      enableBox.classList.remove('hidden');
+      document.getElementById('twofaSetup').classList.add('hidden');
+    }
+  } catch (e) {
+    if (e.message !== 'unauthorized') badge.textContent = '状态未知';
+  }
+}
+
+async function start2fa() {
+  try {
+    var s = await api('POST', '/api/2fa/setup');
+    document.getElementById('twofaQr').src = 'data:image/png;base64,' + s.qr;
+    document.getElementById('twofaSecret').textContent = s.secret;
+    document.getElementById('twofaSetup').classList.remove('hidden');
+  } catch (e) {
+    if (e.message !== 'unauthorized') toast('生成密钥失败: ' + e.message, 'error');
+  }
+}
+
+async function confirm2fa() {
+  var code = document.getElementById('twofaEnableCode').value.trim();
+  if (!code) { toast('请输入验证码', 'error'); return; }
+  try {
+    await api('POST', '/api/2fa/enable', { code: code });
+    toast('两步验证已启用', 'success');
+    document.getElementById('twofaEnableCode').value = '';
+    load2faStatus();
+  } catch (e) {
+    if (e.message !== 'unauthorized') toast('启用失败：验证码不正确', 'error');
+  }
+}
+
+async function disable2fa() {
+  var password = document.getElementById('twofaDisablePass').value;
+  var code = document.getElementById('twofaDisableCode').value.trim();
+  if (!password || !code) { toast('请输入密码和验证码', 'error'); return; }
+  try {
+    await api('POST', '/api/2fa/disable', { password: password, code: code });
+    toast('两步验证已关闭', 'success');
+    document.getElementById('twofaDisablePass').value = '';
+    document.getElementById('twofaDisableCode').value = '';
+    load2faStatus();
+  } catch (e) {
+    if (e.message !== 'unauthorized') toast('关闭失败：密码或验证码不正确', 'error');
   }
 }
 

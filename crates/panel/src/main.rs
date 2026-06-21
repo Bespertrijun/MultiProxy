@@ -40,6 +40,18 @@ enum Command {
     Init(InitArgs),
     /// Download and validate a GeoCN.mmdb file.
     FetchGeocn(FetchGeocnArgs),
+    /// Disable 2FA for a user (lockout recovery when the authenticator is lost).
+    Reset2fa(Reset2faArgs),
+}
+
+#[derive(Parser, Clone)]
+struct Reset2faArgs {
+    /// SQLite URL (same as `serve`/`init`).
+    #[arg(long = "database-url", env = "PANEL_DATABASE_URL")]
+    database_url: String,
+    /// Username whose 2FA should be disabled.
+    #[arg(long = "user")]
+    user: String,
 }
 
 #[derive(Parser, Clone)]
@@ -159,7 +171,25 @@ async fn main() {
         Some(Command::Init(args)) => run_init(args).await,
         Some(Command::Serve(args)) => run_serve(*args).await,
         Some(Command::FetchGeocn(args)) => run_fetch_geocn(args).await,
+        Some(Command::Reset2fa(args)) => run_reset_2fa(args).await,
         None => run_serve(ServeArgs::parse()).await,
+    }
+}
+
+async fn run_reset_2fa(args: Reset2faArgs) {
+    let pool = match db::connect(&args.database_url).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("database error: {e}");
+            std::process::exit(1);
+        }
+    };
+    match db::set_user_totp(&pool, &args.user, None, false).await {
+        Ok(()) => println!("2FA disabled for user '{}'.", args.user),
+        Err(e) => {
+            eprintln!("failed to reset 2FA: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -222,6 +252,8 @@ async fn run_init(args: InitArgs) {
         &contract::model::PanelUser {
             username: args.admin_user,
             password_hash: hash,
+            totp_secret: None,
+            totp_enabled: false,
         },
     )
     .await

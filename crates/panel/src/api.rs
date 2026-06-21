@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{self, SESSION_COOKIE};
 use crate::error::{PanelError, Result};
 use crate::state::AppState;
+use crate::totp;
 use crate::updater;
 use crate::ws_server::{now_ms, push_config_to, rebuild_and_store_snapshot};
 use crate::{acme, cloudflare, db, ui, ws_server};
@@ -92,6 +93,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/update/agents", post(update_agents))
         .route("/api/logout", post(logout))
         .route("/api/change-password", post(change_password))
+        .route("/api/2fa/status", get(totp_status))
+        .route("/api/2fa/setup", post(totp_setup))
+        .route("/api/2fa/enable", post(totp_enable))
+        .route("/api/2fa/disable", post(totp_disable))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,
@@ -132,6 +137,9 @@ pub fn router(state: AppState) -> Router {
 struct LoginReq {
     username: String,
     password: String,
+    /// TOTP code for the second factor (only needed when 2FA is enabled).
+    #[serde(default)]
+    code: Option<String>,
 }
 
 async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> Response {
@@ -139,8 +147,32 @@ async fn login(State(state): State<AppState>, Json(req): Json<LoginReq>) -> Resp
         Ok(u) => u,
         Err(_) => return PanelError::Unauthorized.into_response(),
     };
+    // Password is the first factor; a wrong password is a plain 401 and never reveals
+    // whether 2FA is configured (that signal is gated behind a correct password).
     if !auth::verify_password(&req.password, &user.password_hash) {
         return PanelError::Unauthorized.into_response();
+    }
+    // Second factor: if enabled, a valid TOTP code is required before a session issues.
+    if user.totp_enabled {
+        let Some(secret) = user
+            .totp_secret
+            .as_deref()
+            .and_then(|enc| state.vault.decrypt(enc).ok())
+        else {
+            return PanelError::Internal("totp secret".into()).into_response();
+        };
+        match req.code.as_deref() {
+            None | Some("") => {
+                return Json(serde_json::json!({ "ok": false, "need_2fa": true })).into_response();
+            }
+            Some(code) if !totp::verify(&secret, code) => {
+                return Json(
+                    serde_json::json!({ "ok": false, "need_2fa": true, "error": "code_invalid" }),
+                )
+                .into_response();
+            }
+            Some(_) => {}
+        }
     }
     let token = auth::new_token();
     if db::create_session(&state.db, &token, &user.username, now_ms() as i64)
@@ -232,6 +264,133 @@ async fn change_password(
     // Invalidate ALL sessions for this user.
     let _ = db::delete_sessions_for_user(&state.db, &username).await;
 
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+// ---------- two-factor auth (TOTP) ----------
+
+/// Resolve the logged-in username from the request's session cookie.
+async fn session_username(state: &AppState, headers: &header::HeaderMap) -> Option<String> {
+    let cookie_header = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
+    let token = auth::session_from_cookies(cookie_header)?;
+    db::session_user(&state.db, &token).await.ok().flatten()
+}
+
+#[derive(Deserialize)]
+struct TotpCodeReq {
+    code: String,
+}
+
+#[derive(Deserialize)]
+struct TotpDisableReq {
+    password: String,
+    code: String,
+}
+
+/// Whether 2FA is currently enabled for the logged-in user.
+async fn totp_status(State(state): State<AppState>, headers: header::HeaderMap) -> Response {
+    let Some(username) = session_username(&state, &headers).await else {
+        return PanelError::Unauthorized.into_response();
+    };
+    let enabled = db::get_user(&state.db, &username)
+        .await
+        .map(|u| u.totp_enabled)
+        .unwrap_or(false);
+    Json(serde_json::json!({ "enabled": enabled })).into_response()
+}
+
+/// Begin enrolment: generate a fresh secret (stored encrypted, NOT yet enabled) and
+/// return the otpauth URL + QR for the authenticator app. Safe to call repeatedly
+/// (each call rolls a new pending secret until `enable` confirms it).
+async fn totp_setup(State(state): State<AppState>, headers: header::HeaderMap) -> Response {
+    let Some(username) = session_username(&state, &headers).await else {
+        return PanelError::Unauthorized.into_response();
+    };
+    let secret = totp::generate_secret();
+    let (Ok(url), Ok(qr)) = (
+        totp::provisioning_url(&secret, &username),
+        totp::qr_base64(&secret, &username),
+    ) else {
+        return PanelError::Internal("totp provisioning".into()).into_response();
+    };
+    let Ok(enc) = state.vault.encrypt(&secret) else {
+        return PanelError::Internal("totp encrypt".into()).into_response();
+    };
+    // Store the pending secret but keep 2FA disabled until `enable` verifies a code.
+    if let Err(e) = db::set_user_totp(&state.db, &username, Some(&enc), false).await {
+        return e.into_response();
+    }
+    Json(serde_json::json!({ "secret": secret, "otpauth_url": url, "qr": qr })).into_response()
+}
+
+/// Confirm enrolment: verify a code against the pending secret, then enable 2FA.
+async fn totp_enable(
+    State(state): State<AppState>,
+    headers: header::HeaderMap,
+    Json(req): Json<TotpCodeReq>,
+) -> Response {
+    let Some(username) = session_username(&state, &headers).await else {
+        return PanelError::Unauthorized.into_response();
+    };
+    let Ok(user) = db::get_user(&state.db, &username).await else {
+        return PanelError::Unauthorized.into_response();
+    };
+    let Some(secret) = user
+        .totp_secret
+        .as_deref()
+        .and_then(|enc| state.vault.decrypt(enc).ok())
+    else {
+        return PanelError::BadRequest("先调用 setup 生成密钥".into()).into_response();
+    };
+    if !totp::verify(&secret, &req.code) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "验证码不正确" })),
+        )
+            .into_response();
+    }
+    if let Err(e) = db::set_user_totp(&state.db, &username, user.totp_secret.as_deref(), true).await
+    {
+        return e.into_response();
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+/// Disable 2FA: requires the current password AND a valid current code, then wipes
+/// the secret.
+async fn totp_disable(
+    State(state): State<AppState>,
+    headers: header::HeaderMap,
+    Json(req): Json<TotpDisableReq>,
+) -> Response {
+    let Some(username) = session_username(&state, &headers).await else {
+        return PanelError::Unauthorized.into_response();
+    };
+    let Ok(user) = db::get_user(&state.db, &username).await else {
+        return PanelError::Unauthorized.into_response();
+    };
+    if !auth::verify_password(&req.password, &user.password_hash) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "密码不正确" })),
+        )
+            .into_response();
+    }
+    let code_ok = user
+        .totp_secret
+        .as_deref()
+        .and_then(|enc| state.vault.decrypt(enc).ok())
+        .is_some_and(|secret| totp::verify(&secret, &req.code));
+    if !code_ok {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "验证码不正确" })),
+        )
+            .into_response();
+    }
+    if let Err(e) = db::set_user_totp(&state.db, &username, None, false).await {
+        return e.into_response();
+    }
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
 

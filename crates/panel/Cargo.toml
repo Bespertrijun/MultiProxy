@@ -51,6 +51,9 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4"] }
+# TOTP (RFC 6238) two-factor auth, authenticator-app compatible; `qr` renders the
+# enrolment QR server-side (avoids loading an external JS QR lib under our CSP).
+totp-rs = { version = "5", features = ["qr", "gen_secret", "otpauth"] }
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
