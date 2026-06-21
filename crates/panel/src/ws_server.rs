@@ -288,6 +288,23 @@ pub async fn push_config_to(state: &AppState, node_id: &str) {
     push_config(state, node_id).await;
 }
 
+/// Send a message to every currently-connected agent. Returns how many were
+/// notified (offline nodes are skipped; they get nothing until they reconnect).
+pub async fn broadcast_to_agents(state: &AppState, msg: Message) -> usize {
+    let conns = state.conns.lock().await;
+    let mut sent = 0;
+    for conn in conns.values() {
+        if conn
+            .tx
+            .send(Envelope::new(new_token(), msg.clone()))
+            .is_ok()
+        {
+            sent += 1;
+        }
+    }
+    sent
+}
+
 async fn touch_runtime(state: &AppState, node_id: &str) {
     let now = now_ms();
     let mut rts = state.runtimes.lock().await;

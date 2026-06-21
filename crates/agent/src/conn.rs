@@ -344,6 +344,17 @@ where
                     DecodeResult::Message(Message::Close(c)) => {
                         return SessionEnd::ServerClose(c.reason);
                     }
+                    DecodeResult::Message(Message::UpdateAgent) => {
+                        // Panel asked us to upgrade: pull the new binary from the
+                        // panel's /dl/, replace this executable, and restart. On
+                        // success self_update never returns (it exits/exec's).
+                        eprintln!("received UpdateAgent; self-updating from panel");
+                        match crate::updater::self_update(&cfg.panel_url).await {
+                            Ok(false) => eprintln!("self-update: already up to date"),
+                            Ok(true) => {}
+                            Err(e) => eprintln!("self-update failed: {e}"),
+                        }
+                    }
                     DecodeResult::Message(_) => { /* ignore unexpected agent-bound kinds */ }
                     DecodeResult::Closed => {
                         return SessionEnd::Disconnected {

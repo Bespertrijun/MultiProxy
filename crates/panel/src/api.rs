@@ -1516,11 +1516,19 @@ async fn update_agents(State(state): State<AppState>) -> Response {
 
     let agent_bin_dir = std::path::Path::new(&state.agent_bin_dir);
     match updater::update_agent_binaries(&tag, agent_bin_dir).await {
-        Ok(()) => Json(serde_json::json!({
-            "ok": true,
-            "message": format!("Agent binaries updated to v{tag}. Re-run the install script on each node or use `agent --self-update` to apply."),
-        }))
-        .into_response(),
+        Ok(()) => {
+            // Tell every online agent to pull the freshly-downloaded binary and
+            // restart. Offline nodes get it when they next reconnect (or re-run
+            // the install script).
+            let notified =
+                ws_server::broadcast_to_agents(&state, contract::protocol::Message::UpdateAgent)
+                    .await;
+            Json(serde_json::json!({
+                "ok": true,
+                "message": format!("已下载 agent v{tag}，并通知 {notified} 个在线节点自更新；离线节点重连后或重跑安装脚本即可。"),
+            }))
+            .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e })),

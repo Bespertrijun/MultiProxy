@@ -59,6 +59,9 @@ pub enum Message {
     Ping,
     /// Server-initiated close notice (gap 7.1 supersede / 7.6 token rotation / shutdown).
     Close(Close),
+    /// Tell the agent to self-update its binary from the panel's `/dl/` and restart.
+    /// Unknown to older agents (they ignore the frame), so it is forward-compatible.
+    UpdateAgent,
 }
 
 /// agent→panel handshake. Per-node bearer `token` validated over TLS (task 3),
