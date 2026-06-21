@@ -51,6 +51,7 @@ dependencies = [
  "clap",
  "contract",
  "futures-util",
+ "libc",
  "reqwest",
  "rustls",
  "rustls-pki-types",

@@ -51,6 +51,9 @@ clap = { version = "4", features = ["derive", "env"] }
 rustls-pki-types = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Linux PR_SET_PDEATHSIG: tie the supervised gost/realm child's lifetime to the
+# agent so it can never linger as an orphan (binding its port) across restarts.
+libc = "0.2"
 
 [dev-dependencies]
 # In-test mock panel: a plain-ws server (no TLS) so the conn loop, config-apply,

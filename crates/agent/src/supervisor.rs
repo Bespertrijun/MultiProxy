@@ -102,13 +102,31 @@ impl ProcessSpawner for RealSpawner {
             Tool::Gost => "-C",
             Tool::Realm => "-c",
         };
-        let child = std::process::Command::new(tool.binary())
-            .arg(flag)
+        let mut cmd = std::process::Command::new(tool.binary());
+        cmd.arg(flag)
             .arg(config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stderr(Stdio::inherit());
+        // Linux: bind the child's lifetime to ours. If the agent dies for ANY
+        // reason (clean stop, SIGKILL, or crash) the kernel sends the child
+        // SIGTERM, so a relay can never linger as an orphan holding its port
+        // across restarts (the cause of piled-up duplicate realm processes).
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Guard the fork→prctl race: if the parent already exited, follow it.
+                if libc::getppid() == 1 {
+                    libc::raise(libc::SIGTERM);
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn()?;
         Ok(Box::new(RealChild { child }))
     }
 }
