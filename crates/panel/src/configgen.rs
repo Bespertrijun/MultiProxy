@@ -20,10 +20,28 @@ pub struct RenderedConfig {
     pub realm_config: Option<String>,
 }
 
+/// Cert/key paths the agent writes the `ConfigPush` PEMs to, matching the agent's
+/// default `--config-dir /etc/multiproxy` (`agent::config::ConfigPaths::under`). The
+/// rendered gost/realm config MUST reference these exact paths so the relay process
+/// finds the cert the agent just wrote to disk.
+pub const PROD_TLS_CERT_PATH: &str = "/etc/multiproxy/tls.crt";
+pub const PROD_TLS_KEY_PATH: &str = "/etc/multiproxy/tls.key";
+
 /// Optional TLS config paths for injecting into rendered tool configs.
 pub struct TlsPaths {
     pub cert: String,
     pub key: String,
+}
+
+impl TlsPaths {
+    /// The standard prod paths (see [`PROD_TLS_CERT_PATH`]).
+    #[must_use]
+    pub fn prod() -> Self {
+        Self {
+            cert: PROD_TLS_CERT_PATH.to_string(),
+            key: PROD_TLS_KEY_PATH.to_string(),
+        }
+    }
 }
 
 /// Render gost + realm configs for a node's rules. Rules are partitioned by `tool`

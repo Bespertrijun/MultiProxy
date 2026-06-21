@@ -198,7 +198,17 @@ async fn push_config(state: &AppState, node_id: &str) {
     let Ok(rules) = db::list_rules_for_node(&state.db, node_id).await else {
         return;
     };
-    let rendered = configgen::render_node(&rules);
+    let (cert, key) = (state.tls_cert_pem(), state.tls_key_pem());
+    // Render TLS-terminate listeners ONLY when a cert is actually available — otherwise
+    // a Terminate rule renders plain TCP and the client's HTTPS handshake fails
+    // (ERR_SSL_PROTOCOL_ERROR). The rendered cert paths must match where the agent
+    // writes the PEMs below (configgen::PROD_TLS_*).
+    let tls = if cert.is_some() && key.is_some() {
+        Some(configgen::TlsPaths::prod())
+    } else {
+        None
+    };
+    let rendered = configgen::render_node_with_tls(&rules, tls.as_ref());
     let Ok(node) = db::get_node(&state.db, node_id).await else {
         return;
     };
@@ -206,8 +216,8 @@ async fn push_config(state: &AppState, node_id: &str) {
         desired_gen: node.desired_config_gen,
         gost_config: rendered.gost_config,
         realm_config: rendered.realm_config,
-        tls_cert_pem: state.tls_cert_pem(),
-        tls_key_pem: state.tls_key_pem(),
+        tls_cert_pem: cert,
+        tls_key_pem: key,
     };
     let conns = state.conns.lock().await;
     if let Some(conn) = conns.get(node_id) {
