@@ -137,11 +137,14 @@ fn resolve_traced(
     let kept: Vec<String> = filtered
         .iter()
         .map(|g| {
+            let region = match g.match_region {
+                Some(p) => format!("{p}({})", geoip::division::province_name(p)),
+                None => "不限".to_string(),
+            };
+            let isp = g.match_isp.map_or("不限", |i| i.zh_label());
             format!(
-                "{}(地区={:?},运营商={:?},成员数={})",
+                "{}(地区={region},运营商={isp},成员数={})",
                 g.name,
-                g.match_region,
-                g.match_isp,
                 g.member_node_ids.len()
             )
         })
@@ -161,8 +164,10 @@ fn resolve_traced(
         "info",
         "step3 客户端地理识别",
         format!(
-            "省份码={} 运营商={isp:?}（须满足线路组的 匹配地区/匹配运营商）",
+            "省份={}（{}） 运营商={}（须满足线路组的 匹配地区/匹配运营商）",
             region.province_code,
+            geoip::division::province_name(region.province_code),
+            isp.zh_label(),
         ),
     ));
 

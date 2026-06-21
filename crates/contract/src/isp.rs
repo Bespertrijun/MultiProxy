@@ -68,6 +68,22 @@ impl Isp {
             Isp::Unknown => "Unknown",
         }
     }
+
+    /// Chinese (GeoCN short-form) label for UI display.
+    #[must_use]
+    pub const fn zh_label(self) -> &'static str {
+        match self {
+            Isp::Telecom => "电信",
+            Isp::Unicom => "联通",
+            Isp::Mobile => "移动",
+            Isp::Pengboshi => "鹏博士",
+            Isp::Cernet => "教育网",
+            Isp::Broadcast => "广电",
+            Isp::Aliyun => "阿里云",
+            Isp::Cstnet => "科技网",
+            Isp::Unknown => "未知",
+        }
+    }
 }
 
 #[cfg(test)]
