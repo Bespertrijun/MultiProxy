@@ -8,6 +8,7 @@
 pub mod acme;
 pub mod api;
 pub mod auth;
+pub mod certs;
 pub mod cloudflare;
 pub mod configgen;
 pub mod crypto;
@@ -325,11 +326,35 @@ pub async fn build(cfg: PanelConfig) -> Result<Panel, String> {
     }
 
     // 4. Bind :53 on the isolated DNS runtime.
-    let handler = GeoDnsHandler::new(snapshot, provider, groups, zones, cfg.ttl_secs);
+    let handler = GeoDnsHandler::new(
+        snapshot,
+        provider,
+        groups,
+        zones,
+        cfg.ttl_secs,
+        state.acme_challenges.clone(),
+    );
     let dns = spawn_dns(handler, cfg.dns.clone())?;
     let dns_liveness = dns.liveness.clone();
     let dns_udp_port = dns.udp_port;
     let dns_tcp_port = dns.tcp_port;
+
+    // 4b. Per-zone relay certs: load existing ones now (fast), then issue/renew missing
+    //     or expiring ones in the background. Self-served DNS-01 requires the GeoDNS
+    //     above to be live to answer the `_acme-challenge` TXT, so this runs after it.
+    certs::load_existing_zone_certs(&state).await;
+    {
+        let bg = state.clone();
+        tokio::spawn(async move {
+            certs::renew_due_zone_certs(&bg).await;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(12 * 3600));
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                certs::renew_due_zone_certs(&bg).await;
+            }
+        });
+    }
 
     // 5. Management router.
     let router = api::router(state.clone());

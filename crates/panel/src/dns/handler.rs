@@ -2,6 +2,7 @@
 //! hickory-server 0.26.1: `handle_request<R: ResponseHandler, T: Time>`, ECS via
 //! `request.edns`, answers built with `MessageResponseBuilder`.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,11 +12,12 @@ use contract::model::{DnsZone, LineGroup};
 use contract::snapshot::AvailabilitySnapshot;
 use geoip::ProviderHandle;
 use hickory_proto::op::{Edns, Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode};
-use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::rdata::{A, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_server::net::runtime::Time;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
+use tokio::sync::RwLock;
 
 use crate::dns::answer::{self, Resolution};
 use crate::dns::ecs;
@@ -37,6 +39,9 @@ pub struct GeoDnsHandler {
     /// Observability counters (ECS hit/miss), for the metrics surface (§12).
     pub ecs_hits: Arc<AtomicU64>,
     pub ecs_misses: Arc<AtomicU64>,
+    /// Self-served ACME DNS-01 challenges: normalized `_acme-challenge.<zone>` → TXT
+    /// value. Lets the panel validate certs for zones delegated to its own GeoDNS.
+    pub challenges: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl GeoDnsHandler {
@@ -48,6 +53,7 @@ impl GeoDnsHandler {
         groups: Arc<ArcSwap<Vec<LineGroup>>>,
         zones: Arc<ArcSwap<Vec<DnsZone>>>,
         ttl_secs: u32,
+        challenges: Arc<RwLock<HashMap<String, String>>>,
     ) -> Self {
         Self {
             snapshot,
@@ -57,6 +63,7 @@ impl GeoDnsHandler {
             ttl: Arc::new(AtomicU64::new(u64::from(ttl_secs))),
             ecs_hits: Arc::new(AtomicU64::new(0)),
             ecs_misses: Arc::new(AtomicU64::new(0)),
+            challenges,
         }
     }
 }
@@ -108,6 +115,30 @@ impl RequestHandler for GeoDnsHandler {
             resp_edns
                 .options_mut()
                 .insert(hickory_proto::rr::rdata::opt::EdnsOption::Subnet(echoed));
+        }
+
+        // Self-served ACME DNS-01: answer TXT for `_acme-challenge.<zone>` from the
+        // in-memory challenge store so the panel can validate certs for the zones
+        // delegated to its own GeoDNS.
+        if qtype == RecordType::TXT {
+            let qname = name.to_ascii().trim_end_matches('.').to_lowercase();
+            let value = self.challenges.read().await.get(&qname).cloned();
+            let records = match value {
+                Some(v) => vec![Record::from_rdata(
+                    name.clone(),
+                    60,
+                    RData::TXT(TXT::new(vec![v])),
+                )],
+                None => vec![],
+            };
+            return send_records(
+                &mut response_handle,
+                request,
+                &request_meta,
+                &resp_edns,
+                &records,
+            )
+            .await;
         }
 
         if qtype != RecordType::A {

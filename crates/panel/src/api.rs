@@ -68,6 +68,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/line-groups/{id}", axum::routing::delete(delete_group))
         .route("/api/zones", get(list_zones).post(create_zone))
         .route("/api/zones/{id}", axum::routing::delete(delete_zone))
+        .route(
+            "/api/zones/{id}/cert",
+            get(zone_cert_status).post(zone_cert_issue),
+        )
         .route("/api/health", get(health_view))
         .route("/api/events", get(sse_events))
         .route("/api/dns-diag", get(dns_diag_list).delete(dns_diag_clear))
@@ -559,6 +563,16 @@ async fn create_zone(
         let _ = cf_client
             .upsert_record("NS", &zone.apex_domain, &ns_fqdn, false, 300)
             .await;
+
+        // Issue the relay cert in the background (ACME takes tens of seconds; don't
+        // block the create response). The UI polls per-zone cert status.
+        let st = state.clone();
+        let apex = zone.apex_domain.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::certs::issue_zone_cert(&st, &apex).await {
+                tracing::warn!(domain = %apex, error = %e, "zone cert issuance failed");
+            }
+        });
     }
 
     Ok(Json(zone))
@@ -595,6 +609,60 @@ async fn refresh_zones(state: &AppState) {
     }
     // Unlike groups, zones don't rebuild the snapshot, so signal the UI directly.
     state.notify_change();
+}
+
+/// Report the relay cert status for one DNS zone (issued? loaded in memory? expiry).
+async fn zone_cert_status(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let zones = db::list_zones(&state.db).await.unwrap_or_default();
+    let Some(zone) = zones.into_iter().find(|z| z.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "zone not found" })),
+        )
+            .into_response();
+    };
+    let loaded = state.zone_cert(&zone.apex_domain).await.is_some();
+    let status = match state.cf_config().await {
+        Some(cf) => acme::read_cert_status(
+            &std::path::Path::new(&cf.cert_dir).join(format!("{}.crt", zone.apex_domain)),
+        ),
+        None => acme::CertStatus {
+            has_cert: false,
+            subject: String::new(),
+            expires_at: String::new(),
+            days_remaining: 0,
+        },
+    };
+    Json(serde_json::json!({
+        "domain": zone.apex_domain,
+        "loaded": loaded,
+        "has_cert": status.has_cert,
+        "subject": status.subject,
+        "expires_at": status.expires_at,
+        "days_remaining": status.days_remaining,
+    }))
+    .into_response()
+}
+
+/// Manually (re)issue the relay cert for one DNS zone via self-served DNS-01.
+/// Awaits issuance so the UI gets a definitive ok/error.
+async fn zone_cert_issue(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let zones = db::list_zones(&state.db).await.unwrap_or_default();
+    let Some(zone) = zones.into_iter().find(|z| z.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "zone not found" })),
+        )
+            .into_response();
+    };
+    match crate::certs::issue_zone_cert(&state, &zone.apex_domain).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
 }
 
 // ---------- SSE: push data-change signals to the UI (replaces 10s polling) ----------

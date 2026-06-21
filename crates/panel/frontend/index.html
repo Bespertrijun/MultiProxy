@@ -1621,8 +1621,10 @@ function renderZones() {
         '<div>' +
           '<div class="text-sm font-medium text-white font-mono">' + esc(z.apex_domain) + '</div>' +
           '<div class="text-xs text-panel-400 mt-1">TTL: ' + z.default_ttl + '秒 &middot; NS: ' + nsDisplay + '</div>' +
+          '<div class="text-xs mt-1" id="zoneCert-' + esc(z.id) + '"><span class="text-panel-500">证书: 检查中…</span></div>' +
         '</div>' +
         '<div class="flex items-center gap-2">' +
+          '<button onclick="issueZoneCert(\'' + esc(z.id) + '\', \'' + esc(z.apex_domain) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-400 transition-colors">签发/续期证书</button>' +
           '<button onclick="confirmDelete(\'zone\', \'' + esc(z.id) + '\', \'' + esc(z.apex_domain) + '\')" class="text-xs px-2.5 py-1.5 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">&#10005; 删除</button>' +
         '</div>' +
       '</div>' +
@@ -1635,6 +1637,40 @@ function renderZones() {
   }).join('');
 
   container.innerHTML = html;
+  loadZoneCertStatuses();
+}
+
+/* ========== Per-zone relay cert ========== */
+async function loadZoneCertStatuses() {
+  for (const z of _zones) {
+    const el = document.getElementById('zoneCert-' + z.id);
+    if (!el) continue;
+    try {
+      const s = await api('GET', '/api/zones/' + encodeURIComponent(z.id) + '/cert');
+      if (s && s.has_cert) {
+        const low = s.days_remaining != null && s.days_remaining < 30;
+        const color = low ? 'text-amber-400' : 'text-emerald-400';
+        el.innerHTML = '<span class="' + color + '">证书: 有效，剩 ' + s.days_remaining + ' 天' +
+          (s.loaded ? '' : '（未加载到内存，重启后生效）') + '</span>';
+      } else {
+        el.innerHTML = '<span class="text-red-400">证书: 未签发 — 点右侧“签发/续期证书”</span>';
+      }
+    } catch (e) {
+      if (e.message !== 'unauthorized') el.innerHTML = '<span class="text-panel-500">证书: 状态未知</span>';
+    }
+  }
+}
+
+async function issueZoneCert(id, apex) {
+  const el = document.getElementById('zoneCert-' + id);
+  if (el) el.innerHTML = '<span class="text-blue-400">证书: 正在签发(可能需要 1 分钟)…</span>';
+  try {
+    await api('POST', '/api/zones/' + encodeURIComponent(id) + '/cert');
+    toast('域名 ' + apex + ' 证书签发成功', 'success');
+  } catch (e) {
+    if (e.message !== 'unauthorized') toast('签发失败: ' + e.message, 'error');
+  }
+  loadZoneCertStatuses();
 }
 
 /* ========== GeoCN provider status ========== */

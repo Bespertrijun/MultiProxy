@@ -3,13 +3,61 @@
 //! Orchestrates the full flow: account creation -> order -> DNS-01 challenge via
 //! Cloudflare API -> validation -> finalize -> cert download -> save to disk.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, RetryPolicy,
 };
+use tokio::sync::RwLock;
 
 use crate::cloudflare::CfClient;
+
+/// Where the DNS-01 `_acme-challenge` TXT record is published during issuance.
+enum ChallengeSink<'a> {
+    /// Publish via the Cloudflare API (for non-delegated domains, e.g. `panel.{domain}`).
+    Cloudflare(&'a CfClient),
+    /// Publish into the panel's own GeoDNS challenge store (for zones NS-delegated to us).
+    SelfDns(&'a Arc<RwLock<HashMap<String, String>>>),
+}
+
+impl ChallengeSink<'_> {
+    /// Publish the challenge TXT value for `fqdn` (`_acme-challenge.<domain>`).
+    async fn publish(&self, fqdn: &str, value: &str) -> Result<(), String> {
+        match self {
+            ChallengeSink::Cloudflare(cf) => cf
+                .upsert_record("TXT", fqdn, value, false, 120)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("CF upsert TXT: {e}")),
+            ChallengeSink::SelfDns(store) => {
+                // The GeoDNS lowercases query names before lookup, so store lowercase.
+                store
+                    .write()
+                    .await
+                    .insert(fqdn.to_lowercase(), value.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Remove the challenge TXT after validation (best-effort).
+    async fn cleanup(&self, fqdn: &str) {
+        match self {
+            ChallengeSink::Cloudflare(cf) => {
+                if let Ok(records) = cf.list_records("TXT", fqdn).await {
+                    for rec in records {
+                        let _ = cf.delete_record(&rec.id).await;
+                    }
+                }
+            }
+            ChallengeSink::SelfDns(store) => {
+                store.write().await.remove(&fqdn.to_lowercase());
+            }
+        }
+    }
+}
 
 /// Let's Encrypt production directory URL.
 const LE_PRODUCTION: &str = "https://acme-v02.api.letsencrypt.org/directory";
@@ -53,6 +101,33 @@ pub async fn issue_cert(
     cert_dir: &str,
     staging: bool,
 ) -> Result<IssuedCert, String> {
+    issue_cert_inner(&ChallengeSink::Cloudflare(cf), domain, cert_dir, staging).await
+}
+
+/// Issue (or renew) a cert for `domain` using the panel's OWN GeoDNS to answer the
+/// DNS-01 challenge. Use this for zone domains NS-delegated to the panel's GeoDNS,
+/// where Cloudflare can no longer serve the `_acme-challenge` TXT.
+pub async fn issue_cert_self_dns(
+    challenges: &Arc<RwLock<HashMap<String, String>>>,
+    domain: &str,
+    cert_dir: &str,
+    staging: bool,
+) -> Result<IssuedCert, String> {
+    issue_cert_inner(
+        &ChallengeSink::SelfDns(challenges),
+        domain,
+        cert_dir,
+        staging,
+    )
+    .await
+}
+
+async fn issue_cert_inner(
+    sink: &ChallengeSink<'_>,
+    domain: &str,
+    cert_dir: &str,
+    staging: bool,
+) -> Result<IssuedCert, String> {
     let cert_dir_path = Path::new(cert_dir);
     std::fs::create_dir_all(cert_dir_path).map_err(|e| format!("create cert dir: {e}"))?;
 
@@ -83,9 +158,7 @@ pub async fn issue_cert(
                     domain = %challenge_domain,
                     "setting ACME DNS-01 TXT record"
                 );
-                cf.upsert_record("TXT", &challenge_domain, &dns_value, false, 120)
-                    .await
-                    .map_err(|e| format!("CF upsert TXT: {e}"))?;
+                sink.publish(&challenge_domain, &dns_value).await?;
 
                 // Wait for DNS propagation.
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -118,11 +191,7 @@ pub async fn issue_cert(
         .map_err(|e| format!("ACME poll_certificate: {e}"))?;
 
     // Clean up the ACME challenge TXT record.
-    if let Ok(records) = cf.list_records("TXT", &challenge_domain).await {
-        for rec in records {
-            let _ = cf.delete_record(&rec.id).await;
-        }
-    }
+    sink.cleanup(&challenge_domain).await;
 
     // 7. Save to disk.
     let cert_path = cert_dir_path.join(format!("{domain}.crt"));

@@ -68,7 +68,8 @@ fn spawn(
     snapshot: Arc<ArcSwap<AvailabilitySnapshot>>,
 ) -> (u16, panel::dns::runtime::DnsRuntimeHandle) {
     let zones = Arc::new(ArcSwap::from_pointee(Vec::<contract::model::DnsZone>::new()));
-    let handler = GeoDnsHandler::new(snapshot, provider, groups, zones, 60);
+    let challenges = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let handler = GeoDnsHandler::new(snapshot, provider, groups, zones, 60, challenges);
     let cfg = DnsConfig {
         bind_addr: "127.0.0.1".into(),
         port: 0,

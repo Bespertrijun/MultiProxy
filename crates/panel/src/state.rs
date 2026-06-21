@@ -77,6 +77,13 @@ pub struct AppState {
     pub events: broadcast::Sender<u64>,
     /// Monotonic counter backing the `events` broadcast payload.
     pub event_seq: Arc<AtomicU64>,
+    /// Self-served ACME DNS-01 challenges the GeoDNS answers: normalized
+    /// `_acme-challenge.<zone>` (lowercase, no trailing dot) → TXT value. Used to issue
+    /// certs for NS-delegated zone domains that Cloudflare can no longer validate.
+    pub acme_challenges: Arc<RwLock<HashMap<String, String>>>,
+    /// Issued relay TLS certs by DNS zone `apex_domain` → (cert_pem, key_pem). Distinct
+    /// from `tls_pair` (the panel's own `panel.{domain}` cert).
+    pub zone_certs: Arc<RwLock<HashMap<String, (String, String)>>>,
 }
 
 impl AppState {
@@ -112,7 +119,29 @@ impl AppState {
             // gets a `Lagged` and refetches once, so dropped intermediate ticks are fine.
             events: broadcast::channel(16).0,
             event_seq: Arc::new(AtomicU64::new(0)),
+            acme_challenges: Arc::new(RwLock::new(HashMap::new())),
+            zone_certs: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Install a self-served ACME DNS-01 TXT challenge (served by the GeoDNS).
+    pub async fn set_acme_challenge(&self, fqdn: String, value: String) {
+        self.acme_challenges.write().await.insert(fqdn, value);
+    }
+
+    /// Remove a self-served ACME DNS-01 TXT challenge after validation.
+    pub async fn clear_acme_challenge(&self, fqdn: &str) {
+        self.acme_challenges.write().await.remove(fqdn);
+    }
+
+    /// Cache an issued relay cert for a zone apex domain.
+    pub async fn set_zone_cert(&self, apex: String, cert: String, key: String) {
+        self.zone_certs.write().await.insert(apex, (cert, key));
+    }
+
+    /// Read the cached relay cert for a zone apex domain, if any.
+    pub async fn zone_cert(&self, apex: &str) -> Option<(String, String)> {
+        self.zone_certs.read().await.get(apex).cloned()
     }
 
     /// Signal the UI that backend data changed, so connected SSE clients refetch.

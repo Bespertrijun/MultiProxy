@@ -198,8 +198,28 @@ async fn push_config(state: &AppState, node_id: &str) {
     let Ok(rules) = db::list_rules_for_node(&state.db, node_id).await else {
         return;
     };
-    let (cert, key) = (state.tls_cert_pem(), state.tls_key_pem());
-    // Render TLS-terminate listeners ONLY when a cert is actually available — otherwise
+    // Pick the cert matching the domain(s) this node serves (zone → cert), NOT the
+    // panel's own cert. A relay listener can present only one cert; if a node serves
+    // multiple zones we use the first with an issued cert and warn.
+    let domains = domains_for_node(state, node_id);
+    let mut chosen: Option<(String, (String, String))> = None;
+    for d in &domains {
+        if let Some(pair) = state.zone_cert(d).await {
+            chosen = Some((d.clone(), pair));
+            break;
+        }
+    }
+    if domains.len() > 1 {
+        tracing::warn!(
+            node_id, ?domains, chosen = ?chosen.as_ref().map(|(d, _)| d),
+            "node serves multiple zones but a listener presents one cert; using the first issued one"
+        );
+    }
+    let (cert, key) = match chosen {
+        Some((_, (c, k))) => (Some(c), Some(k)),
+        None => (None, None),
+    };
+    // Render TLS-terminate listeners ONLY when a matching cert is available — otherwise
     // a Terminate rule renders plain TCP and the client's HTTPS handshake fails
     // (ERR_SSL_PROTOCOL_ERROR). The rendered cert paths must match where the agent
     // writes the PEMs below (configgen::PROD_TLS_*).
@@ -225,6 +245,41 @@ async fn push_config(state: &AppState, node_id: &str) {
             .tx
             .send(Envelope::new(new_token(), Message::ConfigPush(push)));
     }
+}
+
+/// The DNS zone apex domains a node serves: line groups that list it as a member →
+/// their `zone_id` → that zone's `apex_domain`. Mirrors the resolver's
+/// zone→group→node join (see `dns::answer::resolve`) in reverse, so we hand a relay
+/// the cert for the domain clients actually reach it by.
+#[must_use]
+pub fn domains_for_node(state: &AppState, node_id: &str) -> Vec<String> {
+    let groups = state.groups.load();
+    let zones = state.zones.load();
+    domains_for_node_in(&groups, &zones, node_id)
+}
+
+/// Pure core of [`domains_for_node`] (testable without an `AppState`).
+fn domains_for_node_in(
+    groups: &[contract::model::LineGroup],
+    zones: &[contract::model::DnsZone],
+    node_id: &str,
+) -> Vec<String> {
+    let mut zone_ids: Vec<&str> = groups
+        .iter()
+        .filter(|g| g.member_node_ids.iter().any(|m| m == node_id))
+        .filter_map(|g| g.zone_id.as_deref())
+        .collect();
+    zone_ids.sort_unstable();
+    zone_ids.dedup();
+    zone_ids
+        .iter()
+        .filter_map(|zid| {
+            zones
+                .iter()
+                .find(|z| z.id == *zid)
+                .map(|z| z.apex_domain.clone())
+        })
+        .collect()
 }
 
 /// Re-push the desired config to a single connected node (no-op if it is not
@@ -446,5 +501,58 @@ async fn writer_task(
             let _ = sink.send(WsMessage::Close(None)).await;
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::domains_for_node_in;
+    use contract::model::{DnsZone, LineGroup};
+
+    fn zone(id: &str, apex: &str) -> DnsZone {
+        DnsZone {
+            id: id.into(),
+            apex_domain: apex.into(),
+            soa: String::new(),
+            ns: vec![],
+            default_ttl: 60,
+        }
+    }
+
+    fn group(id: &str, zone_id: Option<&str>, members: &[&str]) -> LineGroup {
+        LineGroup {
+            id: id.into(),
+            name: id.into(),
+            zone_id: zone_id.map(Into::into),
+            match_region: None,
+            match_isp: None,
+            member_node_ids: members.iter().map(|s| (*s).to_string()).collect(),
+            priority: 0,
+            fallback_group: None,
+        }
+    }
+
+    #[test]
+    fn maps_node_to_its_zone_domains() {
+        let zones = vec![zone("z1", "a.example.com"), zone("z2", "b.example.com")];
+        let groups = vec![
+            group("g1", Some("z1"), &["node-1", "node-2"]),
+            group("g2", Some("z2"), &["node-2"]),
+            group("g3", None, &["node-1"]), // zone_id=None contributes no domain
+        ];
+        // node-1 is in z1 (and a zoneless group) → only a.example.com.
+        assert_eq!(
+            domains_for_node_in(&groups, &zones, "node-1"),
+            vec!["a.example.com".to_string()]
+        );
+        // node-2 spans both zones.
+        let mut d2 = domains_for_node_in(&groups, &zones, "node-2");
+        d2.sort();
+        assert_eq!(
+            d2,
+            vec!["a.example.com".to_string(), "b.example.com".to_string()]
+        );
+        // unknown node → none.
+        assert!(domains_for_node_in(&groups, &zones, "node-x").is_empty());
     }
 }
