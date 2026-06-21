@@ -139,14 +139,37 @@ pub async fn build(cfg: PanelConfig) -> Result<Panel, String> {
         Arc::new(Vault::load_or_create_key(&key_path).map_err(|e| e.to_string())?)
     };
 
-    // 2. Geo provider (hot-reloadable). Real GeoCN MMDB if configured, else the
-    //    unknown stub (the panel still runs; resolution returns SERVFAIL until a DB
-    //    is loaded, which is honest rather than faking answers).
-    let provider = match &cfg.geocn_path {
-        Some(path) => {
-            Arc::new(ProviderHandle::load(geoip::DbFormat::GeoCn, path).map_err(|e| e.to_string())?)
+    // 2. Geo provider (hot-reloadable). Load the GeoCN MMDB from the SAME path the
+    //    online-update endpoint and `AppState` use, so a downloaded DB survives a
+    //    restart (previously startup only loaded when `--geocn` was passed, silently
+    //    reverting to the stub on reboot even when `./GeoCN.mmdb` existed). If the file
+    //    is missing or fails to parse, fall back to the unknown stub and WARN loudly —
+    //    every lookup then returns province 0 / ISP Unknown.
+    let geocn_path = cfg
+        .geocn_path
+        .clone()
+        .unwrap_or_else(|| "./GeoCN.mmdb".to_string());
+    let provider = if std::path::Path::new(&geocn_path).exists() {
+        match ProviderHandle::load(geoip::DbFormat::GeoCn, &geocn_path) {
+            Ok(p) => {
+                tracing::info!(path = %geocn_path, "GeoCN provider loaded");
+                Arc::new(p)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %geocn_path, error = %e,
+                    "GeoCN load failed; using unknown stub — every lookup returns province 0 / ISP Unknown"
+                );
+                Arc::new(ProviderHandle::new(Arc::new(UnknownProvider)))
+            }
         }
-        None => Arc::new(ProviderHandle::new(Arc::new(UnknownProvider))),
+    } else {
+        tracing::warn!(
+            path = %geocn_path,
+            "GeoCN db not found; using unknown stub — every lookup returns province 0 / ISP Unknown. \
+             Load it via the panel's online update or `panel fetch-geocn`."
+        );
+        Arc::new(ProviderHandle::new(Arc::new(UnknownProvider)))
     };
 
     // 3. Shared snapshot + groups handles (the scheduler↔resolver coupling surface).
@@ -156,10 +179,6 @@ pub async fn build(cfg: PanelConfig) -> Result<Panel, String> {
     let zones_vec = db::list_zones(&db).await.map_err(|e| e.to_string())?;
     let zones = Arc::new(ArcSwap::from_pointee(zones_vec));
 
-    let geocn_path = cfg
-        .geocn_path
-        .clone()
-        .unwrap_or_else(|| "./GeoCN.mmdb".to_string());
     let state = AppState::new(
         db.clone(),
         snapshot.clone(),

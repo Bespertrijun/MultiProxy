@@ -342,6 +342,8 @@ tailwind.config = {
           </button>
         </div>
 
+        <div id="geoStatusBanner" class="hidden mb-4 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-300"></div>
+
         <div id="zonesContainer" class="space-y-4">
           <div class="text-sm text-panel-400 py-8 text-center">正在加载...</div>
         </div>
@@ -1000,6 +1002,7 @@ function navigateTo(page) {
   // Auto-load the DNS resolution diagnostics when opening the DNS page; stop its
   // auto-refresh poll when navigating away.
   if (page === 'zones') {
+    loadGeoStatus();
     loadDnsDiag();
   } else {
     stopDnsDiagAuto();
@@ -1632,6 +1635,25 @@ function renderZones() {
   }).join('');
 
   container.innerHTML = html;
+}
+
+/* ========== GeoCN provider status ========== */
+async function loadGeoStatus() {
+  var banner = document.getElementById('geoStatusBanner');
+  if (!banner) return;
+  try {
+    var s = await api('GET', '/api/geocn/status');
+    if (s && s.loaded) {
+      banner.classList.add('hidden');
+    } else {
+      banner.classList.remove('hidden');
+      banner.innerHTML = '⚠ <span class="font-medium">GeoCN 地理库未加载</span>（当前: ' + esc(s ? s.format : '未知') +
+        '）。所有客户端会被识别为“未知地区/运营商”，带「匹配地区/匹配运营商」的线路组都不会命中（SERVFAIL）。' +
+        '请到 <a href="#settings" class="underline">设置</a> 页「在线更新 GeoCN 数据库」，或把线路组的地区/运营商设为「不限」。';
+    }
+  } catch (e) {
+    if (e.message !== 'unauthorized') banner.classList.add('hidden');
+  }
 }
 
 /* ========== DNS resolution diagnostics ========== */

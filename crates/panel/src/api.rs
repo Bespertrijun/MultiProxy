@@ -72,6 +72,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/events", get(sse_events))
         .route("/api/dns-diag", get(dns_diag_list).delete(dns_diag_clear))
         .route("/api/geocn/update", post(geocn_update))
+        .route("/api/geocn/status", get(geocn_status))
         .route("/api/cf/sync", post(cf_sync))
         .route("/api/cert/status", get(cert_status))
         .route("/api/acme/renew", post(acme_renew))
@@ -694,6 +695,19 @@ async fn health_view(State(state): State<AppState>) -> Result<Json<Vec<NodeHealt
 #[derive(Deserialize)]
 struct GeocnUpdateQuery {
     url: Option<String>,
+}
+
+/// Report the active geo provider so the UI can warn when the unknown stub is in
+/// effect (every lookup → province 0 / ISP Unknown, breaking region/ISP routing).
+async fn geocn_status(State(state): State<AppState>) -> Response {
+    let format = state.provider.current().format();
+    let loaded = format != "unknown-stub";
+    Json(serde_json::json!({
+        "format": format,
+        "loaded": loaded,
+        "path": state.geocn_path,
+    }))
+    .into_response()
 }
 
 async fn geocn_update(
