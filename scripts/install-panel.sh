@@ -56,12 +56,22 @@ echo "================================================"
 # 创建目录
 mkdir -p "$DATA_DIR/certs" "$DATA_DIR/dist"
 
-# 下载面板二进制
+# 升级/重装:先停旧服务,避免覆盖正在运行的二进制(Text file busy)。
+if command -v systemctl &>/dev/null && systemctl is-active multiproxy-panel &>/dev/null 2>&1; then
+  systemctl stop multiproxy-panel 2>/dev/null || true
+elif command -v rc-service &>/dev/null && [[ -f /etc/init.d/multiproxy-panel ]]; then
+  rc-service multiproxy-panel stop 2>/dev/null || true
+elif [[ -f /run/multiproxy-panel.pid ]]; then
+  kill "$(cat /run/multiproxy-panel.pid)" 2>/dev/null || true
+fi
+
+# 下载面板二进制。下载到同目录临时文件再 mv 覆盖(原子替换,避免 Text file busy)。
 echo ""
 echo "[1/4] 下载 panel 二进制..."
 DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$BINARY"
-curl -fSL "$DOWNLOAD_URL" -o /usr/local/bin/panel
-chmod +x /usr/local/bin/panel
+curl -fSL "$DOWNLOAD_URL" -o /usr/local/bin/panel.new
+chmod +x /usr/local/bin/panel.new
+mv -f /usr/local/bin/panel.new /usr/local/bin/panel
 echo "  ✓ 已下载: /usr/local/bin/panel ($(du -h /usr/local/bin/panel | cut -f1))"
 
 # 初始化数据库 + 管理员

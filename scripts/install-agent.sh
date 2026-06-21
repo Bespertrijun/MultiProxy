@@ -107,12 +107,27 @@ echo "  面板: $PANEL_URL"
 echo "  节点: $NODE_ID"
 echo "================================================"
 
-# 下载 agent 二进制 (从 GitHub Releases)
+# 升级/重装:先停旧服务并清理残留转发进程,避免二进制被占用(Text file busy)或留下孤儿。
+echo ""
+echo "[0/3] 停止已有服务(若存在)..."
+if command -v systemctl &>/dev/null && systemctl is-active multiproxy-agent &>/dev/null 2>&1; then
+  systemctl stop multiproxy-agent 2>/dev/null || true
+elif command -v rc-service &>/dev/null && [[ -f /etc/init.d/multiproxy-agent ]]; then
+  rc-service multiproxy-agent stop 2>/dev/null || true
+elif [[ -f /run/multiproxy-agent.pid ]]; then
+  kill "$(cat /run/multiproxy-agent.pid)" 2>/dev/null || true
+fi
+pkill -9 -x realm 2>/dev/null || true
+pkill -9 -x gost 2>/dev/null || true
+
+# 下载 agent 二进制 (从 GitHub Releases)。下载到同目录临时文件再 mv 覆盖:即使旧
+# 二进制仍在运行也是原子替换(rename),不会报 Text file busy。
 echo ""
 echo "[1/3] 下载 agent 二进制 ($BINARY)..."
 DOWNLOAD_URL="https://github.com/$REPO/releases/latest/download/$BINARY"
-curl -fSL "$DOWNLOAD_URL" -o /usr/local/bin/agent
-chmod +x /usr/local/bin/agent
+curl -fSL "$DOWNLOAD_URL" -o /usr/local/bin/agent.new
+chmod +x /usr/local/bin/agent.new
+mv -f /usr/local/bin/agent.new /usr/local/bin/agent
 echo "  ✓ 已下载: /usr/local/bin/agent ($(du -h /usr/local/bin/agent | cut -f1))"
 
 # 下载 gost + realm
