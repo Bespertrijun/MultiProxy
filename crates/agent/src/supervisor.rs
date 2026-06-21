@@ -77,13 +77,18 @@ impl ChildProcess for RealChild {
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
-        // Killing an already-exited child returns InvalidInput on some
-        // platforms; treat that as success (idempotent kill).
+        // Send the signal (idempotent — an already-exited child returns
+        // InvalidInput on some platforms; treat as success), THEN wait() to REAP
+        // it. Without the wait an exited/killed child lingers as a zombie; on a
+        // crash-looping or frequently-repushed node these piled up as many
+        // `[realm]`/`[gost]` zombies.
         match self.child.kill() {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
-            Err(e) => Err(e),
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            Err(e) => return Err(e),
         }
+        let _ = self.child.wait();
+        Ok(())
     }
 
     fn pid(&self) -> Option<u32> {
