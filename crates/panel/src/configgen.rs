@@ -135,8 +135,14 @@ fn render_realm(rules: &[&ForwardRule], tls: Option<&TlsPaths>) -> String {
         }
         if r.tls_mode == TlsMode::Terminate {
             if let Some(tls) = tls {
-                out.push_str(&format!("tls_cert = \"{}\"\n", tls.cert));
-                out.push_str(&format!("tls_key = \"{}\"\n", tls.key));
+                // realm terminates TLS via a Kaminari `listen_transport` string, NOT
+                // standalone `tls_cert`/`tls_key` keys (which realm silently ignores,
+                // leaving a plain-TCP listener → client HTTPS fails). Server-side TLS
+                // is `tls;cert=<path>;key=<path>` (paths have no chars needing escape).
+                out.push_str(&format!(
+                    "listen_transport = \"tls;cert={};key={}\"\n",
+                    tls.cert, tls.key
+                ));
             }
         }
     }

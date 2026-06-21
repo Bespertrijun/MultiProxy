@@ -5,5 +5,4 @@ use_udp = true
 [[endpoints]]
 listen = "0.0.0.0:443"
 remote = "10.0.0.5:8096"
-tls_cert = "/etc/multiproxy/tls.crt"
-tls_key = "/etc/multiproxy/tls.key"
+listen_transport = "tls;cert=/etc/multiproxy/tls.crt;key=/etc/multiproxy/tls.key"
