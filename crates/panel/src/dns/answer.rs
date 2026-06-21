@@ -57,11 +57,24 @@ pub fn match_line_group<'a>(
     candidates.into_iter().next()
 }
 
+/// Convert a unix-millis instant plus a timezone offset (minutes east of UTC) into the
+/// local minute-of-day in `[0,1440)`. China is a fixed UTC+8 (no DST), so a constant
+/// offset is exact — this avoids pulling a timezone database into the panel.
+#[must_use]
+pub fn local_minute_of_day(now_ms: u64, tz_offset_min: i64) -> u16 {
+    let secs = (now_ms / 1000) as i64;
+    let local = secs + tz_offset_min * 60;
+    let mod_day = local.rem_euclid(86_400);
+    (mod_day / 60) as u16
+}
+
 /// Resolve a client network to a set of A records.
 ///
 /// `provider` does the geo/ISP lookup; `groups` are all configured line groups;
-/// `snapshot` holds the two-tier-resolved `available` sets. Applies the Q3 empty-set
-/// policy: try the matched line's `fallback_group` once, else SERVFAIL.
+/// `snapshot` holds the two-tier-resolved `available` sets. `now_min` is the current
+/// local minute-of-day (see [`local_minute_of_day`]) used to honor each group's
+/// `active_window` (e.g. evening-peak switching). Applies the Q3 empty-set policy: try
+/// the matched line's `fallback_group` once, else SERVFAIL.
 #[must_use]
 pub fn resolve(
     provider: &dyn GeoIpProvider,
@@ -70,6 +83,7 @@ pub fn resolve(
     snapshot: &AvailabilitySnapshot,
     client_addr: IpAddr,
     query_name: &str,
+    now_min: u16,
 ) -> Resolution {
     let mut steps: Vec<DiagStep> = Vec::new();
     let resolution = resolve_traced(
@@ -79,6 +93,7 @@ pub fn resolve(
         snapshot,
         client_addr,
         query_name,
+        now_min,
         &mut steps,
     );
     let (ok, summary) = match &resolution {
@@ -91,6 +106,7 @@ pub fn resolve(
 
 /// The actual resolution, pushing a structured trace into `steps` at each decision
 /// point so the panel UI can show exactly where an answer — or a SERVFAIL — came from.
+#[allow(clippy::too_many_arguments)]
 fn resolve_traced(
     provider: &dyn GeoIpProvider,
     groups: &[LineGroup],
@@ -98,6 +114,7 @@ fn resolve_traced(
     snapshot: &AvailabilitySnapshot,
     client_addr: IpAddr,
     query_name: &str,
+    now_min: u16,
     steps: &mut Vec<DiagStep>,
 ) -> Resolution {
     let matched_zone = zones
@@ -159,6 +176,32 @@ fn resolve_traced(
         ),
     ));
 
+    // step2.5 生效时段过滤（晚高峰换组）。带 `active_window` 的组只在窗口内可选；窗口外
+    // 被过滤掉，于是同匹配条件、始终生效的常规组自然接管。无窗口的组（绝大多数）恒生效。
+    let scheduled = filtered
+        .iter()
+        .filter(|g| g.active_window.is_some())
+        .count();
+    let inactive: Vec<&str> = filtered
+        .iter()
+        .filter(|g| g.active_window.is_some_and(|w| !w.contains(now_min)))
+        .map(|g| g.name.as_str())
+        .collect();
+    let time_active: Vec<&LineGroup> = filtered
+        .iter()
+        .copied()
+        .filter(|g| g.active_window.is_none_or(|w| w.contains(now_min)))
+        .collect();
+    let (hh, mm) = (now_min / 60, now_min % 60);
+    steps.push(DiagStep::new(
+        if scheduled > 0 { "ok" } else { "info" },
+        "step2.5 生效时段过滤",
+        format!(
+            "当前本地时间 {hh:02}:{mm:02}（按面板时区设置）；{scheduled} 个组配置了生效时段，\
+             当前未生效（已过滤）: {inactive:?}",
+        ),
+    ));
+
     let (region, isp) = provider.lookup(client_addr);
     steps.push(DiagStep::new(
         "info",
@@ -171,12 +214,12 @@ fn resolve_traced(
         ),
     ));
 
-    let flat: Vec<LineGroup> = filtered.into_iter().cloned().collect();
+    let flat: Vec<LineGroup> = time_active.into_iter().cloned().collect();
     let Some(group) = match_line_group(&flat, &region, isp) else {
         steps.push(DiagStep::new(
             "fail",
             "step4 匹配线路组",
-            "没有线路组匹配（域名过滤 + 地区/运营商过滤后为空）-> SERVFAIL".to_string(),
+            "没有线路组匹配（域名过滤 + 生效时段 + 地区/运营商过滤后为空）-> SERVFAIL".to_string(),
         ));
         return Resolution::ServFail;
     };
@@ -271,6 +314,7 @@ mod tests {
             member_node_ids: vec![],
             priority,
             fallback_group: fb.map(str::to_string),
+            active_window: None,
         }
     }
 
@@ -342,6 +386,7 @@ mod tests {
             &snap,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "test.example.com",
+            600,
         );
         assert_eq!(r, Resolution::Answer(vec![Ipv4Addr::new(1, 1, 1, 1)]));
     }
@@ -359,6 +404,7 @@ mod tests {
             &snap,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "test.example.com",
+            600,
         );
         assert_eq!(r, Resolution::Answer(vec![Ipv4Addr::new(2, 2, 2, 2)]));
 
@@ -370,6 +416,7 @@ mod tests {
             &empty,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "test.example.com",
+            600,
         );
         assert_eq!(r2, Resolution::ServFail);
     }
@@ -387,7 +434,106 @@ mod tests {
             &snap,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "test.example.com",
+            600,
         );
         assert_eq!(r, Resolution::ServFail);
+    }
+
+    #[test]
+    fn time_window_contains_and_wraps_midnight() {
+        use contract::model::TimeWindow;
+        let day = TimeWindow {
+            start_min: 8 * 60,
+            end_min: 18 * 60,
+        };
+        assert!(day.contains(8 * 60), "inclusive start");
+        assert!(day.contains(10 * 60));
+        assert!(!day.contains(18 * 60), "exclusive end");
+        assert!(!day.contains(7 * 60));
+
+        let night = TimeWindow {
+            start_min: 20 * 60,
+            end_min: 2 * 60,
+        }; // 20:00–02:00 crosses midnight
+        assert!(night.contains(20 * 60), "inclusive start");
+        assert!(night.contains(23 * 60));
+        assert!(night.contains(60), "01:00 is still inside");
+        assert!(!night.contains(2 * 60), "exclusive end");
+        assert!(!night.contains(10 * 60));
+    }
+
+    #[test]
+    fn local_minute_of_day_applies_offset() {
+        // Epoch 00:00 UTC + 8h = 08:00 local = 480 min.
+        assert_eq!(local_minute_of_day(0, 480), 480);
+        // 16:30:00 UTC with +0 offset = 990 min.
+        assert_eq!(local_minute_of_day(59_400_000, 0), 990);
+        // 23:00 UTC + 8h wraps to 07:00 next day = 420 min.
+        assert_eq!(local_minute_of_day(23 * 3_600_000, 480), 420);
+    }
+
+    #[test]
+    fn peak_window_switches_line_group() {
+        use contract::model::TimeWindow;
+        // Identical matcher (河南电信). `peak` is active only 20:00–24:00 and out-ranks
+        // `normal`. During peak the resolver serves peak's IP; off-peak the peak group is
+        // filtered out by its window and the always-on `normal` group takes over.
+        let mut peak = group("peak", Some(41), Some(Isp::Telecom), 0, None);
+        peak.active_window = Some(TimeWindow {
+            start_min: 20 * 60,
+            end_min: 24 * 60,
+        });
+        let normal = group("normal", Some(41), Some(Isp::Telecom), 5, None);
+        let groups = vec![peak, normal];
+
+        let mut lines = HashMap::new();
+        lines.insert(
+            "peak".to_string(),
+            LineAvailability {
+                available: vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))],
+                fallback_group: None,
+                classified: vec![],
+            },
+        );
+        lines.insert(
+            "normal".to_string(),
+            LineAvailability {
+                available: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+                fallback_group: None,
+                classified: vec![],
+            },
+        );
+        let snap = AvailabilitySnapshot {
+            generation: 1,
+            built_at: 0,
+            lines,
+        };
+        let p = FakeProvider(region(41), Isp::Telecom);
+        let zones = vec![];
+
+        let at_peak = resolve(
+            &p,
+            &groups,
+            &zones,
+            &snap,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "x.example.com",
+            21 * 60,
+        );
+        assert_eq!(at_peak, Resolution::Answer(vec![Ipv4Addr::new(9, 9, 9, 9)]));
+
+        let off_peak = resolve(
+            &p,
+            &groups,
+            &zones,
+            &snap,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "x.example.com",
+            10 * 60,
+        );
+        assert_eq!(
+            off_peak,
+            Resolution::Answer(vec![Ipv4Addr::new(1, 1, 1, 1)])
+        );
     }
 }

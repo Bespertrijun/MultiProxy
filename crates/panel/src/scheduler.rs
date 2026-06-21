@@ -588,6 +588,7 @@ mod tests {
             member_node_ids: vec!["n1".into(), "n2".into()],
             priority: 0,
             fallback_group: None,
+            active_window: None,
         };
         let snap = build_snapshot(&nodes, &rts, &[group], 1, 1000, 20);
         let avail = snap.available_for("g1");

@@ -546,6 +546,7 @@ mod tests {
             member_node_ids: members.iter().map(|s| (*s).to_string()).collect(),
             priority: 0,
             fallback_group: None,
+            active_window: None,
         }
     }
 

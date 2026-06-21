@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use contract::isp::Isp;
 use contract::model::{
-    Agent, ConnState, DnsZone, ForwardRule, FrontNode, LineGroup, NodeStatus, TlsMode,
+    Agent, ConnState, DnsZone, ForwardRule, FrontNode, LineGroup, NodeStatus, TimeWindow, TlsMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +89,10 @@ pub fn router(state: AppState) -> Router {
             get(get_cf_settings)
                 .put(put_cf_settings)
                 .delete(delete_cf_settings),
+        )
+        .route(
+            "/api/settings/timezone",
+            get(get_timezone).put(put_timezone),
         )
         .route("/api/version", get(version_info))
         .route("/api/update/check", get(update_check))
@@ -648,12 +652,28 @@ struct CreateGroupReq {
     priority: i32,
     #[serde(default)]
     fallback_group: Option<String>,
+    /// Optional daily active window (晚高峰换组). `None` = always active.
+    #[serde(default)]
+    active_window: Option<TimeWindow>,
+}
+
+/// Reject a malformed active window before it reaches the DB / resolver.
+fn validate_window(w: Option<&TimeWindow>) -> Result<()> {
+    if let Some(w) = w {
+        if w.start_min > 1439 || w.end_min < 1 || w.end_min > 1440 || w.start_min == w.end_min {
+            return Err(PanelError::BadRequest(
+                "生效时段非法：起始∈[00:00,23:59]、结束∈[00:01,24:00]，且起止不能相同".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn create_group(
     State(state): State<AppState>,
     Json(req): Json<CreateGroupReq>,
 ) -> Result<Json<LineGroup>> {
+    validate_window(req.active_window.as_ref())?;
     let group = LineGroup {
         id: auth::new_token(),
         name: req.name,
@@ -663,6 +683,7 @@ async fn create_group(
         member_node_ids: req.member_node_ids,
         priority: req.priority,
         fallback_group: req.fallback_group,
+        active_window: req.active_window,
     };
     db::upsert_line_group(&state.db, &group).await?;
     refresh_groups(&state).await?;
@@ -693,6 +714,7 @@ async fn update_group(
         Some(g) => g.member_node_ids,
         None => return Err(PanelError::NotFound("line group".into())),
     };
+    validate_window(req.active_window.as_ref())?;
     let group = LineGroup {
         id,
         name: req.name,
@@ -702,6 +724,7 @@ async fn update_group(
         member_node_ids: req.member_node_ids,
         priority: req.priority,
         fallback_group: req.fallback_group,
+        active_window: req.active_window,
     };
     db::upsert_line_group(&state.db, &group).await?;
     refresh_groups(&state).await?;
@@ -1435,6 +1458,52 @@ async fn delete_cf_settings(State(state): State<AppState>) -> Response {
     }
     state.set_cf_config(None).await;
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+// ---------- timezone (for line-group active windows / 晚高峰换组) ----------
+
+#[derive(Serialize)]
+struct TimezoneResp {
+    /// Minutes east of UTC. Default 480 = UTC+8 (China).
+    tz_offset_min: i64,
+}
+
+async fn get_timezone(State(state): State<AppState>) -> Json<TimezoneResp> {
+    Json(TimezoneResp {
+        tz_offset_min: state
+            .tz_offset_min
+            .load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+#[derive(Deserialize)]
+struct PutTimezoneReq {
+    tz_offset_min: i64,
+}
+
+async fn put_timezone(
+    State(state): State<AppState>,
+    Json(req): Json<PutTimezoneReq>,
+) -> Result<Json<TimezoneResp>> {
+    if !(-720..=840).contains(&req.tz_offset_min) {
+        return Err(PanelError::BadRequest(
+            "时区偏移非法：应在 -720..=840 分钟（UTC-12 .. UTC+14）".into(),
+        ));
+    }
+    db::set_setting(
+        &state.db,
+        "tz_offset_min",
+        &req.tz_offset_min.to_string(),
+        None,
+    )
+    .await?;
+    state
+        .tz_offset_min
+        .store(req.tz_offset_min, std::sync::atomic::Ordering::Relaxed);
+    state.notify_change();
+    Ok(Json(TimezoneResp {
+        tz_offset_min: req.tz_offset_min,
+    }))
 }
 
 // ---------- version + self-update ----------

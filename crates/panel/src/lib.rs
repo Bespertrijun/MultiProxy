@@ -192,6 +192,16 @@ pub async fn build(cfg: PanelConfig) -> Result<Panel, String> {
         cfg.agent_bin_dir.clone(),
     );
 
+    // 3a'. Load persisted timezone offset for line-group active windows (晚高峰换组).
+    //      Default stays UTC+8 (set in AppState::new) when the setting is absent/invalid.
+    if let Ok(Some(v)) = db::get_setting(&db, "tz_offset_min", None).await {
+        if let Ok(off) = v.trim().parse::<i64>() {
+            state
+                .tz_offset_min
+                .store(off, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     // 3a. Seed CLI CF flags into DB (CLI wins / overwrites DB).
     let vault_ref = Some(vault.as_ref());
     if let Some(cli_cf) = &cfg.cf {
@@ -333,6 +343,7 @@ pub async fn build(cfg: PanelConfig) -> Result<Panel, String> {
         groups,
         zones,
         cfg.ttl_secs,
+        state.tz_offset_min.clone(),
         state.acme_challenges.clone(),
     );
     let dns = spawn_dns(handler, cfg.dns.clone())?;

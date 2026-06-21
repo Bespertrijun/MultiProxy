@@ -2,7 +2,7 @@
 //! with the DNS runtime, and the live WS connection registry.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -56,6 +56,10 @@ pub struct AppState {
     pub zones: Arc<ArcSwap<Vec<DnsZone>>>,
     /// Monotonic snapshot generation counter.
     pub snapshot_gen: Arc<AtomicU64>,
+    /// Timezone offset (minutes east of UTC) for evaluating line-group active windows
+    /// (晚高峰换组). Default 480 = UTC+8 (China, no DST). Shared with the DNS handler so
+    /// resolution honors the same local time; persisted under settings key `tz_offset_min`.
+    pub tz_offset_min: Arc<AtomicI64>,
     /// Live WS connections by node_id.
     pub conns: Arc<Mutex<HashMap<String, AgentConn>>>,
     /// In-memory per-node health/capacity runtime (rebuilt from reports).
@@ -107,6 +111,7 @@ impl AppState {
             groups,
             zones,
             snapshot_gen: Arc::new(AtomicU64::new(0)),
+            tz_offset_min: Arc::new(AtomicI64::new(480)),
             conns: Arc::new(Mutex::new(HashMap::new())),
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             heartbeat_interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,

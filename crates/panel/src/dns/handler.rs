@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -36,6 +36,9 @@ pub struct GeoDnsHandler {
     pub zones: Arc<ArcSwap<Vec<DnsZone>>>,
     /// Resolution-domain A-record TTL (Q4, default 60s).
     pub ttl: Arc<AtomicU64>,
+    /// Timezone offset (minutes east of UTC) for evaluating line-group active windows
+    /// (晚高峰换组). Shared with `AppState` so live changes apply without a restart.
+    pub tz_offset_min: Arc<AtomicI64>,
     /// Observability counters (ECS hit/miss), for the metrics surface (§12).
     pub ecs_hits: Arc<AtomicU64>,
     pub ecs_misses: Arc<AtomicU64>,
@@ -53,6 +56,7 @@ impl GeoDnsHandler {
         groups: Arc<ArcSwap<Vec<LineGroup>>>,
         zones: Arc<ArcSwap<Vec<DnsZone>>>,
         ttl_secs: u32,
+        tz_offset_min: Arc<AtomicI64>,
         challenges: Arc<RwLock<HashMap<String, String>>>,
     ) -> Self {
         Self {
@@ -61,6 +65,7 @@ impl GeoDnsHandler {
             groups,
             zones,
             ttl: Arc::new(AtomicU64::new(u64::from(ttl_secs))),
+            tz_offset_min,
             ecs_hits: Arc::new(AtomicU64::new(0)),
             ecs_misses: Arc::new(AtomicU64::new(0)),
             challenges,
@@ -159,6 +164,10 @@ impl RequestHandler for GeoDnsHandler {
         let groups = self.groups.load();
         let zones = self.zones.load();
         let query_name_str = name.to_ascii().trim_end_matches('.').to_lowercase();
+        let now_min = answer::local_minute_of_day(
+            crate::ws_server::now_ms(),
+            self.tz_offset_min.load(Ordering::Relaxed),
+        );
         let resolution = answer::resolve(
             provider.as_ref(),
             groups.as_ref(),
@@ -166,6 +175,7 @@ impl RequestHandler for GeoDnsHandler {
             &snapshot,
             client.addr,
             &query_name_str,
+            now_min,
         );
 
         match resolution {

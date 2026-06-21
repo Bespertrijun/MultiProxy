@@ -69,7 +69,8 @@ fn spawn(
 ) -> (u16, panel::dns::runtime::DnsRuntimeHandle) {
     let zones = Arc::new(ArcSwap::from_pointee(Vec::<contract::model::DnsZone>::new()));
     let challenges = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let handler = GeoDnsHandler::new(snapshot, provider, groups, zones, 60, challenges);
+    let tz_offset = Arc::new(std::sync::atomic::AtomicI64::new(480));
+    let handler = GeoDnsHandler::new(snapshot, provider, groups, zones, 60, tz_offset, challenges);
     let cfg = DnsConfig {
         bind_addr: "127.0.0.1".into(),
         port: 0,
@@ -132,6 +133,7 @@ async fn ecs_query_returns_line_a_set_and_echoes_scope() {
         member_node_ids: vec!["n1".into()],
         priority: 0,
         fallback_group: None,
+        active_window: None,
     };
     let groups = Arc::new(ArcSwap::from_pointee(vec![group]));
     let snapshot = Arc::new(ArcSwap::from_pointee(snapshot_with(
@@ -175,6 +177,7 @@ async fn flipping_health_changes_answer_within_one_query() {
         member_node_ids: vec!["n2".into()],
         priority: 0,
         fallback_group: None,
+        active_window: None,
     };
     let groups = Arc::new(ArcSwap::from_pointee(vec![group]));
     // Start empty → SERVFAIL.
@@ -226,6 +229,7 @@ async fn no_ecs_uses_source_ip_fallback() {
         member_node_ids: vec!["n3".into()],
         priority: 0,
         fallback_group: None,
+        active_window: None,
     };
     let groups = Arc::new(ArcSwap::from_pointee(vec![group]));
     let snapshot = Arc::new(ArcSwap::from_pointee(snapshot_with(

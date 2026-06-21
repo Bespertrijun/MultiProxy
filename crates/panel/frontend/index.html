@@ -924,6 +924,32 @@ tailwind.config = {
           <option value="">无</option>
         </select>
       </div>
+      <div class="border-t border-panel-500 pt-3">
+        <label class="flex items-center gap-2 text-xs text-panel-300 uppercase tracking-wider cursor-pointer select-none">
+          <input type="checkbox" id="addGroupSchedEnabled" onchange="toggleGroupSched()" class="accent-blue-500" />
+          仅在指定时段生效（晚高峰换组）
+        </label>
+        <div id="addGroupSchedBox" class="hidden mt-3 space-y-2">
+          <div class="grid grid-cols-2 gap-4">
+            <div>
+              <label class="block text-[11px] text-panel-400 mb-1">开始</label>
+              <input id="addGroupSchedStart" type="time" value="20:00"
+                class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+            </div>
+            <div>
+              <label class="block text-[11px] text-panel-400 mb-1">结束</label>
+              <input id="addGroupSchedEnd" type="time" value="00:00"
+                class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
+            </div>
+          </div>
+          <div>
+            <label class="block text-[11px] text-panel-400 mb-1">时区（全局，所有时段共用）</label>
+            <select id="globalTzOffset" onchange="saveTimezone()"
+              class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100"></select>
+          </div>
+          <p class="text-[11px] text-panel-400 leading-relaxed">结束填 <b>00:00</b> 表示次日零点（24:00）。开始晚于结束表示跨午夜，例如 20:00–02:00。时段外该组自动隐藏，由<b>同匹配条件、未设时段</b>的常规组接管——"晚高峰换一套线路组" = 给峰时组设更高优先级（数值更小）+ 此时段。</p>
+        </div>
+      </div>
     </div>
     <div class="flex justify-end gap-2 px-5 py-4 border-t border-panel-500">
       <button onclick="closeModal('addGroupModal')"
@@ -1521,7 +1547,10 @@ function renderTopology() {
           '<span class="text-panel-400">' + rulesText + '</span></div>';
       }).join('');
       if (!nodeRows) return '';
-      var matchLabel = esc(g.name);
+      var matchLabel = esc(g.name) + (g.active_window
+        ? ' <span class="' + (winContains(g.active_window, nowLocalMin()) ? 'text-green-400' : 'text-panel-500') +
+          '" title="生效时段（晚高峰换组）">⏰' + esc(winLabel(g.active_window)) + '</span>'
+        : '');
       return '<div class="ml-4">' +
         '<div class="flex items-center gap-2 text-xs text-blue-400">' +
           '<span class="text-panel-500">└─</span> ' + matchLabel +
@@ -1716,9 +1745,17 @@ function renderZones() {
         var memberNames = (g.member_node_ids || []).map(function(mid) { return nodeNameById(mid); });
         var regionDisplay = provinceLabel(g.match_region);
         var isLegacy = !g.zone_id;
+        var winHtml = '';
+        if (g.active_window) {
+          var act = winContains(g.active_window, nowLocalMin());
+          winHtml = ' <span class="text-[10px] px-1.5 py-0.5 rounded ' +
+            (act ? 'bg-green-600/20 text-green-400' : 'bg-panel-700 text-panel-400') +
+            '" title="生效时段（晚高峰换组）' + (act ? ' · 当前生效中' : ' · 当前未生效') + '">⏰ ' +
+            esc(winLabel(g.active_window)) + (act ? ' 生效中' : '') + '</span>';
+        }
         return '<tr class="data-row">' +
           '<td class="px-4 py-2.5 text-panel-100 text-xs font-medium">' + esc(g.name) +
-            (isLegacy ? ' <span class="text-panel-500 text-[10px]">(全局)</span>' : '') +
+            (isLegacy ? ' <span class="text-panel-500 text-[10px]">(全局)</span>' : '') + winHtml +
           '</td>' +
           '<td class="px-4 py-2.5 text-panel-300 text-xs">' + (regionDisplay ? esc(regionDisplay) : '<span class="text-panel-500">不限</span>') + '</td>' +
           '<td class="px-4 py-2.5 text-panel-300 text-xs">' + (g.match_isp != null ? esc(g.match_isp) : '<span class="text-panel-500">不限</span>') + '</td>' +
@@ -2273,6 +2310,14 @@ async function createGroup() {
   var fallback = document.getElementById('addGroupFallback').value;
   if (fallback) body.fallback_group = fallback;
 
+  if (document.getElementById('addGroupSchedEnabled').checked) {
+    var sm = timeToMin(document.getElementById('addGroupSchedStart').value, false);
+    var em = timeToMin(document.getElementById('addGroupSchedEnd').value, true);
+    if (sm === em) { toast('生效时段的起止时间不能相同', 'error'); return; }
+    body.active_window = { start_min: sm, end_min: em };
+  }
+  // When the toggle is off, active_window is omitted → backend clears any schedule.
+
   var editing = _editingGroupId;
   try {
     if (editing) {
@@ -2304,6 +2349,13 @@ function editGroup(id) {
   document.getElementById('addGroupISP').value = g.match_isp || '';
   document.getElementById('addGroupPrio').value = g.priority != null ? g.priority : 0;
   document.getElementById('addGroupFallback').value = g.fallback_group || '';
+  var w = g.active_window;
+  document.getElementById('addGroupSchedEnabled').checked = !!w;
+  document.getElementById('addGroupSchedBox').classList.toggle('hidden', !w);
+  if (w) {
+    document.getElementById('addGroupSchedStart').value = fmtMin(w.start_min);
+    document.getElementById('addGroupSchedEnd').value = w.end_min === 1440 ? '00:00' : fmtMin(w.end_min);
+  }
   var members = g.member_node_ids || [];
   document.querySelectorAll('.grp-node-cb').forEach(function(cb) {
     cb.checked = members.indexOf(cb.value) !== -1;
@@ -2475,7 +2527,76 @@ function populateRuleNodeSelect() {
   }).join('');
 }
 
+/* ===== Line-group active windows (晚高峰换组) ===== */
+var _tzOffsetMin = 480; // UTC+8 default; refreshed from /api/settings/timezone
+var TZ_OFFSETS = [
+  { v: 480, label: 'UTC+8 北京/上海' },
+  { v: 540, label: 'UTC+9 东京/首尔' },
+  { v: 420, label: 'UTC+7 曼谷/河内' },
+  { v: 0,   label: 'UTC±0 伦敦' },
+  { v: -300, label: 'UTC-5 纽约(东部)' },
+  { v: -480, label: 'UTC-8 洛杉矶(西部)' }
+];
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+function fmtMin(m) { m = ((m % 1440) + 1440) % 1440; return pad2(Math.floor(m / 60)) + ':' + pad2(m % 60); }
+// "HH:MM" -> minutes; end "00:00" means end-of-day (1440).
+function timeToMin(str, isEnd) {
+  var parts = (str || '').split(':');
+  var h = parseInt(parts[0], 10) || 0, m = parseInt(parts[1], 10) || 0;
+  var total = h * 60 + m;
+  if (isEnd && total === 0) return 1440;
+  return total;
+}
+function winLabel(w) {
+  if (!w) return '';
+  var end = w.end_min === 1440 ? '24:00' : fmtMin(w.end_min);
+  return fmtMin(w.start_min) + '–' + end;
+}
+function winContains(w, t) {
+  t = ((t % 1440) + 1440) % 1440;
+  if (w.start_min <= w.end_min) return t >= w.start_min && t < w.end_min;
+  return t >= w.start_min || t < w.end_min;
+}
+function nowLocalMin() {
+  return ((Math.floor(Date.now() / 60000 + _tzOffsetMin) % 1440) + 1440) % 1440;
+}
+function toggleGroupSched() {
+  var on = document.getElementById('addGroupSchedEnabled').checked;
+  document.getElementById('addGroupSchedBox').classList.toggle('hidden', !on);
+}
+async function loadTimezone() {
+  try {
+    var r = await api('GET', '/api/settings/timezone');
+    if (r && typeof r.tz_offset_min === 'number') _tzOffsetMin = r.tz_offset_min;
+  } catch (e) { /* keep default */ }
+  var sel = document.getElementById('globalTzOffset');
+  if (sel) {
+    var known = TZ_OFFSETS.some(function(t) { return t.v === _tzOffsetMin; });
+    var opts = TZ_OFFSETS.slice();
+    if (!known) opts.push({ v: _tzOffsetMin, label: 'UTC' + (_tzOffsetMin >= 0 ? '+' : '') + (_tzOffsetMin / 60) });
+    sel.innerHTML = opts.map(function(t) {
+      return '<option value="' + t.v + '"' + (t.v === _tzOffsetMin ? ' selected' : '') + '>' + esc(t.label) + '</option>';
+    }).join('');
+  }
+}
+async function saveTimezone() {
+  var v = parseInt(document.getElementById('globalTzOffset').value, 10);
+  try {
+    await api('PUT', '/api/settings/timezone', { tz_offset_min: v });
+    _tzOffsetMin = v;
+    toast('时区已更新（UTC' + (v >= 0 ? '+' : '') + (v / 60) + '）', 'success');
+    await refreshAll();
+  } catch (e) { toast('时区保存失败: ' + e.message, 'error'); }
+}
+
 function populateGroupSelects() {
+  // Reset the schedule sub-form to defaults; editGroup() overrides afterwards.
+  document.getElementById('addGroupSchedEnabled').checked = false;
+  document.getElementById('addGroupSchedBox').classList.add('hidden');
+  document.getElementById('addGroupSchedStart').value = '20:00';
+  document.getElementById('addGroupSchedEnd').value = '00:00';
+  loadTimezone();
+
   // Province dropdown
   var regionSel = document.getElementById('addGroupRegion');
   regionSel.innerHTML = PROVINCES.map(function(p) {

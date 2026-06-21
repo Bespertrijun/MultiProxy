@@ -81,7 +81,8 @@ CREATE TABLE IF NOT EXISTS line_group (
     match_isp       TEXT,
     member_node_ids TEXT NOT NULL DEFAULT '[]',
     priority        INTEGER NOT NULL DEFAULT 0,
-    fallback_group  TEXT
+    fallback_group  TEXT,
+    active_window   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS dns_zone (
@@ -155,6 +156,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
     let alter_stmts = &[
         "ALTER TABLE front_node ADD COLUMN quota_direction TEXT NOT NULL DEFAULT 'Both'",
         "ALTER TABLE line_group ADD COLUMN zone_id TEXT",
+        "ALTER TABLE line_group ADD COLUMN active_window TEXT",
         "ALTER TABLE panel_user ADD COLUMN totp_secret TEXT",
         "ALTER TABLE panel_user ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0",
     ];
@@ -840,13 +842,18 @@ pub async fn delete_rule(pool: &SqlitePool, id: &str) -> Result<()> {
 /// Returns [`PanelError::Db`] on failure.
 pub async fn upsert_line_group(pool: &SqlitePool, g: &LineGroup) -> Result<()> {
     let members = serde_json::to_string(&g.member_node_ids).unwrap_or_else(|_| "[]".into());
+    let active_window = g
+        .active_window
+        .as_ref()
+        .map(|w| serde_json::to_string(w).unwrap_or_default());
     sqlx::query(
-        "INSERT INTO line_group(id, name, zone_id, match_region, match_isp, member_node_ids, priority, fallback_group)
-         VALUES(?,?,?,?,?,?,?,?)
+        "INSERT INTO line_group(id, name, zone_id, match_region, match_isp, member_node_ids, priority, fallback_group, active_window)
+         VALUES(?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET
             name=excluded.name, zone_id=excluded.zone_id, match_region=excluded.match_region,
             match_isp=excluded.match_isp, member_node_ids=excluded.member_node_ids,
-            priority=excluded.priority, fallback_group=excluded.fallback_group",
+            priority=excluded.priority, fallback_group=excluded.fallback_group,
+            active_window=excluded.active_window",
     )
     .bind(&g.id)
     .bind(&g.name)
@@ -856,6 +863,7 @@ pub async fn upsert_line_group(pool: &SqlitePool, g: &LineGroup) -> Result<()> {
     .bind(members)
     .bind(i64::from(g.priority))
     .bind(&g.fallback_group)
+    .bind(active_window)
     .execute(pool)
     .await?;
     Ok(())
@@ -875,6 +883,9 @@ fn row_to_group(row: &sqlx::sqlite::SqliteRow) -> LineGroup {
         member_node_ids: members,
         priority: row.get::<i64, _>("priority") as i32,
         fallback_group: row.get::<Option<String>, _>("fallback_group"),
+        active_window: row
+            .get::<Option<String>, _>("active_window")
+            .and_then(|s| serde_json::from_str(&s).ok()),
     }
 }
 
@@ -1116,6 +1127,38 @@ mod tests {
 
     fn now_ms() -> i64 {
         now_ms_i64()
+    }
+
+    #[tokio::test]
+    async fn line_group_active_window_round_trips() {
+        use contract::model::TimeWindow;
+        let pool = mem().await;
+        let win = TimeWindow {
+            start_min: 1200,
+            end_min: 1440,
+        };
+        let g = LineGroup {
+            id: "g-peak".into(),
+            name: "晚高峰组".into(),
+            zone_id: Some("z1".into()),
+            match_region: Some(41),
+            match_isp: Some(Isp::Telecom),
+            member_node_ids: vec!["n1".into()],
+            priority: 0,
+            fallback_group: None,
+            active_window: Some(win),
+        };
+        upsert_line_group(&pool, &g).await.unwrap();
+        let got = list_line_groups(&pool).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].active_window, Some(win));
+
+        // Clearing the schedule persists as NULL → None.
+        let mut g2 = g.clone();
+        g2.active_window = None;
+        upsert_line_group(&pool, &g2).await.unwrap();
+        let got2 = list_line_groups(&pool).await.unwrap();
+        assert_eq!(got2[0].active_window, None);
     }
 
     #[tokio::test]

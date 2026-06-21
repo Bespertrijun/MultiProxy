@@ -176,6 +176,38 @@ pub enum Tool {
     Realm,
 }
 
+/// A daily active window expressed in local-time minutes-since-midnight (`[0,1440]`).
+///
+/// Lets a line group serve only during certain hours — e.g. an evening-peak (晚高峰)
+/// group active 20:00–24:00. Time-of-day is computed from the panel's configured
+/// timezone offset, so `start_min`/`end_min` are always *local* minutes.
+///
+/// `end_min` may be `1440` (= 24:00, exclusive end-of-day). When `start_min > end_min`
+/// the window crosses midnight (e.g. 20:00–02:00 = `1200..120`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimeWindow {
+    /// Inclusive start minute-of-day, `[0,1439]`.
+    pub start_min: u16,
+    /// Exclusive end minute-of-day, `[1,1440]`.
+    pub end_min: u16,
+}
+
+impl TimeWindow {
+    /// Whether local minute-of-day `t` falls inside the window.
+    ///
+    /// Non-wrapping (`start <= end`): active when `start <= t < end`.
+    /// Wrapping (`start > end`, crosses midnight): active when `t >= start || t < end`.
+    #[must_use]
+    pub fn contains(&self, t: u16) -> bool {
+        let t = t % 1440;
+        if self.start_min <= self.end_min {
+            t >= self.start_min && t < self.end_min
+        } else {
+            t >= self.start_min || t < self.end_min
+        }
+    }
+}
+
 /// Maps a (region, ISP) match to a set of front nodes. `priority` resolves overlap
 /// when multiple groups match (AC-3 gap). Lower number = higher priority.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -197,6 +229,11 @@ pub struct LineGroup {
     /// is empty → SERVFAIL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_group: Option<LineGroupId>,
+    /// `None` = always active. `Some` = the group is only eligible during this daily
+    /// local-time window (e.g. an evening-peak group). Outside the window the resolver
+    /// filters it out, so a same-matcher always-on group transparently takes over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_window: Option<TimeWindow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
