@@ -1,11 +1,17 @@
 //! GeoCN MMDB provider (the M1 default) + the ONE format-switch stub.
 //!
-//! GeoCN MMDB record schema (D5 / CRITICAL-2 — the *real* fields, verified against
-//! the ljxi/GeoCN repo, NOT the HTTP-API enrichment layer):
-//!   IPv4 → `division_code` (integer) + `isp` (short string: 电信/联通/移动/…)
+//! GeoCN MMDB record schema (D5 / CRITICAL-2 — the *real* fields, verified against an
+//! actual GeoCN.mmdb, NOT the HTTP-API enrichment layer):
+//!   IPv4 → `division_code` (MMDB uint64) + `isp` (short string: 电信/联通/移动/…)
 //!   IPv6 → `division_code` + `isp` + `type` (网络类型: 宽带/基站/专线/IDC/空)
 //! There is NO `net` field and NO separate `province/provinceCode/city/...` fields
 //! in the MMDB itself. ISP values are the SHORT forms (电信, not 中国电信).
+//!
+//! NOTE: `division_code` is stored as MMDB type 9 (uint64). It MUST be deserialized as
+//! `u64` — declaring it `u32` makes maxminddb error ("expected u32, got type 9"), which
+//! (with `#[serde(default)]`) silently drops the WHOLE record and returns Unknown for
+//! every IP. That regression shipped undetected because the live decode test was
+//! `#[ignore]`d. See `live_geocn_mmdb_decodes_documented_fields`.
 
 use std::net::IpAddr;
 
@@ -23,8 +29,9 @@ use crate::{division, GeoIpError, GeoIpProvider};
 /// MMDB fields are ignored by serde (forward-compatible).
 #[derive(Debug, Deserialize)]
 struct GeoCnRecord {
+    /// GB/T 2260 division code, stored as MMDB uint64 (type 9) — see module note.
     #[serde(default)]
-    division_code: u32,
+    division_code: u64,
     #[serde(default)]
     isp: String,
     /// IPv6-only network type (宽带/基站/专线/IDC/…). Decoded for completeness;
@@ -69,7 +76,9 @@ impl GeoIpProvider for GeoCnProvider {
         }
         match result.decode::<GeoCnRecord>() {
             Ok(Some(rec)) => {
-                let region = division::decode(rec.division_code);
+                // Division codes are 6-digit GB/T 2260 (≤ 999999); the u64 storage type
+                // always fits u32. Saturate defensively rather than panic on bad data.
+                let region = division::decode(u32::try_from(rec.division_code).unwrap_or(0));
                 let isp = Isp::from_geocn(&rec.isp);
                 let _ = rec.net_type; // IPv6 type decoded but unused in M1 (IPv4-only).
                 (region, isp)
@@ -244,10 +253,11 @@ mod tests {
 
     /// Live GeoCN MMDB decode test — GATED behind the `GEOCN_MMDB` env var and
     /// `#[ignore]` so CI does not fail when the real (large, network-fetched)
-    /// `GeoCN.mmdb` is unavailable in the sandbox (see report notes). Run with:
+    /// `GeoCN.mmdb` is unavailable in the sandbox. Run with:
     ///   `GEOCN_MMDB=/path/to/GeoCN.mmdb cargo test -p geoip -- --ignored`
-    /// It asserts the decoder reads the documented `division_code`/`isp` fields
-    /// from a real file (CRITICAL-2 sample-load), the M0 tie-breaker task.
+    /// It asserts the decoder reads the documented `division_code`/`isp` fields from a
+    /// real file — this is the test that would have caught the uint64 schema bug had it
+    /// not been left unran. KEEP IT PASSING when touching `GeoCnRecord`.
     #[test]
     #[ignore = "requires a real GeoCN.mmdb via GEOCN_MMDB env var"]
     fn live_geocn_mmdb_decodes_documented_fields() {
@@ -255,11 +265,13 @@ mod tests {
             .expect("set GEOCN_MMDB to a real GeoCN.mmdb path to run this test");
         let provider = GeoCnProvider::open(&path).expect("open GeoCN.mmdb");
         assert_eq!(provider.format(), "geocn-mmdb");
-        // 114.114.114.114 (南京信风 DNS, 江苏电信 space) is a stable mainland anchor.
-        let (region, isp) = provider.lookup(IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114)));
-        // We do not hard-code the exact division here (DB revisions move it); we
-        // assert the decode produced a real mainland province + a recognized ISP,
-        // which is what proves the documented-field decode path works end to end.
+        // 202.96.128.86 (广东电信 space) is a stable mainland anchor that carries BOTH a
+        // division_code and an isp (unlike 114.114.114.114, whose isp is empty). This
+        // exercises the full documented-field decode path end to end.
+        let (region, isp) = provider.lookup(IpAddr::V4(Ipv4Addr::new(202, 96, 128, 86)));
+        // We do not hard-code the exact division (DB revisions move it); we assert the
+        // decode produced a real mainland province + a recognized short-form ISP —
+        // which fails loudly if `division_code`'s storage type ever mismatches again.
         assert_ne!(
             region,
             Region::unknown(),
