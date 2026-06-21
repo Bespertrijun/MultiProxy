@@ -66,7 +66,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/rules", get(list_rules).post(create_rule))
         .route("/api/rules/{id}", axum::routing::delete(delete_rule))
         .route("/api/line-groups", get(list_groups).post(create_group))
-        .route("/api/line-groups/{id}", axum::routing::delete(delete_group))
+        .route(
+            "/api/line-groups/{id}",
+            axum::routing::put(update_group).delete(delete_group),
+        )
         .route("/api/zones", get(list_zones).post(create_zone))
         .route("/api/zones/{id}", axum::routing::delete(delete_zone))
         .route(
@@ -668,6 +671,34 @@ async fn create_group(
 
 async fn list_groups(State(state): State<AppState>) -> Result<Json<Vec<LineGroup>>> {
     Ok(Json(db::list_line_groups(&state.db).await?))
+}
+
+async fn update_group(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateGroupReq>,
+) -> Result<Json<LineGroup>> {
+    // PUT semantics: the group must already exist.
+    if !db::list_line_groups(&state.db)
+        .await?
+        .iter()
+        .any(|g| g.id == id)
+    {
+        return Err(PanelError::NotFound("line group".into()));
+    }
+    let group = LineGroup {
+        id,
+        name: req.name,
+        zone_id: req.zone_id,
+        match_region: req.match_region,
+        match_isp: req.match_isp,
+        member_node_ids: req.member_node_ids,
+        priority: req.priority,
+        fallback_group: req.fallback_group,
+    };
+    db::upsert_line_group(&state.db, &group).await?;
+    refresh_groups(&state).await?;
+    Ok(Json(group))
 }
 
 async fn delete_group(State(state): State<AppState>, Path(id): Path<String>) -> Result<StatusCode> {

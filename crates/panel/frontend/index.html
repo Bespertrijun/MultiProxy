@@ -875,7 +875,7 @@ tailwind.config = {
   <div class="modal-backdrop absolute inset-0" onclick="closeModal('addGroupModal')"></div>
   <div class="relative bg-panel-800 border border-panel-500 rounded-xl shadow-2xl w-full max-w-lg animate-slide-up">
     <div class="flex items-center justify-between px-5 py-4 border-b border-panel-500">
-      <h3 class="text-sm font-semibold text-white">添加线路组</h3>
+      <h3 id="addGroupTitle" class="text-sm font-semibold text-white">添加线路组</h3>
       <button onclick="closeModal('addGroupModal')" class="text-panel-400 hover:text-white text-lg">&times;</button>
     </div>
     <div class="p-5 space-y-4">
@@ -1001,6 +1001,7 @@ let _zones = [];
 let _health = [];
 let _refreshTimer = null;
 let _eventSource = null;
+let _editingGroupId = null;
 let _currentPage = 'dashboard';
 
 /* ========== API ========== */
@@ -1124,6 +1125,8 @@ function closeModal(id) {
   document.getElementById(id).classList.add('hidden');
   if (id === 'addGroupModal') {
     document.getElementById('addGroupZoneId').value = '';
+    _editingGroupId = null;
+    document.getElementById('addGroupTitle').textContent = '添加线路组';
   }
 }
 
@@ -1725,7 +1728,8 @@ function renderZones() {
             '</span>' +
           '</td>' +
           '<td class="px-4 py-2.5 text-panel-300 text-xs">' + g.priority + '</td>' +
-          '<td class="px-4 py-2.5 text-right">' +
+          '<td class="px-4 py-2.5 text-right whitespace-nowrap">' +
+            '<button onclick="editGroup(\'' + esc(g.id) + '\')" class="text-xs px-2 py-1 rounded-md bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 transition-colors mr-1">编辑</button>' +
             '<button onclick="confirmDelete(\'group\', \'' + esc(g.id) + '\', \'' + esc(g.name) + '\')" class="text-xs px-2 py-1 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">&#10005;</button>' +
           '</td>' +
         '</tr>';
@@ -1893,8 +1897,17 @@ function stopDnsDiagAuto() {
 }
 
 function openAddGroupForZone(zoneId) {
-  document.getElementById('addGroupZoneId').value = zoneId;
+  // Fresh "add" flow: clear any edit state + previous field values.
+  _editingGroupId = null;
   openModal('addGroupModal');
+  document.getElementById('addGroupTitle').textContent = '添加线路组';
+  document.getElementById('addGroupZoneId').value = zoneId;
+  document.getElementById('addGroupName').value = '';
+  document.getElementById('addGroupRegion').value = '';
+  document.getElementById('addGroupISP').value = '';
+  document.getElementById('addGroupPrio').value = '0';
+  document.getElementById('addGroupFallback').value = '';
+  document.querySelectorAll('.grp-node-cb').forEach(function(cb) { cb.checked = false; });
 }
 
 /* ========== Settings ========== */
@@ -2260,18 +2273,41 @@ async function createGroup() {
   var fallback = document.getElementById('addGroupFallback').value;
   if (fallback) body.fallback_group = fallback;
 
+  var editing = _editingGroupId;
   try {
-    await api('POST', '/api/line-groups', body);
+    if (editing) {
+      await api('PUT', '/api/line-groups/' + encodeURIComponent(editing), body);
+    } else {
+      await api('POST', '/api/line-groups', body);
+    }
     closeModal('addGroupModal');
     document.getElementById('addGroupName').value = '';
     document.getElementById('addGroupRegion').value = '';
     document.getElementById('addGroupZoneId').value = '';
     document.querySelectorAll('.grp-node-cb').forEach(function(cb) { cb.checked = false; });
-    toast('线路组 "' + name + '" 创建成功', 'success');
+    toast('线路组 "' + name + '" ' + (editing ? '已保存' : '创建成功'), 'success');
     await refreshAll();
   } catch (e) {
     toast('操作失败: ' + e.message, 'error');
   }
+}
+
+function editGroup(id) {
+  var g = _groups.find(function(x) { return x.id === id; });
+  if (!g) { toast('线路组不存在', 'error'); return; }
+  _editingGroupId = id;
+  openModal('addGroupModal'); // builds the selects + member checkboxes first
+  document.getElementById('addGroupTitle').textContent = '编辑线路组';
+  document.getElementById('addGroupZoneId').value = g.zone_id || '';
+  document.getElementById('addGroupName').value = g.name || '';
+  document.getElementById('addGroupRegion').value = g.match_region != null ? String(g.match_region) : '';
+  document.getElementById('addGroupISP').value = g.match_isp || '';
+  document.getElementById('addGroupPrio').value = g.priority != null ? g.priority : 0;
+  document.getElementById('addGroupFallback').value = g.fallback_group || '';
+  var members = g.member_node_ids || [];
+  document.querySelectorAll('.grp-node-cb').forEach(function(cb) {
+    cb.checked = members.indexOf(cb.value) !== -1;
+  });
 }
 
 async function createZone() {
