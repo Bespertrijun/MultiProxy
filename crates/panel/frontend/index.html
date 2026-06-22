@@ -239,7 +239,7 @@ tailwind.config = {
         </div>
 
         <!-- Summary cards -->
-        <div id="dashSummary" class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+        <div id="dashSummary" class="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-6">
           <div class="bg-panel-700 border border-panel-500 rounded-xl p-4 card-hover">
             <div class="text-xs text-panel-300 uppercase tracking-wider mb-1">节点总数</div>
             <div id="statTotal" class="text-2xl font-bold text-white">-</div>
@@ -249,8 +249,12 @@ tailwind.config = {
             <div id="statOnline" class="text-2xl font-bold text-emerald-400">-</div>
           </div>
           <div class="bg-panel-700 border border-panel-500 rounded-xl p-4 card-hover">
+            <div class="text-xs text-panel-300 uppercase tracking-wider mb-1">错误</div>
+            <div id="statError" class="text-2xl font-bold text-red-400">-</div>
+          </div>
+          <div class="bg-panel-700 border border-panel-500 rounded-xl p-4 card-hover">
             <div class="text-xs text-panel-300 uppercase tracking-wider mb-1">离线</div>
-            <div id="statOffline" class="text-2xl font-bold text-red-400">-</div>
+            <div id="statOffline" class="text-2xl font-bold text-panel-300">-</div>
           </div>
           <div class="bg-panel-700 border border-panel-500 rounded-xl p-4 card-hover">
             <div class="text-xs text-panel-300 uppercase tracking-wider mb-1">饱和</div>
@@ -323,7 +327,7 @@ tailwind.config = {
               <h3 class="text-sm font-medium text-panel-200">转发规则</h3>
               <p class="text-xs text-panel-400 mt-0.5">按节点配置的端口转发规则</p>
             </div>
-            <button onclick="openModal('addRuleModal')"
+            <button onclick="openAddRule()"
               class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-3 py-1.5 transition-colors whitespace-nowrap">
               + 添加规则
             </button>
@@ -806,7 +810,7 @@ tailwind.config = {
   <div class="modal-backdrop absolute inset-0" onclick="closeModal('addRuleModal')"></div>
   <div class="relative bg-panel-800 border border-panel-500 rounded-xl shadow-2xl w-full max-w-lg animate-slide-up">
     <div class="flex items-center justify-between px-5 py-4 border-b border-panel-500">
-      <h3 class="text-sm font-semibold text-white">添加转发规则</h3>
+      <h3 id="ruleModalTitle" class="text-sm font-semibold text-white">添加转发规则</h3>
       <button onclick="closeModal('addRuleModal')" class="text-panel-400 hover:text-white text-lg">&times;</button>
     </div>
     <div class="p-5 space-y-4">
@@ -865,7 +869,7 @@ tailwind.config = {
     <div class="flex justify-end gap-2 px-5 py-4 border-t border-panel-500">
       <button onclick="closeModal('addRuleModal')"
         class="px-4 py-2 text-sm text-panel-300 hover:text-white rounded-lg hover:bg-panel-600 transition-colors">取消</button>
-      <button onclick="createRule()"
+      <button id="ruleSubmitBtn" onclick="saveRule()"
         class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2 transition-colors">确认</button>
     </div>
   </div>
@@ -1469,15 +1473,23 @@ function stopAutoRefresh() {
 /* ========== Dashboard ========== */
 function renderDashboard() {
   var total = _health.length;
-  var online = 0, offline = 0, saturated = 0;
+  var online = 0, offline = 0, error = 0, saturated = 0;
   _health.forEach(function(h) {
-    if (h.status === 'online' || h.connected) online++;
-    else offline++;
+    var conn = (h.status === 'online' || h.connected);
+    if (!conn) { offline++; return; }
+    // Connected but faulted (the "错误·" badges) is NOT "在线" — count it separately
+    // so the online number reflects nodes that are actually serving.
+    if (h.reason === 'backend_unreachable' || h.reason === 'forwarding_down' || h.reason === 'offline') {
+      error++;
+    } else {
+      online++;
+    }
     if (h.saturation_state === 'saturated') saturated++;
   });
 
   document.getElementById('statTotal').textContent = total;
   document.getElementById('statOnline').textContent = online;
+  document.getElementById('statError').textContent = error;
   document.getElementById('statOffline').textContent = offline;
   document.getElementById('statSaturated').textContent = saturated;
 
@@ -1637,7 +1649,10 @@ function renderNodeRules() {
         '<td class="px-4 py-2.5"><span class="text-xs px-2 py-0.5 rounded bg-panel-600 text-panel-200">' + esc(r.tool) + '</span></td>' +
         '<td class="px-4 py-2.5">' + tlsBadge + '</td>' +
         '<td class="px-4 py-2.5 text-right">' +
-          '<button onclick="confirmDelete(\'rule\', \'' + esc(r.id) + '\', \'端口 ' + r.listen_port + ' 的规则\')" class="text-xs px-2 py-1 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">&#10005;</button>' +
+          '<div class="flex items-center justify-end gap-1">' +
+            '<button onclick="openEditRule(\'' + esc(r.id) + '\')" class="text-xs px-2 py-1 rounded-md bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 transition-colors" title="编辑">&#9998;</button>' +
+            '<button onclick="confirmDelete(\'rule\', \'' + esc(r.id) + '\', \'端口 ' + r.listen_port + ' 的规则\')" class="text-xs px-2 py-1 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors" title="删除">&#10005;</button>' +
+          '</div>' +
         '</td>' +
       '</tr>';
     }).join('');
@@ -1682,7 +1697,7 @@ function renderNodeRules() {
 }
 
 function openAddRuleForNode(nodeId) {
-  openModal('addRuleModal');
+  openAddRule();
   // Pre-select the node after the select is populated
   setTimeout(function() {
     var sel = document.getElementById('addRuleNode');
@@ -2267,28 +2282,75 @@ function clearNodeForm() {
   document.getElementById('addNodeResetDay').value = '';
 }
 
-async function createRule() {
+// null = create mode; a rule id = editing that rule in place.
+var _editingRuleId = null;
+
+function resetRuleForm() {
+  document.getElementById('addRulePort').value = '';
+  document.getElementById('addRuleHost').value = '';
+  document.getElementById('addRuleBackPort').value = '';
+  document.getElementById('addRuleProto').value = 'tcp';
+  document.getElementById('addRuleTool').value = 'gost';
+  document.getElementById('addRuleTlsMode').value = 'passthrough';
+}
+
+function openAddRule() {
+  _editingRuleId = null;
+  resetRuleForm();
+  document.getElementById('ruleModalTitle').textContent = '添加转发规则';
+  document.getElementById('ruleSubmitBtn').textContent = '确认';
+  document.getElementById('addRuleNode').disabled = false;
+  openModal('addRuleModal');
+}
+
+function openEditRule(id) {
+  var r = _rules.find(function(x) { return x.id === id; });
+  if (!r) { toast('规则不存在', 'error'); return; }
+  _editingRuleId = id;
+  openModal('addRuleModal'); // populates the node <select>
+  document.getElementById('ruleModalTitle').textContent = '编辑转发规则';
+  document.getElementById('ruleSubmitBtn').textContent = '保存';
+  document.getElementById('addRulePort').value = r.listen_port;
+  document.getElementById('addRuleProto').value = r.protocol;
+  document.getElementById('addRuleHost').value = r.backend_host;
+  document.getElementById('addRuleBackPort').value = r.backend_port;
+  document.getElementById('addRuleTool').value = r.tool;
+  document.getElementById('addRuleTlsMode').value = r.tls_mode;
+  // Node is fixed when editing (changing it would orphan the rule on the old node).
+  setTimeout(function() {
+    var sel = document.getElementById('addRuleNode');
+    if (sel) { sel.value = r.node_id; sel.disabled = true; }
+  }, 50);
+}
+
+async function saveRule() {
   var nodeId = document.getElementById('addRuleNode').value;
   var port = document.getElementById('addRulePort').value;
   var host = document.getElementById('addRuleHost').value.trim();
   var bport = document.getElementById('addRuleBackPort').value;
   if (!nodeId || !port || !host || !bport) { toast('所有字段均为必填', 'error'); return; }
 
+  var body = {
+    node_id: nodeId,
+    listen_port: parseInt(port, 10),
+    protocol: document.getElementById('addRuleProto').value,
+    backend_host: host,
+    backend_port: parseInt(bport, 10),
+    tool: document.getElementById('addRuleTool').value,
+    tls_mode: document.getElementById('addRuleTlsMode').value
+  };
+
   try {
-    await api('POST', '/api/rules', {
-      node_id: nodeId,
-      listen_port: parseInt(port, 10),
-      protocol: document.getElementById('addRuleProto').value,
-      backend_host: host,
-      backend_port: parseInt(bport, 10),
-      tool: document.getElementById('addRuleTool').value,
-      tls_mode: document.getElementById('addRuleTlsMode').value
-    });
+    if (_editingRuleId) {
+      await api('PUT', '/api/rules/' + encodeURIComponent(_editingRuleId), body);
+    } else {
+      await api('POST', '/api/rules', body);
+    }
     closeModal('addRuleModal');
-    document.getElementById('addRulePort').value = '';
-    document.getElementById('addRuleHost').value = '';
-    document.getElementById('addRuleBackPort').value = '';
-    toast('规则创建成功', 'success');
+    document.getElementById('addRuleNode').disabled = false;
+    resetRuleForm();
+    toast(_editingRuleId ? '规则已更新' : '规则创建成功', 'success');
+    _editingRuleId = null;
     await refreshAll();
   } catch (e) {
     toast('操作失败: ' + e.message, 'error');
