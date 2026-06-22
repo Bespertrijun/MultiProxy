@@ -57,6 +57,13 @@ if [[ "$UNINSTALL" == "true" ]]; then
     echo "  ✓ 已停止后台进程"
   fi
 
+  # 兜底:清掉未被服务/pidfile 跟踪的孤儿 agent 及其转发进程,确保删二进制前无进程占用/残留。
+  pkill -x agent 2>/dev/null || true
+  sleep 1
+  pkill -9 -x agent 2>/dev/null || true
+  pkill -9 -x realm 2>/dev/null || true
+  pkill -9 -x gost 2>/dev/null || true
+
   # 删除二进制
   rm -f /usr/local/bin/agent
   echo "  ✓ 已删除 /usr/local/bin/agent"
@@ -117,6 +124,13 @@ elif command -v rc-service &>/dev/null && [[ -f /etc/init.d/multiproxy-agent ]];
 elif [[ -f /run/multiproxy-agent.pid ]]; then
   kill "$(cat /run/multiproxy-agent.pid)" 2>/dev/null || true
 fi
+# 兜底:停掉未被服务/pidfile 跟踪的孤儿 agent(手动启动、pidfile 失效,或自更新 execv 后
+# start-stop-daemon 按 exec 路径认不出)。否则二进制虽被原子替换,旧进程仍在跑老版本,且
+# 随后 start 会撞 "already running"。先 TERM(经 PR_SET_PDEATHSIG 一并带走其 gost/realm),
+# 稍候再兜底 KILL,确保 start 前进程确已退出。
+pkill -x agent 2>/dev/null || true
+sleep 1
+pkill -9 -x agent 2>/dev/null || true
 pkill -9 -x realm 2>/dev/null || true
 pkill -9 -x gost 2>/dev/null || true
 
