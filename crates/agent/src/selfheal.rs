@@ -41,13 +41,25 @@ impl TcpBackendProbe {
         Self { timeout }
     }
 
-    /// Connect-test a single endpoint within the timeout.
+    /// Connect-test a single endpoint within the timeout. Logs WHY a probe failed
+    /// (malformed address / refused / timeout) so backend-health issues are
+    /// diagnosable from the agent log instead of guessable.
     async fn connects(&self, target: &BackendEndpoint) -> bool {
         let addr = format!("{}:{}", target.host, target.port);
-        matches!(
-            tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr)).await,
-            Ok(Ok(_))
-        )
+        match tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr)).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                eprintln!("backend probe: connect {addr} failed: {e}");
+                false
+            }
+            Err(_) => {
+                eprintln!(
+                    "backend probe: connect {addr} timed out after {:?}",
+                    self.timeout
+                );
+                false
+            }
+        }
     }
 }
 

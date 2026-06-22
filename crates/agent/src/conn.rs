@@ -324,6 +324,15 @@ where
                         } else if push.gost_config.is_none() && push.realm_config.is_none() {
                             deps.backends.clear();
                         }
+                        eprintln!(
+                            "config: gen={} backend probe target(s)=[{}]",
+                            push.desired_gen,
+                            deps.backends
+                                .iter()
+                                .map(|b| format!("{}:{}", b.host, b.port))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
                         let ack = match config::apply(&push, &cfg.config_paths) {
                             Ok(ApplyOutcome::Start(applied)) => {
                                 let start = deps.supervisor.start(applied.tool, applied.config_path);
