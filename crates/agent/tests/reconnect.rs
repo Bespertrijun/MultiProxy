@@ -85,6 +85,7 @@ async fn agent_retries_after_a_dropped_connection() {
         supervisor: Supervisor::new(spawner),
         capacity: CapacityCollector::new(NicCounterSource, 1, Duration::from_secs(60)),
         backend: FixedBackendProbe::new(false),
+        backends: vec![],
         applied_gen: 0,
     };
 

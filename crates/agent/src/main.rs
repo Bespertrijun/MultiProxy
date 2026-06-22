@@ -11,6 +11,11 @@
 //!   --config-dir <DIR>      [env: AGENT_CONFIG_DIR]   [default: /etc/multiproxy]
 //!   --backend-host <HOST>   [env: AGENT_BACKEND_HOST] [default: 127.0.0.1]
 //!   --backend-port <PORT>   [env: AGENT_BACKEND_PORT] [default: 8096]
+//!
+//! `--backend-host/--backend-port` are only a **fallback** probe target used before
+//! the first `ConfigPush`. Once the panel pushes the node's rules, the agent probes
+//! the real rule backends (`ConfigPush.backends`) for health — so these flags no
+//! longer need to be set per node in normal operation.
 
 use std::time::Duration;
 
@@ -20,6 +25,7 @@ use agent::conn::{run_reconnect_loop, AgentConfig, Backoff, SessionDeps};
 use agent::selfheal::TcpBackendProbe;
 use agent::supervisor::{RealSpawner, Supervisor};
 use clap::Parser;
+use contract::protocol::BackendEndpoint;
 
 #[derive(Parser)]
 #[command(name = "agent", about = "multiProxy node agent")]
@@ -111,9 +117,14 @@ async fn main() {
         cfg.panel_url,
     );
 
-    // Backend reachability probe (task 3). If no backend host is configured yet,
-    // a probe pointed at an unconfigured address simply fails → reported down.
-    let backend = TcpBackendProbe::new(cli.backend_host, cli.backend_port, Duration::from_secs(3));
+    // Backend reachability probe (task 3). Targets come from the panel's
+    // `ConfigPush.backends` at runtime; the CLI host/port is only a fallback seed
+    // used before the first push (replaced as soon as the panel pushes the rules).
+    let backend = TcpBackendProbe::new(Duration::from_secs(3));
+    let backend_fallback = vec![BackendEndpoint {
+        host: cli.backend_host,
+        port: cli.backend_port,
+    }];
 
     // Capacity collector (task 3b): NIC-delta tier for M1 (forward-byte tier
     // wires gost/realm per-rule counters at M2). Window = 2 heartbeat intervals.
@@ -127,6 +138,7 @@ async fn main() {
         supervisor: Supervisor::new(RealSpawner),
         capacity,
         backend,
+        backends: backend_fallback,
         applied_gen: 0,
     };
 

@@ -172,6 +172,16 @@ pub enum AuthRejectReason {
     Other(String),
 }
 
+/// One forwarding backend (e.g. Emby) endpoint a node relays traffic to. Carried in
+/// [`ConfigPush::backends`] so the agent can probe the **real** backend for
+/// `StatusReport.backend_reachable` instead of a hardcoded/CLI address (the relay
+/// node is the only vantage point that can see the backend behind its NAT).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendEndpoint {
+    pub host: String,
+    pub port: u16,
+}
+
 /// Versioned full-config snapshot push (D2). Idempotent; agent echoes `desired_gen`
 /// back in [`ConfigAck`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -188,6 +198,11 @@ pub struct ConfigPush {
     /// Optional TLS private key (PEM) paired with `tls_cert_pem`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_key_pem: Option<String>,
+    /// Distinct backend endpoints this node's forwarding rules target. The agent
+    /// probes these for `StatusReport.backend_reachable`. Additive: older panels
+    /// omit it (defaults empty) and older agents ignore it (D1 forward-compat).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backends: Vec<BackendEndpoint>,
 }
 
 /// Server-initiated close notice.
@@ -263,6 +278,16 @@ mod tests {
             realm_config: None,
             tls_cert_pem: None,
             tls_key_pem: None,
+            backends: vec![
+                BackendEndpoint {
+                    host: "10.0.0.5".into(),
+                    port: 8096,
+                },
+                BackendEndpoint {
+                    host: "emby.example.com".into(),
+                    port: 443,
+                },
+            ],
         }));
         // ConfigPush with TLS cert fields populated.
         roundtrip(Message::ConfigPush(ConfigPush {
@@ -275,6 +300,7 @@ mod tests {
             tls_key_pem: Some(
                 "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----\n".into(),
             ),
+            backends: vec![],
         }));
         roundtrip(Message::Ping);
         roundtrip(Message::Close(Close {

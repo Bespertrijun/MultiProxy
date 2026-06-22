@@ -5,7 +5,9 @@
 //! compiled into the production binary.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use contract::protocol::BackendEndpoint;
 
 use crate::selfheal::BackendProbe;
 use crate::supervisor::{ChildProcess, ProcessSpawner, Tool};
@@ -112,7 +114,39 @@ impl FixedBackendProbe {
 }
 
 impl BackendProbe for FixedBackendProbe {
-    async fn reachable(&self) -> bool {
+    async fn reachable(&self, _targets: &[BackendEndpoint]) -> bool {
+        self.reachable.load(Ordering::SeqCst)
+    }
+}
+
+/// A backend probe that records the targets it was last asked about (so a test can
+/// assert the agent probes the endpoints from `ConfigPush.backends`, not a fixed
+/// address) and returns a fixed reachability answer.
+#[derive(Clone, Default)]
+pub struct RecordingBackendProbe {
+    reachable: Arc<AtomicBool>,
+    last_targets: Arc<Mutex<Vec<BackendEndpoint>>>,
+}
+
+impl RecordingBackendProbe {
+    #[must_use]
+    pub fn new(reachable: bool) -> Self {
+        Self {
+            reachable: Arc::new(AtomicBool::new(reachable)),
+            last_targets: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// The targets passed to the most recent `reachable` call.
+    #[must_use]
+    pub fn last_targets(&self) -> Vec<BackendEndpoint> {
+        self.last_targets.lock().unwrap().clone()
+    }
+}
+
+impl BackendProbe for RecordingBackendProbe {
+    async fn reachable(&self, targets: &[BackendEndpoint]) -> bool {
+        *self.last_targets.lock().unwrap() = targets.to_vec();
         self.reachable.load(Ordering::SeqCst)
     }
 }

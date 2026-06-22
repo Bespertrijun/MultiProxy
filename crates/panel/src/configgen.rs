@@ -12,12 +12,32 @@
 //! as `Some` only when relevant).
 
 use contract::model::{ForwardRule, Protocol, TlsMode, Tool};
+use contract::protocol::BackendEndpoint;
 
 /// Rendered configs for one node. Either side is `None` when that tool has no rules.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RenderedConfig {
     pub gost_config: Option<String>,
     pub realm_config: Option<String>,
+    /// Distinct backend endpoints across all of the node's rules (both tools),
+    /// sorted + deduped. Sent in `ConfigPush.backends` so the agent probes the real
+    /// backends for health (not a hardcoded address).
+    pub backends: Vec<BackendEndpoint>,
+}
+
+/// Collect the distinct `(host, port)` backends a node's rules target, sorted for
+/// deterministic output.
+fn collect_backends(rules: &[ForwardRule]) -> Vec<BackendEndpoint> {
+    let mut backends: Vec<BackendEndpoint> = rules
+        .iter()
+        .map(|r| BackendEndpoint {
+            host: r.backend_host.clone(),
+            port: r.backend_port,
+        })
+        .collect();
+    backends.sort_by(|a, b| (a.host.as_str(), a.port).cmp(&(b.host.as_str(), b.port)));
+    backends.dedup();
+    backends
 }
 
 /// Cert/key paths the agent writes the `ConfigPush` PEMs to, matching the agent's
@@ -71,6 +91,7 @@ pub fn render_node_with_tls(rules: &[ForwardRule], tls: Option<&TlsPaths>) -> Re
         } else {
             Some(render_realm(&realm_rules, tls))
         },
+        backends: collect_backends(rules),
     }
 }
 
@@ -245,6 +266,32 @@ mod tests {
     fn empty_rules_render_nothing() {
         let out = render_node(&[]);
         assert_eq!(out, RenderedConfig::default());
+        assert!(out.backends.is_empty());
+    }
+
+    #[test]
+    fn collects_distinct_backends_sorted_across_tools() {
+        // Duplicate backend across two rules/tools collapses to one; distinct
+        // host/port are kept and the output is sorted (deterministic).
+        let rules = vec![
+            rule("r1", 8080, Protocol::Tcp, "10.0.0.9", 8096, Tool::Gost),
+            rule("r2", 9000, Protocol::Tcp, "10.0.0.9", 8096, Tool::Realm), // dup backend
+            rule("r3", 7000, Protocol::Tcp, "10.0.0.5", 8920, Tool::Gost),
+        ];
+        let out = render_node(&rules);
+        assert_eq!(
+            out.backends,
+            vec![
+                BackendEndpoint {
+                    host: "10.0.0.5".into(),
+                    port: 8920
+                },
+                BackendEndpoint {
+                    host: "10.0.0.9".into(),
+                    port: 8096
+                },
+            ]
+        );
     }
 
     #[test]

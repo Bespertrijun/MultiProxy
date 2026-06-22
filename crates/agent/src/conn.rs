@@ -20,7 +20,8 @@
 use std::time::Duration;
 
 use contract::protocol::{
-    AuthRejectReason, Capacity, CloseReason, ConfigAck, Envelope, Heartbeat, Hello, Message,
+    AuthRejectReason, BackendEndpoint, Capacity, CloseReason, ConfigAck, Envelope, Heartbeat,
+    Hello, Message,
 };
 use contract::version::PROTOCOL_VERSION;
 use futures_util::{SinkExt, StreamExt};
@@ -183,6 +184,10 @@ where
     pub supervisor: Supervisor<S>,
     pub capacity: CapacityCollector<C>,
     pub backend: P,
+    /// Backend endpoints to probe, from the latest `ConfigPush.backends`. Empty
+    /// until the panel pushes the node's rules → probe reports backend-down (correct:
+    /// a node with no forwarding backend is not backend-up).
+    pub backends: Vec<BackendEndpoint>,
     /// Last applied config generation (0 before any push).
     pub applied_gen: u64,
 }
@@ -282,11 +287,14 @@ where
                     };
                 }
 
-                // StatusReport (incl. capacity telemetry).
+                // StatusReport (incl. capacity telemetry). Probe the REAL backends
+                // pushed by the panel (not a fixed address) for `backend_reachable`.
                 let capacity: Option<Capacity> = deps.capacity.sample();
+                let forwarding_up = deps.supervisor.forwarding_up();
+                let backend_reachable = deps.backend.reachable(&deps.backends).await;
                 let report = report::build(ReportInputs {
-                    forwarding_up: deps.supervisor.forwarding_up(),
-                    backend_reachable: deps.backend.reachable().await,
+                    forwarding_up,
+                    backend_reachable,
                     applied_config_gen: deps.applied_gen,
                     restart_count: deps.supervisor.restart_count(),
                     pid: deps.supervisor.pid(),
@@ -304,6 +312,18 @@ where
             msg = stream.next() => {
                 match decode_next(msg) {
                     DecodeResult::Message(Message::ConfigPush(push)) => {
+                        // Track the real backends so the next health probe targets them.
+                        // A new panel always sends a non-empty `backends` when there are
+                        // rules (empty config ⟺ no rules), so:
+                        //   * non-empty           → adopt the pushed backends;
+                        //   * empty + no config   → genuinely no rules → clear;
+                        //   * empty + has config  → a pre-this-version panel that can't
+                        //     send backends → keep the fallback seed (don't blank health).
+                        if !push.backends.is_empty() {
+                            deps.backends = push.backends.clone();
+                        } else if push.gost_config.is_none() && push.realm_config.is_none() {
+                            deps.backends.clear();
+                        }
                         let ack = match config::apply(&push, &cfg.config_paths) {
                             Ok(ApplyOutcome::Start(applied)) => {
                                 let start = deps.supervisor.start(applied.tool, applied.config_path);

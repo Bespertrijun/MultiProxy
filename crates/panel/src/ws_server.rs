@@ -238,6 +238,7 @@ async fn push_config(state: &AppState, node_id: &str) {
         realm_config: rendered.realm_config,
         tls_cert_pem: cert,
         tls_key_pem: key,
+        backends: rendered.backends,
     };
     let conns = state.conns.lock().await;
     if let Some(conn) = conns.get(node_id) {

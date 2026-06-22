@@ -13,9 +13,9 @@ use agent::capacity::CapacityCollector;
 use agent::config::ConfigPaths;
 use agent::conn::{run_session, AgentConfig, SessionDeps};
 use agent::supervisor::Supervisor;
-use agent::testutil::{DummySpawner, FixedBackendProbe, SteppingCounterSource};
+use agent::testutil::{DummySpawner, RecordingBackendProbe, SteppingCounterSource};
 
-use contract::protocol::{ConfigPush, Envelope, HelloOk, Message};
+use contract::protocol::{BackendEndpoint, ConfigPush, Envelope, HelloOk, Message};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -51,7 +51,8 @@ async fn start_mock_panel(
         )
         .await;
 
-        // 3. Push a gost config.
+        // 3. Push a gost config carrying the node's real backend endpoint(s) so the
+        //    agent probes those (not a hardcoded address) for backend reachability.
         send_msg(
             &mut ws,
             Message::ConfigPush(ConfigPush {
@@ -60,6 +61,10 @@ async fn start_mock_panel(
                 realm_config: None,
                 tls_cert_pem: None,
                 tls_key_pem: None,
+                backends: vec![BackendEndpoint {
+                    host: "10.9.9.9".into(),
+                    port: 8096,
+                }],
             }),
         )
         .await;
@@ -122,7 +127,7 @@ async fn agent_connects_applies_config_and_self_reports() {
     };
 
     let (spawner, control) = DummySpawner::new();
-    let backend = FixedBackendProbe::new(true);
+    let backend = RecordingBackendProbe::new(true);
     let mut deps = SessionDeps {
         supervisor: Supervisor::new(spawner),
         capacity: CapacityCollector::new(
@@ -131,6 +136,7 @@ async fn agent_connects_applies_config_and_self_reports() {
             Duration::from_secs(60),
         ),
         backend: backend.clone(),
+        backends: vec![],
         applied_gen: 0,
     };
 
@@ -195,6 +201,17 @@ async fn agent_connects_applies_config_and_self_reports() {
     assert!(
         report,
         "panel must have received a StatusReport with capacity"
+    );
+
+    // The agent probed the backend endpoint(s) carried in the ConfigPush — i.e. the
+    // real rule backend, not a hardcoded address (the bug this fix closes).
+    assert_eq!(
+        backend.last_targets(),
+        vec![BackendEndpoint {
+            host: "10.9.9.9".into(),
+            port: 8096,
+        }],
+        "agent must probe the backends from ConfigPush.backends"
     );
 
     // The config file was actually written to disk by the agent.

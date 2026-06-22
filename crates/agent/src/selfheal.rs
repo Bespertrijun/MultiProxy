@@ -12,36 +12,38 @@
 
 use std::time::Duration;
 
-/// Probes whether the configured Emby backend is reachable from this node.
+use contract::protocol::BackendEndpoint;
+
+/// Probes whether the node's forwarding backends are reachable from this node.
+///
+/// The endpoints are supplied per-call from the panel's `ConfigPush.backends`, so
+/// the probe always tracks the node's **real** forwarding rules — it is never tied
+/// to a hardcoded or install-time address.
 #[allow(async_fn_in_trait)]
 pub trait BackendProbe: Send + Sync {
-    /// `true` if the backend currently accepts a connection within the timeout.
-    async fn reachable(&self) -> bool;
+    /// `true` if the given backends are reachable. Policy: **every** endpoint must
+    /// accept a connection within the timeout; an empty list reports `false` (a node
+    /// with no forwarding backend is not backend-up).
+    async fn reachable(&self, targets: &[BackendEndpoint]) -> bool;
 }
 
-/// Real probe: a bounded TCP connect to `host:port`. A successful connect means
-/// the backend is reachable from the node's vantage point.
+/// Real probe: a bounded TCP connect to each `host:port`. A successful connect means
+/// the backend is reachable from the node's vantage point (the relay node is the only
+/// place that can see a backend behind its NAT).
 #[derive(Debug, Clone)]
 pub struct TcpBackendProbe {
-    pub host: String,
-    pub port: u16,
     pub timeout: Duration,
 }
 
 impl TcpBackendProbe {
     #[must_use]
-    pub fn new(host: impl Into<String>, port: u16, timeout: Duration) -> Self {
-        Self {
-            host: host.into(),
-            port,
-            timeout,
-        }
+    pub fn new(timeout: Duration) -> Self {
+        Self { timeout }
     }
-}
 
-impl BackendProbe for TcpBackendProbe {
-    async fn reachable(&self) -> bool {
-        let addr = format!("{}:{}", self.host, self.port);
+    /// Connect-test a single endpoint within the timeout.
+    async fn connects(&self, target: &BackendEndpoint) -> bool {
+        let addr = format!("{}:{}", target.host, target.port);
         matches!(
             tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr)).await,
             Ok(Ok(_))
@@ -49,13 +51,27 @@ impl BackendProbe for TcpBackendProbe {
     }
 }
 
-/// A probe with no backend configured yet (before the first ConfigPush). Reports
-/// unreachable so a node without forwarding config is never marked backend-up.
+impl BackendProbe for TcpBackendProbe {
+    async fn reachable(&self, targets: &[BackendEndpoint]) -> bool {
+        if targets.is_empty() {
+            return false;
+        }
+        for t in targets {
+            if !self.connects(t).await {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// A probe that always reports unreachable, regardless of targets. Equivalent to a
+/// [`TcpBackendProbe`] handed an empty target list; kept as an explicit double.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoBackendProbe;
 
 impl BackendProbe for NoBackendProbe {
-    async fn reachable(&self) -> bool {
+    async fn reachable(&self, _targets: &[BackendEndpoint]) -> bool {
         false
     }
 }
@@ -66,14 +82,28 @@ mod tests {
 
     struct FixedProbe(bool);
     impl BackendProbe for FixedProbe {
-        async fn reachable(&self) -> bool {
+        async fn reachable(&self, _targets: &[BackendEndpoint]) -> bool {
             self.0
+        }
+    }
+
+    fn ep(host: &str, port: u16) -> BackendEndpoint {
+        BackendEndpoint {
+            host: host.into(),
+            port,
         }
     }
 
     #[tokio::test]
     async fn no_backend_is_unreachable() {
-        assert!(!NoBackendProbe.reachable().await);
+        assert!(!NoBackendProbe.reachable(&[ep("127.0.0.1", 1)]).await);
+    }
+
+    #[tokio::test]
+    async fn empty_targets_report_unreachable() {
+        // A node with no forwarding backend (no rules yet) is not backend-up.
+        let probe = TcpBackendProbe::new(Duration::from_millis(300));
+        assert!(!probe.reachable(&[]).await);
     }
 
     #[tokio::test]
@@ -81,8 +111,8 @@ mod tests {
         // Bind an ephemeral listener and probe it → reachable.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let probe = TcpBackendProbe::new("127.0.0.1", addr.port(), Duration::from_secs(1));
-        assert!(probe.reachable().await);
+        let probe = TcpBackendProbe::new(Duration::from_secs(1));
+        assert!(probe.reachable(&[ep("127.0.0.1", addr.port())]).await);
     }
 
     #[tokio::test]
@@ -91,8 +121,24 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let probe = TcpBackendProbe::new("127.0.0.1", port, Duration::from_millis(300));
-        assert!(!probe.reachable().await);
+        let probe = TcpBackendProbe::new(Duration::from_millis(300));
+        assert!(!probe.reachable(&[ep("127.0.0.1", port)]).await);
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_requires_all_targets_reachable() {
+        // One live + one dead endpoint → not reachable (all-must-connect policy).
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let probe = TcpBackendProbe::new(Duration::from_millis(300));
+        assert!(
+            !probe
+                .reachable(&[ep("127.0.0.1", live_port), ep("127.0.0.1", dead_port)])
+                .await
+        );
     }
 
     #[tokio::test]
@@ -101,7 +147,7 @@ mod tests {
         // consumed via static dispatch (generic `P: BackendProbe`). Verify the
         // double works through a generic helper, matching real usage.
         async fn check<P: BackendProbe>(p: &P) -> bool {
-            p.reachable().await
+            p.reachable(&[]).await
         }
         assert!(check(&FixedProbe(true)).await);
         assert!(!check(&FixedProbe(false)).await);
