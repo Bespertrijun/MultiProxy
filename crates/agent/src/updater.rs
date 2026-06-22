@@ -126,37 +126,39 @@ pub async fn self_update(panel_url: &str) -> Result<bool, String> {
     restart();
 }
 
-/// Restart: if under systemd just exit (Restart=always); otherwise fork+exec.
+/// Restart into the freshly-written binary.
+///
+/// We replace the current process image **in place** with `execv` (same PID), which
+/// is correct under EVERY init system: systemd keeps the same MainPID/cgroup, OpenRC's
+/// `start-stop-daemon` pidfile stays valid, and bare/`nohup` setups keep running.
+///
+/// The previous implementation instead *exited* whenever it thought a supervisor would
+/// restart it, detecting that via `parent_id() == 1`. But a daemonized OpenRC agent is
+/// reparented to init (PID 1) too, so it was misread as systemd → the agent exited and
+/// OpenRC (which does NOT restart a backgrounded process that exits cleanly) left it
+/// dead. `execv` removes the guesswork entirely.
 fn restart() -> ! {
-    let under_systemd = std::env::var("INVOCATION_ID").is_ok();
-
     #[cfg(unix)]
-    let under_systemd = under_systemd || {
-        use std::os::unix::process::parent_id;
-        parent_id() == 1
-    };
-
-    if under_systemd {
-        eprintln!("self-update: running under systemd, exiting for restart");
-        std::process::exit(0);
-    }
-
-    match std::env::current_exe() {
-        Ok(exe) => {
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            // Filter out --self-update from the args for the respawned process.
-            let args: Vec<&String> = args.iter().filter(|a| *a != "--self-update").collect();
-            match std::process::Command::new(exe).args(args).spawn() {
-                Ok(_) => std::process::exit(0),
-                Err(e) => {
-                    eprintln!("self-update: respawn failed: {e}");
-                    std::process::exit(1);
-                }
+    {
+        use std::os::unix::process::CommandExt;
+        if let Ok(exe) = std::env::current_exe() {
+            // Re-exec with the same args, minus the one-shot --self-update flag.
+            let args: Vec<String> = std::env::args()
+                .skip(1)
+                .filter(|a| a != "--self-update")
+                .collect();
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(&args);
+            // `exec` only returns if it FAILED to replace the image.
+            let err = cmd.exec();
+            eprintln!("self-update: re-exec failed ({err}); trying spawn fallback");
+            // Fallback: spawn a fresh process so the agent keeps running even where a
+            // clean exit would NOT be restarted (e.g. OpenRC background daemons).
+            if cmd.spawn().is_ok() {
+                std::process::exit(0);
             }
-        }
-        Err(e) => {
-            eprintln!("self-update: cannot determine exe: {e}");
-            std::process::exit(1);
+            eprintln!("self-update: spawn fallback failed; exiting for supervisor restart");
         }
     }
+    std::process::exit(0);
 }
