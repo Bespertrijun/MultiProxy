@@ -1222,16 +1222,29 @@ function statusBadge(status) {
   }
 }
 
-function availabilityBadge(state) {
-  switch (state) {
-    case 'available':
-      return '<span class="inline-flex items-center gap-1.5 text-xs"><span class="w-2 h-2 rounded-full bg-emerald-400"></span><span class="text-emerald-400">正常</span></span>';
-    case 'soft_excluded':
-      return '<span class="inline-flex items-center gap-1.5 text-xs"><span class="w-2 h-2 rounded-full bg-amber-400"></span><span class="text-amber-400">软排除</span></span>';
-    case 'hard_excluded':
-      return '<span class="inline-flex items-center gap-1.5 text-xs"><span class="w-2 h-2 rounded-full bg-red-400"></span><span class="text-red-400">硬排除</span></span>';
-    default:
-      return '<span class="text-xs text-panel-400">' + esc(state) + '</span>';
+// Reason-driven health badge. `reason` is the backend HealthReason (snake_case): it
+// names WHY a node is in its state, so we never show a vague "硬排除". A health failure
+// (失联/转发/后端) reads as 「错误」; quota-over-limit is a deliberate policy exclusion,
+// NOT an error, so it reads as 「配额超限」.
+function availabilityBadge(reason) {
+  // Full literal class strings (so Tailwind always sees them).
+  var red = { dot: 'bg-red-400', txt: 'text-red-400' };
+  var amber = { dot: 'bg-amber-400', txt: 'text-amber-400' };
+  var green = { dot: 'bg-emerald-400', txt: 'text-emerald-400' };
+  var gray = { dot: 'bg-panel-400', txt: 'text-panel-400' };
+  function badge(c, text) {
+    return '<span class="inline-flex items-center gap-1.5 text-xs"><span class="w-2 h-2 rounded-full ' +
+      c.dot + '"></span><span class="' + c.txt + '">' + text + '</span></span>';
+  }
+  switch (reason) {
+    case 'ok': return badge(green, '正常');
+    case 'offline': return badge(red, '错误 · 失联');
+    case 'forwarding_down': return badge(red, '错误 · 转发未运行');
+    case 'backend_unreachable': return badge(red, '错误 · 后端不可达');
+    case 'quota_hard': return badge(red, '配额超限');
+    case 'quota_soft': return badge(amber, '配额预警');
+    case 'saturated': return badge(amber, '带宽饱和');
+    default: return badge(gray, esc(String(reason || '未知')));
   }
 }
 
@@ -1494,7 +1507,7 @@ function renderDashboard() {
           '<div class="text-xs text-panel-400 mt-0.5">' + esc(h.public_ip) + '</div>' +
         '</div>' +
         '<div class="flex items-center gap-2">' +
-          availabilityBadge(h.availability_state) +
+          availabilityBadge(h.reason) +
         '</div>' +
       '</div>' +
       '<div class="flex items-center gap-2 mb-3">' +

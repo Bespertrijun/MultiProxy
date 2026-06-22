@@ -189,22 +189,68 @@ pub fn debounce_saturation(
     }
 }
 
-/// Classify a single node into its [`ExclusionClass`] from health + capacity inputs
-/// (the two-tier taxonomy; Line-0 task 5). Order of precedence:
-/// unhealthy/hard-quota (hard) > soft-quota/saturated (soft) > included.
+/// The specific reason a node is in its current availability state (observability /
+/// UI). Finer-grained than [`ExclusionClass`]: it splits the "unhealthy" bucket into
+/// its sub-causes (offline / forwarding-down / backend-unreachable) so the panel can
+/// show *why* a node is excluded, not merely that it is. Serialized as snake_case for
+/// the health API (mapped to a human label in the frontend).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthReason {
+    /// Available — included in DNS answers.
+    Ok,
+    /// Control channel not fresh (agent disconnected or heartbeats stale).
+    Offline,
+    /// Connected but the agent reports its forwarding process is not running.
+    ForwardingDown,
+    /// Connected and forwarding up, but the agent cannot reach its backend.
+    BackendUnreachable,
+    /// Traffic usage at/over the hard-quota threshold (hard exclusion).
+    QuotaHard,
+    /// Traffic usage at/over the soft-quota threshold (soft exclusion).
+    QuotaSoft,
+    /// Bandwidth saturated (soft exclusion).
+    Saturated,
+}
+
+impl HealthReason {
+    /// The [`ExclusionClass`] this reason maps to (the snapshot's two-tier taxonomy).
+    #[must_use]
+    pub fn exclusion_class(self) -> ExclusionClass {
+        match self {
+            HealthReason::Ok => ExclusionClass::Included,
+            HealthReason::Offline
+            | HealthReason::ForwardingDown
+            | HealthReason::BackendUnreachable => ExclusionClass::Unhealthy,
+            HealthReason::QuotaHard => ExclusionClass::HardQuota,
+            HealthReason::QuotaSoft => ExclusionClass::SoftQuota,
+            HealthReason::Saturated => ExclusionClass::Saturated,
+        }
+    }
+}
+
+/// Diagnose a single node's [`HealthReason`] from health + capacity inputs. Order of
+/// precedence (highest first): offline > forwarding-down > backend-unreachable >
+/// hard-quota > soft-quota > saturated > ok. This is the single source of truth that
+/// [`classify_node`] derives its [`ExclusionClass`] from.
 #[must_use]
-pub fn classify_node(
+pub fn health_reason(
     node: &FrontNode,
     rt: &NodeRuntime,
     now_ms: u64,
     heartbeat_interval: u32,
-) -> ExclusionClass {
+) -> HealthReason {
     // Health: control-channel fresh AND agent reports forwarding+backend up.
     let window_ms = freshness_window_secs(heartbeat_interval) * 1000;
     let fresh = rt.connected && now_ms.saturating_sub(rt.last_contact_ms) <= window_ms;
-    let healthy = fresh && rt.forwarding_up && rt.backend_reachable;
-    if !healthy {
-        return ExclusionClass::Unhealthy;
+    if !fresh {
+        return HealthReason::Offline;
+    }
+    if !rt.forwarding_up {
+        return HealthReason::ForwardingDown;
+    }
+    if !rt.backend_reachable {
+        return HealthReason::BackendUnreachable;
     }
 
     // Quota: hard exclusion at hard%, soft exclusion at soft%.
@@ -218,20 +264,34 @@ pub fn classify_node(
             let hard_threshold = quota.saturating_mul(u64::from(pct_hard)) / 100;
             let soft_threshold = quota.saturating_mul(u64::from(pct_soft)) / 100;
             if used >= hard_threshold {
-                return ExclusionClass::HardQuota;
+                return HealthReason::QuotaHard;
             }
             if used >= soft_threshold {
-                return ExclusionClass::SoftQuota;
+                return HealthReason::QuotaSoft;
             }
         }
     }
 
     // Saturation (soft exclusion).
     if rt.saturation == SaturationState::Saturated {
-        return ExclusionClass::Saturated;
+        return HealthReason::Saturated;
     }
 
-    ExclusionClass::Included
+    HealthReason::Ok
+}
+
+/// Classify a single node into its [`ExclusionClass`] from health + capacity inputs
+/// (the two-tier taxonomy; Line-0 task 5). Order of precedence:
+/// unhealthy/hard-quota (hard) > soft-quota/saturated (soft) > included. Thin wrapper
+/// over [`health_reason`] so the policy lives in exactly one place.
+#[must_use]
+pub fn classify_node(
+    node: &FrontNode,
+    rt: &NodeRuntime,
+    now_ms: u64,
+    heartbeat_interval: u32,
+) -> ExclusionClass {
+    health_reason(node, rt, now_ms, heartbeat_interval).exclusion_class()
 }
 
 /// Map an [`ExclusionClass`] to the persisted [`AvailabilityState`] (observability).
@@ -546,6 +606,55 @@ mod tests {
         // now is way past the freshness window.
         let class = classify_node(&n, &rt, 1_000_000, 20);
         assert_eq!(class, ExclusionClass::Unhealthy);
+    }
+
+    #[test]
+    fn health_reason_splits_unhealthy_sub_causes() {
+        let n = node("n1", "1.2.3.4", None);
+
+        // Stale control channel → Offline (all map to Unhealthy).
+        let mut stale = healthy_rt(0);
+        stale.last_contact_ms = 0;
+        let r = health_reason(&n, &stale, 1_000_000, 20);
+        assert_eq!(r, HealthReason::Offline);
+        assert_eq!(r.exclusion_class(), ExclusionClass::Unhealthy);
+
+        // Fresh + connected, forwarding process down → ForwardingDown.
+        let mut fwd_down = healthy_rt(1000);
+        fwd_down.forwarding_up = false;
+        assert_eq!(
+            health_reason(&n, &fwd_down, 1000, 20),
+            HealthReason::ForwardingDown
+        );
+
+        // Fresh + forwarding up, but backend not reachable → BackendUnreachable
+        // (the bug class: node shows "online" yet is excluded).
+        let mut backend_down = healthy_rt(1000);
+        backend_down.backend_reachable = false;
+        assert_eq!(
+            health_reason(&n, &backend_down, 1000, 20),
+            HealthReason::BackendUnreachable
+        );
+
+        // Fully healthy → Ok.
+        assert_eq!(
+            health_reason(&n, &healthy_rt(1000), 1000, 20),
+            HealthReason::Ok
+        );
+    }
+
+    #[test]
+    fn health_reason_maps_quota_and_saturation() {
+        let n = node("n1", "1.2.3.4", Some(1000));
+        let mut hard = healthy_rt(1000);
+        hard.capacity.accumulated_usage_bytes = 1000; // 100% → hard
+        assert_eq!(health_reason(&n, &hard, 1000, 20), HealthReason::QuotaHard);
+        // Quota-over-limit is NOT an "error" — it is a deliberate policy exclusion.
+        assert!(hard.forwarding_up && hard.backend_reachable);
+
+        let mut sat = healthy_rt(1000);
+        sat.saturation = SaturationState::Saturated;
+        assert_eq!(health_reason(&n, &sat, 1000, 20), HealthReason::Saturated);
     }
 
     #[test]

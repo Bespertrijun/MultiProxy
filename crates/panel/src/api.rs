@@ -21,7 +21,7 @@ use crate::state::AppState;
 use crate::totp;
 use crate::updater;
 use crate::ws_server::{now_ms, push_config_to, rebuild_and_store_snapshot};
-use crate::{acme, cloudflare, db, ui, ws_server};
+use crate::{acme, cloudflare, db, scheduler, ui, ws_server};
 
 /// Default download URL for GeoCN.mmdb (ljxi/GeoCN latest release).
 const GEOCN_DEFAULT_URL: &str = "https://github.com/ljxi/GeoCN/releases/latest/download/GeoCN.mmdb";
@@ -962,12 +962,21 @@ struct NodeHealth {
     quota_used_ratio: Option<f64>,
     saturation_state: contract::model::SaturationState,
     availability_state: contract::model::AvailabilityState,
+    /// Agent-reported sub-health (raw inputs behind `availability_state`).
+    forwarding_up: bool,
+    backend_reachable: bool,
+    /// The specific reason behind the current availability (offline / forwarding-down /
+    /// backend-unreachable / quota / saturated / ok) — lets the UI show *why* a node is
+    /// excluded instead of a generic "excluded" label.
+    reason: scheduler::HealthReason,
 }
 
 async fn health_view(State(state): State<AppState>) -> Result<Json<Vec<NodeHealth>>> {
     let nodes = db::list_nodes(&state.db).await?;
     let conns = state.conns.lock().await;
     let rts = state.runtimes.lock().await;
+    let now = now_ms();
+    let hb = state.heartbeat_interval_secs;
     let out = nodes
         .into_iter()
         .map(|n| {
@@ -981,6 +990,12 @@ async fn health_view(State(state): State<AppState>) -> Result<Json<Vec<NodeHealt
                 .traffic_quota_bytes
                 .filter(|q| *q > 0)
                 .map(|q| used as f64 / q as f64);
+            // Diagnose the reason fresh from the live runtime so it reflects current
+            // freshness (the persisted availability_state only updates on reports).
+            let reason = match rt {
+                Some(rt) => scheduler::health_reason(&n, rt, now, hb),
+                None => scheduler::HealthReason::Offline,
+            };
             NodeHealth {
                 id: n.id,
                 name: n.name,
@@ -992,6 +1007,9 @@ async fn health_view(State(state): State<AppState>) -> Result<Json<Vec<NodeHealt
                 quota_used_ratio,
                 saturation_state: n.saturation_state,
                 availability_state: n.availability_state,
+                forwarding_up: rt.is_some_and(|r| r.forwarding_up),
+                backend_reachable: rt.is_some_and(|r| r.backend_reachable),
+                reason,
             }
         })
         .collect();
