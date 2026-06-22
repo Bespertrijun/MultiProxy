@@ -569,7 +569,8 @@ tailwind.config = {
                 更新面板
               </button>
               <button id="updateAgentBtn" onclick="doUpdateAgents()"
-                class="bg-amber-600 hover:bg-amber-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed hidden">
+                title="把最新 agent 二进制推送给所有在线节点（在线节点自更新并重启，离线节点重连后或重跑安装脚本时生效）"
+                class="bg-amber-600 hover:bg-amber-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
                 更新 Agent 二进制
               </button>
             </div>
@@ -2155,13 +2156,11 @@ async function doUpdateCheck() {
         document.getElementById('updateNotes').textContent = info.release_notes.slice(0, 500);
       }
       document.getElementById('updatePanelBtn').classList.remove('hidden');
-      document.getElementById('updateAgentBtn').classList.remove('hidden');
       toast('发现新版本: v' + info.latest_version, 'info');
     } else {
       document.getElementById('updateLatestRow').classList.add('hidden');
       document.getElementById('updateNotesRow').classList.add('hidden');
       document.getElementById('updatePanelBtn').classList.add('hidden');
-      document.getElementById('updateAgentBtn').classList.add('hidden');
       toast('已是最新版本', 'success');
     }
   } catch (e) {
