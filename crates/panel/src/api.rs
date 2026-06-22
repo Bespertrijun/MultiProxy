@@ -64,7 +64,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/nodes/{id}/token", post(regen_token))
         .route("/api/rules", get(list_rules).post(create_rule))
-        .route("/api/rules/{id}", axum::routing::delete(delete_rule))
+        .route(
+            "/api/rules/{id}",
+            axum::routing::delete(delete_rule).put(update_rule),
+        )
         .route("/api/line-groups", get(list_groups).post(create_group))
         .route(
             "/api/line-groups/{id}",
@@ -585,11 +588,28 @@ fn validate_backend_host(host: &str) -> Result<()> {
     }
     if !host
         .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
     {
         return Err(PanelError::BadRequest(
-            "backend_host contains invalid characters (allowed: alphanumeric . - :)".into(),
+            "backend_host contains invalid characters (allowed: alphanumeric . - : [ ])".into(),
         ));
+    }
+    // A ':' is only legal inside an IPv6 literal. Reject an IPv4/hostname with a stray
+    // colon or an embedded port (e.g. "1.2.3.4:" or "1.2.3.4:8096") — that would render
+    // a malformed `host:port` (".. ::..") the agent's TCP probe can't parse, so the node
+    // shows "backend unreachable" even though the relay forwards. Port goes in its own field.
+    if host.contains(':') {
+        let inner = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(PanelError::BadRequest(
+                "backend_host 含非法的 ':' —— 这里只填主机(IPv4/域名)，端口请填到端口字段；\
+                 IPv6 须为合法地址"
+                    .into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -612,6 +632,33 @@ async fn create_rule(
     };
     db::upsert_rule(&state.db, &rule).await?;
     // Bump desired config gen (D2) and push to the connected agent (Q6).
+    db::bump_desired_gen(&state.db, &req.node_id).await?;
+    push_config_to(&state, &req.node_id).await;
+    state.notify_change();
+    Ok(Json(rule))
+}
+
+/// Edit an existing rule in place (same id). `upsert_rule` replaces the row, so this
+/// is the create path with a caller-supplied id — avoids the delete+recreate dance.
+async fn update_rule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateRuleReq>,
+) -> Result<Json<ForwardRule>> {
+    db::get_node(&state.db, &req.node_id).await?; // FK check
+    validate_backend_host(&req.backend_host)?;
+    let rule = ForwardRule {
+        id,
+        node_id: req.node_id.clone(),
+        listen_port: req.listen_port,
+        protocol: req.protocol,
+        backend_host: req.backend_host,
+        backend_port: req.backend_port,
+        tool: req.tool,
+        tls_mode: req.tls_mode,
+    };
+    db::upsert_rule(&state.db, &rule).await?;
+    // Bump desired config gen (D2) and re-push so the agent applies the edit.
     db::bump_desired_gen(&state.db, &req.node_id).await?;
     push_config_to(&state, &req.node_id).await;
     state.notify_change();
@@ -1752,4 +1799,45 @@ async fn dl_agent_binary(State(state): State<AppState>, Path(filename): Path<Str
 
 async fn index() -> Html<&'static str> {
     Html(ui::INDEX_HTML)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_backend_host;
+
+    #[test]
+    fn backend_host_accepts_clean_hosts() {
+        for h in [
+            "84.54.2.144",
+            "emby.example.com",
+            "10.0.0.5",
+            "::1",
+            "2001:db8::1",
+        ] {
+            assert!(validate_backend_host(h).is_ok(), "should accept {h}");
+        }
+        // Bracketed IPv6 is fine too.
+        assert!(validate_backend_host("[2001:db8::1]").is_ok());
+    }
+
+    #[test]
+    fn backend_host_rejects_stray_colon_or_embedded_port() {
+        // These are the malformed values that rendered "1.2.3.4::port" and made the
+        // agent's TCP probe report a false "backend unreachable".
+        for h in [
+            "84.54.2.144:",
+            "84.54.2.144:8096",
+            "emby.example.com:8096",
+            ":8096",
+        ] {
+            assert!(validate_backend_host(h).is_err(), "should reject {h}");
+        }
+    }
+
+    #[test]
+    fn backend_host_rejects_empty_and_unsafe_chars() {
+        assert!(validate_backend_host("").is_err());
+        assert!(validate_backend_host("bad host").is_err());
+        assert!(validate_backend_host("a\"b").is_err());
+    }
 }
