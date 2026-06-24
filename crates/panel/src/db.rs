@@ -63,14 +63,15 @@ CREATE TABLE IF NOT EXISTS agent (
 );
 
 CREATE TABLE IF NOT EXISTS forward_rule (
-    id            TEXT PRIMARY KEY,
-    node_id       TEXT NOT NULL,
-    listen_port   INTEGER NOT NULL,
-    protocol      TEXT NOT NULL,
-    backend_host  TEXT NOT NULL,
-    backend_port  INTEGER NOT NULL,
-    tool          TEXT NOT NULL,
-    tls_mode      TEXT NOT NULL DEFAULT 'passthrough'
+    id             TEXT PRIMARY KEY,
+    node_id        TEXT NOT NULL,
+    listen_port    INTEGER NOT NULL,
+    protocol       TEXT NOT NULL,
+    backend_host   TEXT NOT NULL,
+    backend_port   INTEGER NOT NULL,
+    tool           TEXT NOT NULL,
+    tls_mode       TEXT NOT NULL DEFAULT 'passthrough',
+    extra_backends TEXT
 );
 
 CREATE TABLE IF NOT EXISTS line_group (
@@ -159,6 +160,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE line_group ADD COLUMN active_window TEXT",
         "ALTER TABLE panel_user ADD COLUMN totp_secret TEXT",
         "ALTER TABLE panel_user ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE forward_rule ADD COLUMN extra_backends TEXT",
     ];
     for stmt in alter_stmts {
         let _ = sqlx::query(stmt).execute(pool).await;
@@ -765,13 +767,15 @@ pub async fn set_agent_token_hash(pool: &SqlitePool, node_id: &str, hash: &str) 
 /// # Errors
 /// Returns [`PanelError::Db`] on failure.
 pub async fn upsert_rule(pool: &SqlitePool, r: &ForwardRule) -> Result<()> {
+    let extra_backends_json =
+        serde_json::to_string(&r.extra_backends).unwrap_or_else(|_| "[]".into());
     sqlx::query(
-        "INSERT INTO forward_rule(id, node_id, listen_port, protocol, backend_host, backend_port, tool, tls_mode)
-         VALUES(?,?,?,?,?,?,?,?)
+        "INSERT INTO forward_rule(id, node_id, listen_port, protocol, backend_host, backend_port, tool, tls_mode, extra_backends)
+         VALUES(?,?,?,?,?,?,?,?,?)
          ON CONFLICT(id) DO UPDATE SET
             node_id=excluded.node_id, listen_port=excluded.listen_port, protocol=excluded.protocol,
             backend_host=excluded.backend_host, backend_port=excluded.backend_port, tool=excluded.tool,
-            tls_mode=excluded.tls_mode",
+            tls_mode=excluded.tls_mode, extra_backends=excluded.extra_backends",
     )
     .bind(&r.id)
     .bind(&r.node_id)
@@ -781,21 +785,41 @@ pub async fn upsert_rule(pool: &SqlitePool, r: &ForwardRule) -> Result<()> {
     .bind(i64::from(r.backend_port))
     .bind(tool_str(r.tool))
     .bind(tls_mode_str(r.tls_mode))
+    .bind(extra_backends_json)
     .execute(pool)
     .await?;
     Ok(())
 }
 
 fn row_to_rule(row: &sqlx::sqlite::SqliteRow) -> ForwardRule {
+    use sqlx::Row as _;
+    // try_get is NULL-safe / forward-compatible: after migration old rows have
+    // extra_backends = NULL; both old and new binaries can read them without error.
+    let extra_backends: Vec<contract::protocol::BackendEndpoint> = row
+        .try_get::<Option<String>, _>("extra_backends")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
     ForwardRule {
-        id: row.get("id"),
-        node_id: row.get("node_id"),
-        listen_port: row.get::<i64, _>("listen_port") as u16,
-        protocol: proto_from(&row.get::<String, _>("protocol")),
-        backend_host: row.get("backend_host"),
-        backend_port: row.get::<i64, _>("backend_port") as u16,
-        tool: tool_from(&row.get::<String, _>("tool")),
-        tls_mode: tls_mode_from(&row.get::<String, _>("tls_mode")),
+        id: row.try_get("id").unwrap_or_default(),
+        node_id: row.try_get("node_id").unwrap_or_default(),
+        listen_port: row.try_get::<i64, _>("listen_port").unwrap_or(0) as u16,
+        protocol: proto_from(
+            &row.try_get::<String, _>("protocol")
+                .unwrap_or_else(|_| "tcp".into()),
+        ),
+        backend_host: row.try_get("backend_host").unwrap_or_default(),
+        backend_port: row.try_get::<i64, _>("backend_port").unwrap_or(0) as u16,
+        tool: tool_from(
+            &row.try_get::<String, _>("tool")
+                .unwrap_or_else(|_| "gost".into()),
+        ),
+        tls_mode: tls_mode_from(
+            &row.try_get::<String, _>("tls_mode")
+                .unwrap_or_else(|_| "passthrough".into()),
+        ),
+        extra_backends,
     }
 }
 
@@ -1296,5 +1320,111 @@ mod tests {
         assert_eq!(cf.cf_token, "secret-tok");
         assert_eq!(cf.cf_zone_id, "z1");
         assert_eq!(cf.cf_domain, "example.com");
+    }
+
+    /// Pre-existing rows that lack extra_backends (NULL after ALTER TABLE migration)
+    /// must be readable via try_get without error, yielding an empty Vec.
+    #[tokio::test]
+    async fn migration_old_rule_row_reads_extra_backends_as_empty() {
+        use sqlx::Pool;
+        use sqlx::Sqlite;
+
+        // Create a pool and apply only the 8-column schema (pre-migration state).
+        let pool: Pool<Sqlite> = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str("sqlite::memory:")
+                    .unwrap()
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+
+        // 8-column DDL without extra_backends.
+        sqlx::query(
+            "CREATE TABLE forward_rule (
+                id           TEXT PRIMARY KEY,
+                node_id      TEXT NOT NULL,
+                listen_port  INTEGER NOT NULL,
+                protocol     TEXT NOT NULL,
+                backend_host TEXT NOT NULL,
+                backend_port INTEGER NOT NULL,
+                tool         TEXT NOT NULL,
+                tls_mode     TEXT NOT NULL DEFAULT 'passthrough'
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Insert a legacy row without extra_backends.
+        sqlx::query(
+            "INSERT INTO forward_rule(id, node_id, listen_port, protocol, backend_host, backend_port, tool, tls_mode)
+             VALUES('r-old','n1',8080,'tcp','10.0.0.1',8096,'gost','passthrough')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Run ALTER TABLE migration to add the column (as migrate() does).
+        let _ = sqlx::query("ALTER TABLE forward_rule ADD COLUMN extra_backends TEXT")
+            .execute(&pool)
+            .await;
+
+        // row_to_rule must read the old row without panic; extra_backends = NULL → [].
+        let rows = sqlx::query("SELECT * FROM forward_rule")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let rule = row_to_rule(&rows[0]);
+        assert_eq!(rule.id, "r-old");
+        assert_eq!(rule.listen_port, 8080);
+        assert!(
+            rule.extra_backends.is_empty(),
+            "legacy NULL extra_backends must yield empty Vec"
+        );
+    }
+
+    /// upsert_rule with extra_backends round-trips through the DB.
+    #[tokio::test]
+    async fn upsert_rule_with_extra_backends_round_trips() {
+        use contract::protocol::BackendEndpoint;
+
+        let pool = mem().await;
+
+        // Upsert a rule with extra_backends populated.
+        let extra = vec![
+            BackendEndpoint {
+                host: "10.0.0.2".into(),
+                port: 8096,
+            },
+            BackendEndpoint {
+                host: "10.0.0.3".into(),
+                port: 8097,
+            },
+        ];
+        let rule = ForwardRule {
+            id: "r-extra".into(),
+            node_id: "n1".into(),
+            listen_port: 9000,
+            protocol: Protocol::Tcp,
+            backend_host: "10.0.0.1".into(),
+            backend_port: 8096,
+            tool: Tool::Gost,
+            tls_mode: TlsMode::Passthrough,
+            extra_backends: extra.clone(),
+        };
+        upsert_rule(&pool, &rule).await.unwrap();
+
+        // Read back and verify extra_backends matches.
+        let rows = sqlx::query("SELECT * FROM forward_rule WHERE id = 'r-extra'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let got = row_to_rule(&rows[0]);
+        assert_eq!(got.extra_backends, extra);
+        assert_eq!(got, rule);
     }
 }

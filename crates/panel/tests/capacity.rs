@@ -112,6 +112,8 @@ async fn status(applied_gen: u64, capacity: Option<Capacity>) -> Message {
         applied_config_gen: applied_gen,
         metrics: None,
         capacity,
+        backend_health: None,
+        active_backends: None,
     })
 }
 

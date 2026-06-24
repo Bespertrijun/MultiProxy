@@ -16,6 +16,7 @@ path = "src/lib.rs"
 [dependencies]
 contract = { workspace = true }
 geoip = { workspace = true }
+relaycfg = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

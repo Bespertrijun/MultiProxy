@@ -1,0 +1,11 @@
+[package]
+name = "relaycfg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared rendering logic: ForwardRule[] → gost/realm config strings (musl-thin, no heavy deps)."
+
+[dependencies]
+contract = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

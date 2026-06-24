@@ -15,8 +15,8 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::Response;
 use contract::protocol::{
-    AuthReject, AuthRejectReason, Close, CloseReason, ConfigPush, Envelope, HelloOk, Message,
-    StatusReport, T_ACK_SECS,
+    AuthReject, AuthRejectReason, BackendEndpoint, Close, CloseReason, ConfigPush, Envelope,
+    HelloOk, Message, RuleSpec, StatusReport, T_ACK_SECS,
 };
 use contract::version::is_accepted;
 use tokio::sync::mpsc;
@@ -154,6 +154,11 @@ async fn handshake(
         Message::HelloOk(HelloOk {
             session: session.clone(),
             heartbeat_interval_secs: state.heartbeat_interval_secs,
+            probe_interval_secs: state.failover_params.probe_interval_secs,
+            probe_timeout_ms: state.failover_params.probe_timeout_ms,
+            failover_max_fails: state.failover_params.max_fails,
+            failover_recovery_checks: state.failover_params.recovery_checks,
+            min_dwell_secs: state.failover_params.min_dwell_secs,
         }),
     ));
     Some(hello.node_id)
@@ -228,10 +233,34 @@ async fn push_config(state: &AppState, node_id: &str) {
     } else {
         None
     };
+    // Legacy render: gost/realm config + flat backends from the *primary* upstream of
+    // each rule (relaycfg renders `[main]`). This is the byte-for-byte pre-Phase-4 push.
     let rendered = configgen::render_node_with_tls(&rules, tls.as_ref());
     let Ok(node) = db::get_node(&state.db, node_id).await else {
         return;
     };
+
+    // Version split (decision ③A, must-fix #4). The kill-switch (must-fix #2) sits at
+    // the OUTERMOST layer: when engaged, EVERY agent — regardless of version — gets only
+    // the legacy single-upstream render and NO structured `rules` (== pre-Phase-4).
+    // Otherwise: a NEW agent (>= v0.10.0) additionally receives structured `rules` (a
+    // full per-rule replica list) so it can run local failover; an OLD agent gets the
+    // legacy render only. The version is read FRESH from the DB (the value just written
+    // at handshake), never a cached copy.
+    let rules_field = if state.killswitch_on() {
+        vec![]
+    } else {
+        let version = db::get_agent(&state.db, node_id)
+            .await
+            .map(|a| a.agent_version)
+            .unwrap_or_default();
+        if agent_is_new(&version) {
+            build_rule_specs(&rules)
+        } else {
+            vec![]
+        }
+    };
+
     let push = ConfigPush {
         desired_gen: node.desired_config_gen,
         gost_config: rendered.gost_config,
@@ -239,6 +268,7 @@ async fn push_config(state: &AppState, node_id: &str) {
         tls_cert_pem: cert,
         tls_key_pem: key,
         backends: rendered.backends,
+        rules: rules_field,
     };
     let conns = state.conns.lock().await;
     if let Some(conn) = conns.get(node_id) {
@@ -246,6 +276,41 @@ async fn push_config(state: &AppState, node_id: &str) {
             .tx
             .send(Envelope::new(new_token(), Message::ConfigPush(push)));
     }
+}
+
+/// Whether an agent at `version` is a "new" (Phase-4-failover-capable) agent: version
+/// `>= v0.10.0`. Reuses [`updater::version_newer`] (strict `>`) instead of pulling in a
+/// semver crate. `!version_newer("0.10.0", v)` is true when `v == 0.10.0` (equal) or
+/// `v > 0.10.0`, and false when `v < 0.10.0`. Unparseable/empty versions parse to
+/// `0.0.0` → treated as OLD (fail-safe: when in doubt, do not enable failover).
+fn agent_is_new(version: &str) -> bool {
+    let v = version.trim().trim_start_matches('v');
+    !crate::updater::version_newer("0.10.0", v)
+}
+
+/// Build the structured per-rule specs carried in `ConfigPush.rules` for a new agent.
+/// Each rule's backend list is `[main, ...extra_backends]` (primary first), matching the
+/// `ForwardRule.backend_host/backend_port` then `ForwardRule.extra_backends` order.
+fn build_rule_specs(rules: &[contract::model::ForwardRule]) -> Vec<RuleSpec> {
+    rules
+        .iter()
+        .map(|r| {
+            let mut backends = Vec::with_capacity(1 + r.extra_backends.len());
+            backends.push(BackendEndpoint {
+                host: r.backend_host.clone(),
+                port: r.backend_port,
+            });
+            backends.extend(r.extra_backends.iter().cloned());
+            RuleSpec {
+                rule_id: r.id.clone(),
+                listen_port: r.listen_port,
+                protocol: r.protocol,
+                tls_mode: r.tls_mode,
+                tool: r.tool,
+                backends,
+            }
+        })
+        .collect()
 }
 
 /// The DNS zone apex domains a node serves: line groups that list it as a member →
@@ -524,8 +589,9 @@ async fn writer_task(
 
 #[cfg(test)]
 mod tests {
-    use super::domains_for_node_in;
-    use contract::model::{DnsZone, LineGroup};
+    use super::{agent_is_new, build_rule_specs, domains_for_node_in};
+    use contract::model::{DnsZone, ForwardRule, LineGroup, Protocol, TlsMode, Tool};
+    use contract::protocol::BackendEndpoint;
 
     fn zone(id: &str, apex: &str) -> DnsZone {
         DnsZone {
@@ -573,5 +639,70 @@ mod tests {
         );
         // unknown node → none.
         assert!(domains_for_node_in(&groups, &zones, "node-x").is_empty());
+    }
+
+    #[test]
+    fn version_split_routes_six_values() {
+        // OLD (legacy-only push, no rules): empty/junk parse to 0.0.0; < 0.10.0.
+        assert!(!agent_is_new(""), "empty → old (fail-safe)");
+        assert!(!agent_is_new("junk"), "unparseable → old (fail-safe)");
+        assert!(!agent_is_new("0.9.6"), "0.9.6 < 0.10.0 → old");
+        // NEW (structured rules): boundary 0.10.0 is inclusive (>=), and anything above.
+        assert!(
+            agent_is_new("0.10.0"),
+            "0.10.0 == threshold → new (boundary)"
+        );
+        assert!(agent_is_new("0.11.0"), "0.11.0 > 0.10.0 → new");
+        assert!(agent_is_new("1.0.0"), "1.0.0 > 0.10.0 → new");
+        // A leading `v` must not flip the classification.
+        assert!(agent_is_new("v0.10.0"), "v-prefixed boundary → new");
+        assert!(!agent_is_new("v0.9.6"), "v-prefixed old → old");
+    }
+
+    #[test]
+    fn rule_specs_order_main_then_extras() {
+        let rule = ForwardRule {
+            id: "r1".into(),
+            node_id: "n1".into(),
+            listen_port: 8443,
+            protocol: Protocol::Tcp,
+            backend_host: "10.0.0.5".into(),
+            backend_port: 8096,
+            tool: Tool::Gost,
+            tls_mode: TlsMode::Passthrough,
+            extra_backends: vec![
+                BackendEndpoint {
+                    host: "10.0.0.6".into(),
+                    port: 8096,
+                },
+                BackendEndpoint {
+                    host: "10.0.0.7".into(),
+                    port: 8096,
+                },
+            ],
+        };
+        let specs = build_rule_specs(std::slice::from_ref(&rule));
+        assert_eq!(specs.len(), 1);
+        let s = &specs[0];
+        assert_eq!(s.rule_id, "r1");
+        assert_eq!(s.listen_port, 8443);
+        // Primary backend first, extras in order after it.
+        assert_eq!(
+            s.backends,
+            vec![
+                BackendEndpoint {
+                    host: "10.0.0.5".into(),
+                    port: 8096
+                },
+                BackendEndpoint {
+                    host: "10.0.0.6".into(),
+                    port: 8096
+                },
+                BackendEndpoint {
+                    host: "10.0.0.7".into(),
+                    port: 8096
+                },
+            ]
+        );
     }
 }

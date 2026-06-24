@@ -20,8 +20,8 @@
 use std::time::Duration;
 
 use contract::protocol::{
-    AuthRejectReason, BackendEndpoint, Capacity, CloseReason, ConfigAck, Envelope, Heartbeat,
-    Hello, Message,
+    AuthRejectReason, BackendEndpoint, Capacity, CloseReason, ConfigAck, ConfigPush, Envelope,
+    Heartbeat, Hello, Message,
 };
 use contract::version::PROTOCOL_VERSION;
 use futures_util::{SinkExt, StreamExt};
@@ -30,6 +30,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::capacity::{CapacityCollector, CounterSource};
 use crate::config::{self, ApplyOutcome, ConfigPaths};
+use crate::failover::{FailoverEngine, FailoverTunables};
 use crate::report::{self, ReportInputs};
 use crate::selfheal::BackendProbe;
 use crate::supervisor::{ProcessSpawner, Supervisor};
@@ -197,6 +198,46 @@ fn encode(env: &Envelope) -> WsMessage {
     WsMessage::Text(serde_json::to_string(env).unwrap_or_default().into())
 }
 
+/// Apply a failover switch decision: write the re-rendered single-upstream config
+/// to disk and restart the supervised tool **once**.
+///
+/// P6 invariant: this NEVER mutates `deps.applied_gen` and NEVER sends a
+/// `ConfigAck` — a local active-backend switch is not a new config generation. We
+/// reuse [`config::apply`] only for its write-file + tool-selection logic by
+/// handing it a synthetic push tagged with the *current* applied gen (so even if
+/// some future code path read the returned gen it would be a no-op change).
+fn apply_failover_switch<S, C, P>(
+    decision: &crate::failover::FailoverDecision,
+    deps: &mut SessionDeps<S, C, P>,
+    paths: &ConfigPaths,
+) where
+    S: ProcessSpawner,
+    C: CounterSource,
+    P: BackendProbe,
+{
+    let synthetic = ConfigPush {
+        desired_gen: deps.applied_gen,
+        gost_config: decision.gost_config.clone(),
+        realm_config: decision.realm_config.clone(),
+        tls_cert_pem: None,
+        tls_key_pem: None,
+        backends: Vec::new(),
+        rules: Vec::new(),
+    };
+    match config::apply(&synthetic, paths) {
+        Ok(ApplyOutcome::Start(applied)) => {
+            if let Err(e) = deps.supervisor.start(applied.tool, applied.config_path) {
+                eprintln!("failover: restart after backend switch failed: {e}");
+            } else {
+                eprintln!("failover: active backend changed → re-rendered + restarted relay");
+            }
+            // P6: deliberately DO NOT touch deps.applied_gen here.
+        }
+        Ok(ApplyOutcome::NoTool { .. }) => { /* nothing to start */ }
+        Err(e) => eprintln!("failover: writing re-rendered config failed: {e}"),
+    }
+}
+
 /// Run one connected session until it ends. The handshake (`Hello` → wait for
 /// `HelloOk`/`AuthReject`) happens here, then the heartbeat/report/config loop.
 ///
@@ -223,6 +264,10 @@ where
 
     let mut heartbeat_interval =
         Duration::from_secs(contract::protocol::DEFAULT_HEARTBEAT_INTERVAL_SECS as u64);
+    // The HelloOk that ends the handshake; carries the failover tunables (Phase 3
+    // fields, serde-defaulted for older panels). HelloOk is the only non-`return`
+    // way out of the loop, so it is always `Some` after the loop.
+    let hello_ok;
 
     // Wait for HelloOk / AuthReject (or a transport failure).
     loop {
@@ -238,6 +283,7 @@ where
                             heartbeat_interval =
                                 Duration::from_secs(ok.heartbeat_interval_secs as u64);
                         }
+                        hello_ok = ok;
                         break;
                     }
                     DecodeResult::Message(Message::AuthReject(rej)) => {
@@ -262,10 +308,27 @@ where
         }
     }
 
+    let tunables = FailoverTunables::from_hello_ok(&hello_ok);
+
     // ---- session loop ----
     let mut tick = tokio::time::interval(heartbeat_interval);
     // Fire (almost) immediately so the first report doesn't wait a full interval.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Independent probe/failover cadence (decoupled from the heartbeat). The
+    // failover engine drives active-backend selection per `probe_interval_secs`;
+    // the heartbeat arm merely *reports* the latest state on its slower cadence.
+    let mut probe_tick = tokio::time::interval(tunables.probe_interval);
+    probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // Per-session failover engine, built from the agent's config dir (for TLS
+    // paths). Empty until a ConfigPush carries structured `rules`; while empty the
+    // agent stays on the legacy single-upstream path (no failover, no regression).
+    let mut failover = FailoverEngine::new(&cfg.config_paths);
+    // Latest per-replica probe results (refreshed by the probe arm), reported on
+    // the heartbeat cadence so it lags by ≤ one heartbeat — decoupled from the
+    // faster failover decision cadence.
+    let mut last_health: Option<Vec<contract::protocol::BackendHealth>> = None;
 
     loop {
         tokio::select! {
@@ -291,7 +354,19 @@ where
                 // pushed by the panel (not a fixed address) for `backend_reachable`.
                 let capacity: Option<Capacity> = deps.capacity.sample();
                 let forwarding_up = deps.supervisor.forwarding_up();
-                let backend_reachable = deps.backend.reachable(&deps.backends).await;
+                // With structured rules: backend_reachable = every rule has a healthy
+                // replica (all-rules-have-a-healthy-replica), and we attach the latest
+                // per-replica health + the current active backend per rule. Without
+                // rules: the legacy any-up probe, health fields omitted (no regression).
+                let (backend_reachable, backend_health, active_backends) = if failover.is_active() {
+                    (
+                        failover.all_rules_have_healthy_replica(),
+                        last_health.clone(),
+                        Some(failover.active_backends()),
+                    )
+                } else {
+                    (deps.backend.reachable(&deps.backends).await, None, None)
+                };
                 let report = report::build(ReportInputs {
                     forwarding_up,
                     backend_reachable,
@@ -299,6 +374,8 @@ where
                     restart_count: deps.supervisor.restart_count(),
                     pid: deps.supervisor.pid(),
                     capacity,
+                    backend_health,
+                    active_backends,
                 });
                 let env = Envelope::new(new_msg_id(), Message::StatusReport(report));
                 if stream.send(encode(&env)).await.is_err() {
@@ -309,17 +386,49 @@ where
                 }
             }
 
+            // Independent failover cadence: probe every replica of every rule and
+            // let the engine pick each rule's active backend. Only runs once the
+            // panel has pushed structured rules; otherwise it is a cheap no-op so
+            // the legacy single-upstream path is unaffected.
+            _ = probe_tick.tick() => {
+                if failover.is_active() {
+                    let (decision, health) =
+                        failover.probe_and_decide(&deps.backend, &tunables).await;
+                    last_health = Some(health);
+
+                    // Only an ACTUAL active-backend change triggers a re-render +
+                    // a SINGLE restart (all rule changes this cycle are batched).
+                    // OQ-8: an all-dead rule keeps last-known → no change → no
+                    // restart → never a crash-loop. P6: a local switch NEVER touches
+                    // applied_gen and NEVER emits a ConfigAck — the new active is
+                    // surfaced only via the next StatusReport.active_backends.
+                    if decision.changed {
+                        apply_failover_switch(&decision, deps, &cfg.config_paths);
+                    }
+                }
+            }
+
             msg = stream.next() => {
                 match decode_next(msg) {
                     DecodeResult::Message(Message::ConfigPush(push)) => {
-                        // Track the real backends so the next health probe targets them.
-                        // A new panel always sends a non-empty `backends` when there are
-                        // rules (empty config ⟺ no rules), so:
-                        //   * non-empty           → adopt the pushed backends;
-                        //   * empty + no config   → genuinely no rules → clear;
-                        //   * empty + has config  → a pre-this-version panel that can't
-                        //     send backends → keep the fallback seed (don't blank health).
-                        if !push.backends.is_empty() {
+                        // Adopt structured rules (Phase 4a). When present, the failover
+                        // engine owns the per-rule active-backend selection and we probe
+                        // the rules' replicas; flat `deps.backends` is backfilled from
+                        // the union of all rule backends so the legacy any-up path (and
+                        // older panels reading `backend_reachable`) does not regress.
+                        // When absent (older panel / no rules), the engine stays empty
+                        // and we keep today's flat-backend behavior verbatim.
+                        if !push.rules.is_empty() {
+                            failover.set_rules(&push.rules);
+                            deps.backends = failover.flat_backends();
+                        } else if !push.backends.is_empty() {
+                            // Track the real backends so the next health probe targets them.
+                            // A new panel always sends a non-empty `backends` when there are
+                            // rules (empty config ⟺ no rules), so:
+                            //   * non-empty           → adopt the pushed backends;
+                            //   * empty + no config   → genuinely no rules → clear;
+                            //   * empty + has config  → a pre-this-version panel that can't
+                            //     send backends → keep the fallback seed (don't blank health).
                             deps.backends = push.backends.clone();
                         } else if push.gost_config.is_none() && push.realm_config.is_none() {
                             deps.backends.clear();

@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use contract::protocol::BackendEndpoint;
+use contract::protocol::{BackendEndpoint, BackendHealth};
 
 /// Probes whether the node's forwarding backends are reachable from this node.
 ///
@@ -21,10 +21,41 @@ use contract::protocol::BackendEndpoint;
 /// to a hardcoded or install-time address.
 #[allow(async_fn_in_trait)]
 pub trait BackendProbe: Send + Sync {
-    /// `true` if the given backends are reachable. Policy: **every** endpoint must
-    /// accept a connection within the timeout; an empty list reports `false` (a node
-    /// with no forwarding backend is not backend-up).
-    async fn reachable(&self, targets: &[BackendEndpoint]) -> bool;
+    /// `true` if the node is backend-up. Policy: **any-up** — at least one endpoint
+    /// must accept a connection within the timeout; an empty list reports `false` (a
+    /// node with no forwarding backend is not backend-up). A node with multiple
+    /// backends (e.g. replicas, or several rules) must NOT be marked down just because
+    /// one backend is unreachable — that would blackhole the whole node IP from DNS
+    /// and take its healthy backends down with it.
+    ///
+    /// Default impl derives the any-up answer from [`reachable_each`](Self::reachable_each)
+    /// so a probe only needs to implement per-endpoint probing.
+    async fn reachable(&self, targets: &[BackendEndpoint]) -> bool {
+        self.reachable_each(targets)
+            .await
+            .iter()
+            .any(|h| h.reachable)
+    }
+
+    /// Probe **each** endpoint once and report its individual health. The failover
+    /// engine uses these per-replica results to drive per-rule active-backend
+    /// selection; the any-up [`reachable`](Self::reachable) is just a fold over this.
+    ///
+    /// Default impl probes endpoints one at a time via single-element [`reachable`]
+    /// calls — enough for test doubles; real probes ([`TcpBackendProbe`]) override it
+    /// to connect-test each endpoint directly.
+    async fn reachable_each(&self, targets: &[BackendEndpoint]) -> Vec<BackendHealth> {
+        let mut out = Vec::with_capacity(targets.len());
+        for t in targets {
+            let reachable = self.reachable(std::slice::from_ref(t)).await;
+            out.push(BackendHealth {
+                host: t.host.clone(),
+                port: t.port,
+                reachable,
+            });
+        }
+        out
+    }
 }
 
 /// Real probe: a bounded TCP connect to each `host:port`. A successful connect means
@@ -68,12 +99,28 @@ impl BackendProbe for TcpBackendProbe {
         if targets.is_empty() {
             return false;
         }
+        // any-up: the node can still serve as long as ONE backend is reachable.
+        // Short-circuit on the first live endpoint (cheaper than probing all).
         for t in targets {
-            if !self.connects(t).await {
-                return false;
+            if self.connects(t).await {
+                return true;
             }
         }
-        true
+        false
+    }
+
+    async fn reachable_each(&self, targets: &[BackendEndpoint]) -> Vec<BackendHealth> {
+        // Probe EVERY endpoint once (no short-circuit) so the failover engine sees
+        // each replica's individual health, not just an any-up answer.
+        let mut out = Vec::with_capacity(targets.len());
+        for t in targets {
+            out.push(BackendHealth {
+                host: t.host.clone(),
+                port: t.port,
+                reachable: self.connects(t).await,
+            });
+        }
+        out
     }
 }
 
@@ -138,8 +185,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_probe_requires_all_targets_reachable() {
-        // One live + one dead endpoint → not reachable (all-must-connect policy).
+    async fn tcp_probe_reachable_if_any_target_up() {
+        // One live + one dead endpoint → reachable (any-up policy: a node stays
+        // backend-up as long as at least one backend accepts a connection, so one
+        // dead replica/rule does not blackhole the whole node from DNS).
         let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let live_port = live.local_addr().unwrap().port();
         let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -147,10 +196,70 @@ mod tests {
         drop(dead);
         let probe = TcpBackendProbe::new(Duration::from_millis(300));
         assert!(
-            !probe
+            probe
                 .reachable(&[ep("127.0.0.1", live_port), ep("127.0.0.1", dead_port)])
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_unreachable_if_all_targets_down() {
+        // All endpoints dead → not reachable (only then is the node backend-down).
+        let a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_port = a.local_addr().unwrap().port();
+        let b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_port = b.local_addr().unwrap().port();
+        drop(a);
+        drop(b);
+        let probe = TcpBackendProbe::new(Duration::from_millis(300));
+        assert!(
+            !probe
+                .reachable(&[ep("127.0.0.1", a_port), ep("127.0.0.1", b_port)])
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn reachable_each_reports_per_endpoint_health() {
+        // One live + one dead endpoint → reachable_each returns one true, one false
+        // (each replica probed individually, no short-circuit).
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let probe = TcpBackendProbe::new(Duration::from_millis(300));
+        let health = probe
+            .reachable_each(&[ep("127.0.0.1", live_port), ep("127.0.0.1", dead_port)])
+            .await;
+        assert_eq!(health.len(), 2);
+        assert_eq!(health[0].port, live_port);
+        assert!(health[0].reachable, "live endpoint must be reachable");
+        assert_eq!(health[1].port, dead_port);
+        assert!(!health[1].reachable, "dead endpoint must be unreachable");
+    }
+
+    #[tokio::test]
+    async fn reachable_each_empty_is_empty_and_reachable_false() {
+        let probe = TcpBackendProbe::new(Duration::from_millis(300));
+        assert!(probe.reachable_each(&[]).await.is_empty());
+        // any-up over an empty per-endpoint result is false (no rules → not up).
+        assert!(!probe.reachable(&[]).await);
+    }
+
+    #[tokio::test]
+    async fn reachable_each_default_impl_works_for_doubles() {
+        // FixedProbe only implements `reachable`; the default `reachable_each`
+        // must fan it out per endpoint.
+        let health = FixedProbe(true)
+            .reachable_each(&[ep("127.0.0.1", 1), ep("127.0.0.1", 2)])
+            .await;
+        assert_eq!(health.len(), 2);
+        assert!(health.iter().all(|h| h.reachable));
+        let health = FixedProbe(false)
+            .reachable_each(&[ep("127.0.0.1", 1)])
+            .await;
+        assert!(health.iter().all(|h| !h.reachable));
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@
 //! telemetry — into a [`contract::protocol::StatusReport`] that the conn loop
 //! sends on the heartbeat interval.
 
-use contract::protocol::{Capacity, Metrics, StatusReport};
+use contract::protocol::{ActiveBackend, BackendHealth, Capacity, Metrics, StatusReport};
 
 /// Inputs the conn loop has on hand when it's time to report.
 pub struct ReportInputs {
@@ -15,6 +15,12 @@ pub struct ReportInputs {
     pub restart_count: u32,
     pub pid: Option<u32>,
     pub capacity: Option<Capacity>,
+    /// Per-replica probe results from the failover engine (None on the legacy
+    /// no-rules path so older panels see the field omitted entirely).
+    pub backend_health: Option<Vec<BackendHealth>>,
+    /// Current active backend per rule from the failover engine (None on the
+    /// legacy no-rules path).
+    pub active_backends: Option<Vec<ActiveBackend>>,
 }
 
 /// Build the wire [`StatusReport`] from collected inputs. `metrics` is only
@@ -38,6 +44,8 @@ pub fn build(inputs: ReportInputs) -> StatusReport {
         applied_config_gen: inputs.applied_config_gen,
         metrics,
         capacity: inputs.capacity,
+        backend_health: inputs.backend_health,
+        active_backends: inputs.active_backends,
     }
 }
 
@@ -61,6 +69,8 @@ mod tests {
                 rx_bytes_total: 20,
                 throughput_bps: 5,
             }),
+            backend_health: None,
+            active_backends: None,
         });
         assert!(r.forwarding_up);
         assert_eq!(r.applied_config_gen, 5);
@@ -79,8 +89,36 @@ mod tests {
             restart_count: 0,
             pid: None,
             capacity: None,
+            backend_health: None,
+            active_backends: None,
         });
         assert!(r.metrics.is_none());
         assert!(r.capacity.is_none());
+    }
+
+    #[test]
+    fn passes_through_failover_health_fields() {
+        use contract::protocol::{ActiveBackend, BackendHealth};
+        let r = build(ReportInputs {
+            forwarding_up: true,
+            backend_reachable: true,
+            applied_config_gen: 1,
+            restart_count: 0,
+            pid: None,
+            capacity: None,
+            backend_health: Some(vec![BackendHealth {
+                host: "10.0.0.1".into(),
+                port: 8096,
+                reachable: false,
+            }]),
+            active_backends: Some(vec![ActiveBackend {
+                rule_id: "r1".into(),
+                host: "10.0.0.2".into(),
+                port: 8096,
+            }]),
+        });
+        assert_eq!(r.backend_health.as_ref().unwrap()[0].host, "10.0.0.1");
+        assert!(!r.backend_health.as_ref().unwrap()[0].reachable);
+        assert_eq!(r.active_backends.as_ref().unwrap()[0].host, "10.0.0.2");
     }
 }

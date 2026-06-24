@@ -140,6 +140,7 @@ mod tests {
             tls_cert_pem: None,
             tls_key_pem: None,
             backends: vec![],
+            rules: vec![],
         };
         match apply(&push, &paths).unwrap() {
             ApplyOutcome::Start(a) => {
@@ -164,6 +165,7 @@ mod tests {
             tls_cert_pem: None,
             tls_key_pem: None,
             backends: vec![],
+            rules: vec![],
         };
         match apply(&push, &paths).unwrap() {
             ApplyOutcome::Start(a) => {
@@ -189,6 +191,7 @@ mod tests {
             tls_cert_pem: None,
             tls_key_pem: None,
             backends: vec![],
+            rules: vec![],
         };
         match apply(&push, &paths).unwrap() {
             ApplyOutcome::NoTool { applied_gen } => assert_eq!(applied_gen, 9),
@@ -212,6 +215,7 @@ mod tests {
                 "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n".into(),
             ),
             backends: vec![],
+            rules: vec![],
         };
         match apply(&push, &paths).unwrap() {
             ApplyOutcome::Start(a) => {
@@ -238,6 +242,7 @@ mod tests {
             tls_cert_pem: None,
             tls_key_pem: None,
             backends: vec![],
+            rules: vec![],
         };
         match apply(&push, &paths).unwrap() {
             ApplyOutcome::Start(a) => assert_eq!(a.tool, Tool::Gost),

@@ -1253,6 +1253,44 @@ function availabilityBadge(reason) {
   }
 }
 
+// Render per-backend probe detail for one node health record.
+// Falls back gracefully to nothing when backend_health is absent/empty (old agent).
+function backendHealthSection(h) {
+  var bh = h.backend_health;
+  var ab = h.active_backends;
+  // Old-agent fallback: no per-backend data — render nothing (node-level
+  // backend_reachable badge is already shown via availabilityBadge).
+  if (!bh || bh.length === 0) return '';
+
+  // Build a set of "host:port" strings for currently active backends.
+  var activeSet = {};
+  if (ab && ab.length > 0) {
+    ab.forEach(function(a) { activeSet[a.host + ':' + a.port] = true; });
+  }
+
+  var rows = bh.map(function(b) {
+    var key = b.host + ':' + b.port;
+    var isActive = !!activeSet[key];
+    var reachCls = b.reachable ? 'text-emerald-400' : 'text-red-400';
+    var reachDot = b.reachable
+      ? '<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block flex-shrink-0"></span>'
+      : '<span class="w-1.5 h-1.5 rounded-full bg-red-400 inline-block flex-shrink-0"></span>';
+    var activeMark = isActive
+      ? ' <span class="text-emerald-400 font-medium">(活动)</span>'
+      : '';
+    return '<div class="flex items-center gap-1.5 ' + reachCls + '">' +
+      reachDot +
+      '<span class="font-mono">' + esc(key) + '</span>' +
+      activeMark +
+    '</div>';
+  }).join('');
+
+  return '<div class="mt-2.5 pt-2 border-t border-panel-600 space-y-1">' +
+    '<div class="text-xs text-panel-400 mb-1">副本状态 (' + bh.length + ')</div>' +
+    '<div class="text-xs space-y-0.5">' + rows + '</div>' +
+  '</div>';
+}
+
 function progressBar(ratio, label) {
   if (ratio == null || isNaN(ratio)) return '<span class="text-xs text-panel-400">-</span>';
   var pct = Math.min(100, Math.max(0, ratio * 100));
@@ -1539,6 +1577,7 @@ function renderDashboard() {
           ? progressBar(quotaRatio, '配额使用: ' + formatBytes(h.accumulated_usage_bytes))
           : '<div class="text-xs text-panel-400">已用流量: ' + formatBytes(h.accumulated_usage_bytes) + ' <span class="text-panel-500">(无配额)</span></div>') +
       '</div>' +
+      backendHealthSection(h) +
       (node ? '<div class="mt-3 pt-2.5 border-t border-panel-600 flex justify-between text-xs text-panel-400">' +
         '<span>配置版本: ' + node.desired_config_gen + '/' + node.applied_config_gen + driftWarn + '</span>' +
         '<span>v' + node.desired_config_gen + '</span>' +
@@ -1560,10 +1599,23 @@ function renderTopology() {
         var node = _nodes.find(function(n) { return n.id === nid; });
         if (!node) return '';
         var nodeRules = _rules.filter(function(r) { return r.node_id === nid; });
-        var rulesText = nodeRules.length > 0
-          ? nodeRules.map(function(r) { return ':' + r.listen_port + ' → ' + r.backend_host + ':' + r.backend_port; }).join(', ')
-          : '<span class="text-panel-500">无规则</span>';
         var health = _health.find(function(h) { return h.id === nid; });
+        var rulesText = nodeRules.length > 0
+          ? nodeRules.map(function(r) {
+              // If we have active_backends data, annotate which host:port is active for this rule.
+              var activeHost = health && health.active_backends && health.active_backends.length > 0
+                ? health.active_backends.find(function(a) { return a.rule_id === r.id; })
+                : null;
+              var dest = activeHost
+                ? '<span class="text-emerald-400">' + esc(activeHost.host + ':' + activeHost.port) + '</span>'
+                : esc(r.backend_host + ':' + r.backend_port);
+              // Show total replica count from backend_health when available.
+              var replicas = health && health.backend_health && health.backend_health.length > 1
+                ? ' <span class="text-panel-500">(+' + (health.backend_health.length - 1) + ' 副本)</span>'
+                : '';
+              return ':' + r.listen_port + ' → ' + dest + replicas;
+            }).join(', ')
+          : '<span class="text-panel-500">无规则</span>';
         var dot = health && (health.status === 'online' || health.connected)
           ? '<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block"></span>'
           : '<span class="w-1.5 h-1.5 rounded-full bg-red-400 inline-block"></span>';

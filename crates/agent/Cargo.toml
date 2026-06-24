@@ -20,6 +20,9 @@ testutil = []
 
 [dependencies]
 contract = { workspace = true }
+# Shared gost/realm renderer (musl-thin: contract + serde only). The agent uses it
+# to re-render a single-upstream config when failover picks a new active backend.
+relaycfg = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

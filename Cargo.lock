@@ -52,6 +52,7 @@ dependencies = [
  "contract",
  "futures-util",
  "libc",
+ "relaycfg",
  "reqwest",
  "rustls",
  "rustls-pki-types",
@@ -1677,6 +1678,7 @@ dependencies = [
  "hickory-server",
  "instant-acme",
  "rand 0.8.6",
+ "relaycfg",
  "reqwest",
  "rust-embed",
  "serde",
@@ -2078,6 +2080,15 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "relaycfg"
+version = "0.1.0"
+dependencies = [
+ "contract",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "reqwest"

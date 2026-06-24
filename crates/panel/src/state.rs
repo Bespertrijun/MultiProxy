@@ -2,7 +2,7 @@
 //! with the DNS runtime, and the live WS connection registry.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -16,6 +16,23 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::crypto::Vault;
 use crate::scheduler::NodeRuntime;
+
+/// Failover tunable parameters broadcast to agents in `HelloOk` on every (re)connect.
+/// Seeded from env vars at startup; changing them requires a panel restart, after which
+/// agents pick up the new values automatically on their next reconnect.
+#[derive(Debug, Clone, Copy)]
+pub struct FailoverParams {
+    /// How often the agent probes each backend (seconds).
+    pub probe_interval_secs: u32,
+    /// Per-probe TCP connect timeout (milliseconds).
+    pub probe_timeout_ms: u32,
+    /// Consecutive probe failures before a backend is considered down.
+    pub max_fails: u32,
+    /// Consecutive successful probes required to consider a backend recovered.
+    pub recovery_checks: u32,
+    /// Minimum seconds a failover backend must remain active before reverting.
+    pub min_dwell_secs: u32,
+}
 
 /// A message queued to a connected agent's writer task.
 pub type AgentTx = mpsc::UnboundedSender<contract::protocol::Envelope>;
@@ -66,6 +83,8 @@ pub struct AppState {
     pub runtimes: Arc<Mutex<HashMap<String, NodeRuntime>>>,
     /// Server-controlled heartbeat interval (gap 7.3).
     pub heartbeat_interval_secs: u32,
+    /// Failover tunable parameters delivered to agents in HelloOk (seeded from env).
+    pub failover_params: FailoverParams,
     /// Path where GeoCN.mmdb is stored (for online update).
     pub geocn_path: String,
     /// Optional Cloudflare integration config (reloadable from DB settings).
@@ -88,6 +107,12 @@ pub struct AppState {
     /// Issued relay TLS certs by DNS zone `apex_domain` → (cert_pem, key_pem). Distinct
     /// from `tls_pair` (the panel's own `panel.{domain}` cert).
     pub zone_certs: Arc<RwLock<HashMap<String, (String, String)>>>,
+    /// Failover kill-switch (must-fix #2, P0). When `true`, `push_config` short-circuits
+    /// the version-split logic and pushes ONLY the legacy single-upstream render to every
+    /// agent (no structured `rules`) — equivalent to pre-Phase-4 behavior. Default `false`,
+    /// seeded from `PANEL_FAILOVER_KILLSWITCH=1`, hot-toggled via the API. Not a ConfigPush
+    /// wire field; zero agent cooperation.
+    pub failover_killswitch: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -115,6 +140,7 @@ impl AppState {
             conns: Arc::new(Mutex::new(HashMap::new())),
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             heartbeat_interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
+            failover_params: failover_params_from_env(),
             geocn_path,
             cf: Arc::new(RwLock::new(None)),
             tls_pair: Arc::new(RwLock::new(None)),
@@ -126,7 +152,21 @@ impl AppState {
             event_seq: Arc::new(AtomicU64::new(0)),
             acme_challenges: Arc::new(RwLock::new(HashMap::new())),
             zone_certs: Arc::new(RwLock::new(HashMap::new())),
+            // Default OFF; operator may seed it ON via env, hot-toggle via the API.
+            failover_killswitch: Arc::new(AtomicBool::new(failover_killswitch_from_env())),
         }
+    }
+
+    /// Whether the failover kill-switch is currently engaged (legacy-only push mode).
+    #[must_use]
+    pub fn killswitch_on(&self) -> bool {
+        self.failover_killswitch.load(Ordering::Relaxed)
+    }
+
+    /// Set the failover kill-switch (hot toggle). Returns the new value.
+    pub fn set_killswitch(&self, on: bool) -> bool {
+        self.failover_killswitch.store(on, Ordering::Relaxed);
+        on
     }
 
     /// Install a self-served ACME DNS-01 TXT challenge (served by the GeoDNS).
@@ -187,5 +227,61 @@ impl AppState {
     pub async fn set_cf_config(&self, cfg: Option<CfConfig>) {
         let mut guard = self.cf.write().await;
         *guard = cfg;
+    }
+}
+
+/// Read the failover kill-switch default from the environment. Engaged when
+/// `PANEL_FAILOVER_KILLSWITCH` is set to `1`/`true`/`yes`/`on` (case-insensitive).
+fn failover_killswitch_from_env() -> bool {
+    std::env::var("PANEL_FAILOVER_KILLSWITCH")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Read failover tunable parameters from the environment. Each variable is optional;
+/// missing or unparseable values fall back to the documented defaults (5/1000/3/6/60).
+///
+/// | Env var                          | Field                | Default |
+/// |----------------------------------|----------------------|---------|
+/// | `PANEL_PROBE_INTERVAL_SECS`      | `probe_interval_secs`| 5       |
+/// | `PANEL_PROBE_TIMEOUT_MS`         | `probe_timeout_ms`   | 1000    |
+/// | `PANEL_FAILOVER_MAX_FAILS`       | `max_fails`          | 3       |
+/// | `PANEL_FAILOVER_RECOVERY_CHECKS` | `recovery_checks`    | 6       |
+/// | `PANEL_MIN_DWELL_SECS`           | `min_dwell_secs`     | 60      |
+fn failover_params_from_env() -> FailoverParams {
+    fn parse_u32(var: &str, default: u32) -> u32 {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(default)
+    }
+    FailoverParams {
+        probe_interval_secs: parse_u32("PANEL_PROBE_INTERVAL_SECS", 5),
+        probe_timeout_ms: parse_u32("PANEL_PROBE_TIMEOUT_MS", 1000),
+        max_fails: parse_u32("PANEL_FAILOVER_MAX_FAILS", 3),
+        recovery_checks: parse_u32("PANEL_FAILOVER_RECOVERY_CHECKS", 6),
+        min_dwell_secs: parse_u32("PANEL_MIN_DWELL_SECS", 60),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failover_params_defaults_when_env_absent() {
+        // Ensure none of these vars are set in the test environment.
+        // (They are not set in a standard CI/unit-test context.)
+        let p = failover_params_from_env();
+        assert_eq!(p.probe_interval_secs, 5);
+        assert_eq!(p.probe_timeout_ms, 1000);
+        assert_eq!(p.max_fails, 3);
+        assert_eq!(p.recovery_checks, 6);
+        assert_eq!(p.min_dwell_secs, 60);
     }
 }

@@ -47,6 +47,11 @@ async fn start_mock_panel(
             Message::HelloOk(HelloOk {
                 session: "s-1".into(),
                 heartbeat_interval_secs: 1,
+                probe_interval_secs: 5,
+                probe_timeout_ms: 1000,
+                failover_max_fails: 3,
+                failover_recovery_checks: 6,
+                min_dwell_secs: 60,
             }),
         )
         .await;
@@ -65,6 +70,7 @@ async fn start_mock_panel(
                     host: "10.9.9.9".into(),
                     port: 8096,
                 }],
+                rules: vec![],
             }),
         )
         .await;

@@ -16,6 +16,8 @@
 //!     forward-bytes vs nic-delta source tier).
 //!   * [`report`]    — StatusReport assembly.
 //!   * [`selfheal`]  — backend reachability probe + crashed-child restart.
+//!   * [`failover`]  — per-rule active-backend selection (fast-fail / slow-recovery
+//!     / min-dwell) + single-upstream re-render on change.
 //!
 //! The crate is intentionally light: it depends only on `contract` + tokio +
 //! tokio-tungstenite + rustls(ring) + serde_json + small utils. It does NOT pull
@@ -24,6 +26,7 @@
 pub mod capacity;
 pub mod config;
 pub mod conn;
+pub mod failover;
 pub mod platform;
 pub mod report;
 pub mod selfheal;

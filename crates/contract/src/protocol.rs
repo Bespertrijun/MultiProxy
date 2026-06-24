@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::{Protocol, TlsMode, Tool};
 use crate::version::PROTOCOL_VERSION;
 
 /// Server-controlled heartbeat interval default (gap 7.3). Delivered to the agent
@@ -99,6 +100,28 @@ pub struct StatusReport {
     pub metrics: Option<Metrics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<Capacity>,
+    /// Per-backend probe results, keyed by (host, port). Additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_health: Option<Vec<BackendHealth>>,
+    /// Which backend is currently active for each rule. Additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_backends: Option<Vec<ActiveBackend>>,
+}
+
+/// Probe result for one backend endpoint, as seen from the agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackendHealth {
+    pub host: String,
+    pub port: u16,
+    pub reachable: bool,
+}
+
+/// Currently active backend for one forwarding rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActiveBackend {
+    pub rule_id: String,
+    pub host: String,
+    pub port: u16,
 }
 
 /// Optional, extensible observability metrics (gap 7.5). All fields optional;
@@ -151,11 +174,45 @@ pub struct ConfigAck {
 }
 
 /// panel→agent handshake success. Carries the server-controlled heartbeat interval
-/// (gap 7.3) so cadence is tunable from the panel.
+/// (gap 7.3) and failover tunables so all cadences are adjustable from the panel.
+/// Failover tunable values are server-controlled via panel env vars
+/// (`PANEL_PROBE_INTERVAL_SECS`, `PANEL_PROBE_TIMEOUT_MS`, `PANEL_FAILOVER_MAX_FAILS`,
+/// `PANEL_FAILOVER_RECOVERY_CHECKS`, `PANEL_MIN_DWELL_SECS`), applied on agent reconnect.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HelloOk {
     pub session: String,
     pub heartbeat_interval_secs: u32,
+    /// How often the agent probes each backend (seconds).
+    #[serde(default = "default_probe_interval_secs")]
+    pub probe_interval_secs: u32,
+    /// Per-probe TCP connect timeout (milliseconds).
+    #[serde(default = "default_probe_timeout_ms")]
+    pub probe_timeout_ms: u32,
+    /// Consecutive probe failures before a backend is considered down.
+    #[serde(default = "default_failover_max_fails")]
+    pub failover_max_fails: u32,
+    /// Consecutive successful probes required to consider a backend recovered.
+    #[serde(default = "default_failover_recovery_checks")]
+    pub failover_recovery_checks: u32,
+    /// Minimum seconds a failover backend must remain active before reverting.
+    #[serde(default = "default_min_dwell_secs")]
+    pub min_dwell_secs: u32,
+}
+
+fn default_probe_interval_secs() -> u32 {
+    5
+}
+fn default_probe_timeout_ms() -> u32 {
+    1000
+}
+fn default_failover_max_fails() -> u32 {
+    3
+}
+fn default_failover_recovery_checks() -> u32 {
+    6
+}
+fn default_min_dwell_secs() -> u32 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -182,6 +239,20 @@ pub struct BackendEndpoint {
     pub port: u16,
 }
 
+/// Per-rule structured spec carried in [`ConfigPush::rules`]. Backends are ordered
+/// `[main, ...extra]` matching `ForwardRule.backend_host/backend_port` then
+/// `ForwardRule.extra_backends`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuleSpec {
+    pub rule_id: String,
+    pub listen_port: u16,
+    pub protocol: Protocol,
+    pub tls_mode: TlsMode,
+    pub tool: Tool,
+    /// Ordered backend list: index 0 is the primary, rest are standby replicas.
+    pub backends: Vec<BackendEndpoint>,
+}
+
 /// Versioned full-config snapshot push (D2). Idempotent; agent echoes `desired_gen`
 /// back in [`ConfigAck`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -203,6 +274,11 @@ pub struct ConfigPush {
     /// omit it (defaults empty) and older agents ignore it (D1 forward-compat).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backends: Vec<BackendEndpoint>,
+    /// Structured per-rule specs (ordered backends per rule). Additive field:
+    /// older agents omit/ignore it (D1 forward-compat). The legacy
+    /// `gost_config`/`realm_config`/`backends` fields are retained and still populated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RuleSpec>,
 }
 
 /// Server-initiated close notice.
@@ -259,6 +335,8 @@ mod tests {
                 rx_bytes_total: 200,
                 throughput_bps: 50,
             }),
+            backend_health: None,
+            active_backends: None,
         }));
         roundtrip(Message::ConfigAck(ConfigAck {
             applied_gen: 3,
@@ -268,6 +346,11 @@ mod tests {
         roundtrip(Message::HelloOk(HelloOk {
             session: "s".into(),
             heartbeat_interval_secs: 20,
+            probe_interval_secs: 5,
+            probe_timeout_ms: 1000,
+            failover_max_fails: 3,
+            failover_recovery_checks: 6,
+            min_dwell_secs: 60,
         }));
         roundtrip(Message::AuthReject(AuthReject {
             reason: AuthRejectReason::ProtocolVersion,
@@ -288,6 +371,7 @@ mod tests {
                     port: 443,
                 },
             ],
+            rules: vec![],
         }));
         // ConfigPush with TLS cert fields populated.
         roundtrip(Message::ConfigPush(ConfigPush {
@@ -301,6 +385,7 @@ mod tests {
                 "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----\n".into(),
             ),
             backends: vec![],
+            rules: vec![],
         }));
         roundtrip(Message::Ping);
         roundtrip(Message::Close(Close {
@@ -340,5 +425,127 @@ mod tests {
         let json = r#"{"gost_realm_pids":[1,2],"some_future_field":99}"#;
         let m: Metrics = serde_json::from_str(json).expect("forward-compat metrics");
         assert_eq!(m.gost_realm_pids, Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn protocol_version_is_one() {
+        assert_eq!(PROTOCOL_VERSION, 1, "PROTOCOL_VERSION must not be bumped");
+    }
+
+    #[test]
+    fn legacy_config_push_missing_rules_defaults_empty() {
+        // A panel that predates the `rules` field omits it entirely; the agent
+        // must deserialize successfully with rules = [].
+        let json = r#"{"protocol_version":1,"msg_id":"x","kind":"config_push","payload":{"desired_gen":2,"gost_config":"g"}}"#;
+        let env: Envelope = serde_json::from_str(json).expect("legacy config_push");
+        match env.message {
+            Message::ConfigPush(cp) => {
+                assert_eq!(cp.desired_gen, 2);
+                assert!(cp.rules.is_empty(), "rules must default to []");
+            }
+            other => panic!("expected config_push, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_status_report_missing_health_fields_defaults_none() {
+        // An older agent omits backend_health / active_backends; they must default to None.
+        let json = r#"{"forwarding_up":true,"backend_reachable":false,"applied_config_gen":0}"#;
+        let sr: StatusReport = serde_json::from_str(json).expect("legacy status_report");
+        assert!(sr.backend_health.is_none());
+        assert!(sr.active_backends.is_none());
+    }
+
+    #[test]
+    fn legacy_hello_ok_missing_failover_fields_defaults() {
+        // An older panel omits the new failover tunables; they must default correctly.
+        let json = r#"{"session":"s","heartbeat_interval_secs":20}"#;
+        let h: HelloOk = serde_json::from_str(json).expect("legacy hello_ok");
+        assert_eq!(h.probe_interval_secs, 5);
+        assert_eq!(h.probe_timeout_ms, 1000);
+        assert_eq!(h.failover_max_fails, 3);
+        assert_eq!(h.failover_recovery_checks, 6);
+        assert_eq!(h.min_dwell_secs, 60);
+    }
+
+    #[test]
+    fn config_push_with_rules_field_is_ignored_by_older_schema() {
+        // A new panel sends rules=[...]; an older agent ignores unknown fields
+        // (no deny_unknown_fields). We verify the field round-trips present.
+        use crate::model::{Protocol, TlsMode, Tool};
+        let push = ConfigPush {
+            desired_gen: 1,
+            gost_config: None,
+            realm_config: None,
+            tls_cert_pem: None,
+            tls_key_pem: None,
+            backends: vec![],
+            rules: vec![RuleSpec {
+                rule_id: "r1".into(),
+                listen_port: 8080,
+                protocol: Protocol::Tcp,
+                tls_mode: TlsMode::Passthrough,
+                tool: Tool::Gost,
+                backends: vec![BackendEndpoint {
+                    host: "10.0.0.1".into(),
+                    port: 8096,
+                }],
+            }],
+        };
+        let json = serde_json::to_string(&push).expect("serialize");
+        // rules field is present in JSON (not skipped since non-empty)
+        assert!(
+            json.contains("\"rules\""),
+            "rules field must appear in JSON"
+        );
+        let back: ConfigPush = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, push);
+    }
+
+    #[test]
+    fn new_types_round_trip() {
+        // BackendHealth and ActiveBackend roundtrip
+        let bh = BackendHealth {
+            host: "10.0.0.1".into(),
+            port: 8096,
+            reachable: true,
+        };
+        let json = serde_json::to_string(&bh).unwrap();
+        let back: BackendHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, bh);
+
+        let ab = ActiveBackend {
+            rule_id: "r1".into(),
+            host: "10.0.0.1".into(),
+            port: 8096,
+        };
+        let json = serde_json::to_string(&ab).unwrap();
+        let back: ActiveBackend = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ab);
+    }
+
+    #[test]
+    fn status_report_with_health_fields_round_trips() {
+        let sr = StatusReport {
+            forwarding_up: true,
+            backend_reachable: true,
+            applied_config_gen: 1,
+            metrics: None,
+            capacity: None,
+            backend_health: Some(vec![BackendHealth {
+                host: "10.0.0.1".into(),
+                port: 8096,
+                reachable: true,
+            }]),
+            active_backends: Some(vec![ActiveBackend {
+                rule_id: "r1".into(),
+                host: "10.0.0.1".into(),
+                port: 8096,
+            }]),
+        };
+        let env = Envelope::new("m-health", Message::StatusReport(sr.clone()));
+        let json = serde_json::to_string(&env).expect("serialize");
+        let back: Envelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(env, back);
     }
 }

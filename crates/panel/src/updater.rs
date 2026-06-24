@@ -210,8 +210,8 @@ fn validate_binary(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Simple semver comparison: returns true if `latest` > `current`.
-fn version_newer(latest: &str, current: &str) -> bool {
+/// Simple semver comparison: returns true if `latest` > `current` (strict `>`).
+pub(crate) fn version_newer(latest: &str, current: &str) -> bool {
     let parse = |s: &str| -> Vec<u64> {
         s.split('.')
             .map(|p| p.parse::<u64>().unwrap_or(0))

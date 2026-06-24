@@ -103,6 +103,67 @@ async fn make_node_with_rule(h: &Harness) -> (String, String) {
     (node_id, token)
 }
 
+/// agent_version for a "new" (Phase-4-failover-capable) agent (>= v0.10.0).
+const NEW_AGENT_VERSION: &str = "0.10.0";
+/// agent_version for an "old" agent (< v0.10.0).
+const OLD_AGENT_VERSION: &str = "0.9.6";
+
+/// Connect, handshake with the given agent version, drain HelloOk, return (ws, first push).
+async fn connect_and_handshake(
+    h: &Harness,
+    node_id: &str,
+    token: &str,
+    agent_version: &str,
+) -> (Ws, contract::protocol::ConfigPush) {
+    let (mut ws, _) = connect_async(&h.ws_url).await.unwrap();
+    send(
+        &mut ws,
+        Message::Hello(Hello {
+            node_id: node_id.to_string(),
+            token: token.to_string(),
+            agent_version: agent_version.to_string(),
+            platform: "x86_64-linux".into(),
+        }),
+    )
+    .await;
+    // HelloOk first.
+    match recv(&mut ws).await {
+        Some(Message::HelloOk(_)) => {}
+        other => panic!("expected HelloOk, got {other:?}"),
+    }
+    let push = loop {
+        match recv(&mut ws).await {
+            Some(Message::ConfigPush(p)) => break p,
+            Some(_) => continue,
+            None => panic!("no ConfigPush on connect"),
+        }
+    };
+    (ws, push)
+}
+
+/// Create a line group containing `node_id` (no zone). Re-pushes to its members via
+/// `push_config_to` WITHOUT bumping desired_gen — the leg-b "unrelated re-push" path.
+async fn create_group_with_node(h: &Harness, node_id: &str) {
+    h.client
+        .post(format!("{}/api/line-groups", h.base_http))
+        .json(&serde_json::json!({
+            "name": "g1",
+            "member_node_ids": [node_id],
+        }))
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn set_killswitch(h: &Harness, enabled: bool) {
+    h.client
+        .put(format!("{}/api/settings/failover-killswitch", h.base_http))
+        .json(&serde_json::json!({ "enabled": enabled }))
+        .send()
+        .await
+        .unwrap();
+}
+
 async fn send(ws: &mut Ws, msg: Message) {
     let env = Envelope::new("m", msg);
     ws.send(WsMessage::Text(serde_json::to_string(&env).unwrap()))
@@ -196,6 +257,8 @@ async fn happy_path_hello_configpush_ack() {
             applied_config_gen: push.desired_gen,
             metrics: None,
             capacity: None,
+            backend_health: None,
+            active_backends: None,
         }),
     )
     .await;
@@ -372,4 +435,175 @@ async fn token_rotation_rejects_old_token() {
         Some(Message::AuthReject(r)) => assert_eq!(r.reason, AuthRejectReason::BadToken),
         other => panic!("expected BadToken after rotation, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn new_agent_gets_rules_old_agent_does_not() {
+    // Version split (must-fix #4): a NEW agent's push carries structured `rules`
+    // (a full replica list) PLUS the legacy render; an OLD agent gets the legacy render
+    // only (no rules), byte-for-byte the pre-Phase-4 push.
+    let h = boot().await;
+    let (node_id, token) = make_node_with_rule(&h).await;
+
+    let (_ws_new, push_new) = connect_and_handshake(&h, &node_id, &token, NEW_AGENT_VERSION).await;
+    assert!(
+        !push_new.rules.is_empty(),
+        "new agent must receive structured rules"
+    );
+    assert_eq!(push_new.rules[0].listen_port, 8443);
+    // Legacy render is still present as a fallback.
+    assert!(
+        push_new.gost_config.as_deref().unwrap().contains("8443"),
+        "legacy gost_config must still be sent as fallback"
+    );
+
+    let (_ws_old, push_old) = connect_and_handshake(&h, &node_id, &token, OLD_AGENT_VERSION).await;
+    assert!(
+        push_old.rules.is_empty(),
+        "old agent must NOT receive structured rules"
+    );
+    assert!(push_old.gost_config.as_deref().unwrap().contains("8443"));
+}
+
+#[tokio::test]
+async fn leg_b_unrelated_repush_to_new_agent_still_carries_rules() {
+    // BLOCKING (must-fix #1): an unrelated re-push (here: group CRUD via push_config_to,
+    // the same path as cert renewal certs.rs:94, which does NOT bump desired_gen) to a
+    // NEW agent must STILL carry the full structured `rules` — never a "main upstream
+    // only" push that would knock the agent back onto a dead primary.
+    let h = boot().await;
+    let (node_id, token) = make_node_with_rule(&h).await;
+    let (mut ws, push1) = connect_and_handshake(&h, &node_id, &token, NEW_AGENT_VERSION).await;
+    assert!(!push1.rules.is_empty(), "connect push carries rules");
+
+    // Trigger an unrelated re-push (group membership) — does NOT bump desired_gen.
+    create_group_with_node(&h, &node_id).await;
+
+    let push2 = loop {
+        match recv(&mut ws).await {
+            Some(Message::ConfigPush(p)) => break p,
+            Some(_) => continue,
+            None => panic!("no re-push after group create"),
+        }
+    };
+    assert!(
+        !push2.rules.is_empty(),
+        "unrelated re-push to a new agent MUST still carry structured rules (leg-b)"
+    );
+    assert_eq!(push2.rules[0].listen_port, 8443);
+    // gen unchanged (group CRUD does not bump desired_gen).
+    assert_eq!(
+        push2.desired_gen, push1.desired_gen,
+        "group CRUD must not bump desired_gen"
+    );
+}
+
+#[tokio::test]
+async fn killswitch_forces_legacy_only_push_for_new_agent() {
+    // BLOCKING (must-fix #2): with the kill-switch ENGAGED, a NEW agent receives ONLY the
+    // legacy single-upstream render and NO structured rules (== pre-Phase-4). Disengaging
+    // restores rules + legacy fallback.
+    let h = boot().await;
+    let (node_id, token) = make_node_with_rule(&h).await;
+
+    // Kill-switch ON.
+    set_killswitch(&h, true).await;
+    let (mut ws, push_on) = connect_and_handshake(&h, &node_id, &token, NEW_AGENT_VERSION).await;
+    assert!(
+        push_on.rules.is_empty(),
+        "kill-switch ON: new agent must NOT receive structured rules"
+    );
+    assert!(
+        push_on.gost_config.as_deref().unwrap().contains("8443"),
+        "legacy render still present under kill-switch"
+    );
+
+    // Kill-switch OFF → re-push (via group CRUD) now carries rules again.
+    set_killswitch(&h, false).await;
+    create_group_with_node(&h, &node_id).await;
+    let push_off = loop {
+        match recv(&mut ws).await {
+            Some(Message::ConfigPush(p)) => break p,
+            Some(_) => continue,
+            None => panic!("no re-push after disengaging kill-switch"),
+        }
+    };
+    assert!(
+        !push_off.rules.is_empty(),
+        "kill-switch OFF: new agent receives structured rules again"
+    );
+}
+
+#[tokio::test]
+async fn killswitch_push_matches_old_agent_push_byte_for_byte() {
+    // The kill-switch push to a new agent must equal the legacy push an old agent gets:
+    // same gost_config / realm_config / backends, and rules empty in both.
+    let h = boot().await;
+    let (node_id, token) = make_node_with_rule(&h).await;
+
+    set_killswitch(&h, true).await;
+    let (_ws_new, push_new) = connect_and_handshake(&h, &node_id, &token, NEW_AGENT_VERSION).await;
+    let (_ws_old, push_old) = connect_and_handshake(&h, &node_id, &token, OLD_AGENT_VERSION).await;
+
+    assert!(push_new.rules.is_empty());
+    assert!(push_old.rules.is_empty());
+    assert_eq!(push_new.gost_config, push_old.gost_config);
+    assert_eq!(push_new.realm_config, push_old.realm_config);
+    assert_eq!(push_new.backends, push_old.backends);
+}
+
+#[tokio::test]
+async fn new_agent_active_backend_report_does_not_trigger_repush() {
+    // drift-no-fight: a NEW agent reports active_backends but keeps applied_config_gen ==
+    // desired_config_gen → panel sees desired == applied → NO re-push within T_ACK.
+    let h = boot().await;
+    let (node_id, token) = make_node_with_rule(&h).await;
+    let (mut ws, push) = connect_and_handshake(&h, &node_id, &token, NEW_AGENT_VERSION).await;
+
+    // Ack the desired gen so applied == desired (no drift).
+    send(
+        &mut ws,
+        Message::ConfigAck(ConfigAck {
+            applied_gen: push.desired_gen,
+            ok: true,
+            err: None,
+        }),
+    )
+    .await;
+
+    // Report active_backends while keeping applied_config_gen == desired.
+    send(
+        &mut ws,
+        Message::StatusReport(StatusReport {
+            forwarding_up: true,
+            backend_reachable: true,
+            applied_config_gen: push.desired_gen,
+            metrics: None,
+            capacity: None,
+            backend_health: None,
+            active_backends: Some(vec![contract::protocol::ActiveBackend {
+                rule_id: push.rules[0].rule_id.clone(),
+                host: "10.0.0.5".into(),
+                port: 8096,
+            }]),
+        }),
+    )
+    .await;
+
+    // No ConfigPush should arrive in a short window (we are not waiting the full T_ACK,
+    // but any spurious immediate re-push would show up here).
+    let spurious = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match recv(&mut ws).await {
+                Some(Message::ConfigPush(_)) => break true,
+                Some(_) => continue,
+                None => break false,
+            }
+        }
+    })
+    .await;
+    assert!(
+        spurious.is_err() || spurious == Ok(false),
+        "no re-push expected when applied == desired (drift must not fight failover)"
+    );
 }

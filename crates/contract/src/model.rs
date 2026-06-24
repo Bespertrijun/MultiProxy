@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::isp::Isp;
+use crate::protocol::BackendEndpoint;
 
 pub type NodeId = String;
 pub type RuleId = String;
@@ -148,6 +149,10 @@ pub struct ForwardRule {
     /// TLS handling mode for this rule's listener.
     #[serde(default)]
     pub tls_mode: TlsMode,
+    /// Ordered standby replicas for this rule's backend. The primary backend is
+    /// `backend_host`/`backend_port`; these are extras. Renders as [main, ...extra].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_backends: Vec<BackendEndpoint>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,3 +296,75 @@ pub const DEFAULT_RESOLUTION_TTL_SECS: u32 = 60;
 
 /// Q5 authoritative-layer failover SLO: max seconds from detection to :53 removal.
 pub const AUTHORITATIVE_FAILOVER_SLO_SECS: u32 = 30;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_rule_legacy_missing_extra_backends_defaults_empty() {
+        // An older DB row or JSON payload without extra_backends must deserialize
+        // successfully with extra_backends = [].
+        let json = r#"{
+            "id": "r1",
+            "node_id": "n1",
+            "listen_port": 8080,
+            "protocol": "tcp",
+            "backend_host": "10.0.0.1",
+            "backend_port": 8096,
+            "tool": "gost",
+            "tls_mode": "passthrough"
+        }"#;
+        let rule: ForwardRule = serde_json::from_str(json).expect("legacy forward_rule");
+        assert!(
+            rule.extra_backends.is_empty(),
+            "extra_backends must default to []"
+        );
+    }
+
+    #[test]
+    fn forward_rule_extra_backends_round_trips() {
+        use crate::protocol::BackendEndpoint;
+        let rule = ForwardRule {
+            id: "r1".into(),
+            node_id: "n1".into(),
+            listen_port: 8080,
+            protocol: Protocol::Tcp,
+            backend_host: "10.0.0.1".into(),
+            backend_port: 8096,
+            tool: Tool::Gost,
+            tls_mode: TlsMode::Passthrough,
+            extra_backends: vec![BackendEndpoint {
+                host: "10.0.0.2".into(),
+                port: 8096,
+            }],
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        assert!(
+            json.contains("extra_backends"),
+            "extra_backends must appear in JSON when non-empty"
+        );
+        let back: ForwardRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rule);
+    }
+
+    #[test]
+    fn forward_rule_empty_extra_backends_not_serialized() {
+        let rule = ForwardRule {
+            id: "r1".into(),
+            node_id: "n1".into(),
+            listen_port: 8080,
+            protocol: Protocol::Tcp,
+            backend_host: "10.0.0.1".into(),
+            backend_port: 8096,
+            tool: Tool::Gost,
+            tls_mode: TlsMode::Passthrough,
+            extra_backends: vec![],
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        assert!(
+            !json.contains("extra_backends"),
+            "empty extra_backends must be skipped in serialization"
+        );
+    }
+}

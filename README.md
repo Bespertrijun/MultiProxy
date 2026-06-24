@@ -220,6 +220,183 @@ The agent's CLI is in [`deploy/agent-install.md`](deploy/agent-install.md).
 
 ---
 
+## Multi-replica failover
+
+### Overview
+
+Forwarding rules now support **ordered multi-replica backends**: a single rule can have a primary backend plus multiple ordered standby backends. The **agent self-drives** failover — it probes each replica on a cadence and runs a simple state machine to pick the best-available replica as the active upstream. When the primary fails continuously, it switches to the next standby; when the primary recovers, it must stay healthy for a recovery window and past a minimum dwell time before switching back.
+
+**Precondition**: these replicas must be interchangeable copies of the same service (identical content), or the semantics break down.
+
+### Terminology
+
+- **Primary backend**: the `backend_host`/`backend_port` you specify in rule editing, highest priority.
+- **Extra replica backends** (`extra_backends`): ordered standbys `[first_standby, second_standby, ...]` added in rule editing, probed in list order.
+- **Active replica**: the backend currently in use by the forwarding tool (gost/realm).
+
+### Panel rule editing usage
+
+In the panel Web UI's **forwarding rule editor**, you can add extra replica backends to any rule:
+
+1. **Open rule editor**: select a rule, enter edit mode.
+2. **Configure primary backend**: edit `backend_host` and `backend_port` (existing logic, no change).
+3. **Add extra replica backends** (new):
+   - Click "Add replica backend" button.
+   - Enter the replica's `host` and `port`.
+   - Add multiple replicas; they are probed in addition order.
+   - Leave empty if no standby is needed.
+4. **Validate and save**: ensure all backend addresses pass the same charset checks as the primary; save the rule.
+
+On save, the panel will:
+- Validate primary and replica addresses.
+- Store in SQLite (`extra_backends` as a JSON-serialized array).
+- Bump the config generation (`desired_config_gen`) and re-push ConfigPush to that node.
+- The agent receives the new rule and starts the failover engine.
+
+### Failover semantics (as-implemented)
+
+#### Probing and state machine
+
+The agent probes every replica of every rule on the `probe_interval_secs` cadence (default 5 seconds, sent in HelloOk). Each backend tracks two counters:
+
+- **Consecutive failures**: failed probe → +1; successful probe → 0.
+- **Consecutive successes**: successful probe → +1; failed probe → 0.
+
+State machine rules:
+
+| State | Trigger | Transition |
+|-------|---------|------------|
+| UP (default) | Consecutive failures ≥ `failover_max_fails` (default 3, ~15s) | → DOWN |
+| DOWN | Consecutive successes ≥ `failover_recovery_checks` (default 6, ~30s) **AND** past `min_dwell_secs` (default 60s) | → UP |
+
+- **Fast-fail**: a dead primary takes ~15 seconds (3 × 5s probe intervals) to be marked unreachable.
+- **Slow-recovery**: a recovered standby needs ~30 seconds (6 × 5s) of consecutive success PLUS 60 seconds minimum dwell (~90s total) before switching back. This prevents flapping on transient glitches.
+
+#### Active replica selection
+
+Every probe cycle, the agent walks the replica list (primary → first standby → second standby → …) and picks the first one in UP state as the active replica.
+
+#### Config re-render and restart
+
+When the set of active replicas changes (any rule's active replica shifts), the agent **re-renders the entire node's gost/realm config** (all rules' upstreams regenerated) and **restarts the relay process once**. All changes in a probe cycle are **batched** into a single re-render and restart.
+
+**This causes a brief disruption to all connections on that relay**: Emby playback experiences a **perceptible stall / reconnect**. The panel mitigates by:
+
+- Asymmetric hysteresis: fast-fail, slow-recovery, minimum dwell.
+- Batching: multiple rule changes in one cycle merge into one restart.
+- Graceful degradation (OQ-8): if all replicas are dead, keep the last known config (no crash-loop).
+
+#### Node DNS availability
+
+The panel uses "any-up" logic: **a node stays in DNS (in the line group's A set) as long as any rule has one healthy replica**. Only when all replicas of a rule are down is that rule marked "down"; only when all rules are down is the node removed from GeoDNS.
+
+### Tunable parameters
+
+These are sent by the panel in `HelloOk` to the agent — **no need to re-release the agent binary**. Values are configured via **panel environment variables**; agents receive the updated values automatically on their next reconnect (no panel UI required, no agent redeploy needed):
+
+| Parameter | Env var | Default | Meaning |
+|-----------|---------|---------|---------|
+| `probe_interval_secs` | `PANEL_PROBE_INTERVAL_SECS` | 5 | Backend probe cadence (seconds) |
+| `probe_timeout_ms` | `PANEL_PROBE_TIMEOUT_MS` | 1000 | Per-probe timeout (milliseconds) |
+| `failover_max_fails` | `PANEL_FAILOVER_MAX_FAILS` | 3 | Consecutive failures to mark a replica down |
+| `failover_recovery_checks` | `PANEL_FAILOVER_RECOVERY_CHECKS` | 6 | Consecutive successes to mark a replica up |
+| `min_dwell_secs` | `PANEL_MIN_DWELL_SECS` | 60 | Minimum dwell time after switching to a lower-priority replica (seconds) |
+
+Set the env vars before starting (or restarting) the panel; agents pick up new values on their next reconnect via `HelloOk`.
+
+### State visibility
+
+Every StatusReport from an agent includes:
+
+- **`backend_health`**: per-backend probe results (host, port, reachable).
+- **`active_backends`**: per-rule active replica (rule_id, host, port).
+
+The panel **dashboard/overview** shows:
+- Current active upstream for each rule on each node.
+- Probe status (green/red) for all backends.
+
+### Kill-switch: emergency rollback
+
+If failover misbehaves, an **emergency kill-switch** reverts all agents (regardless of version) to the pre-launch single-primary behavior instantly.
+
+#### Activation
+
+**Method 1: environment variable (at startup)**
+
+```sh
+# When starting the panel
+export PANEL_FAILOVER_KILLSWITCH=1
+panel serve --db "..." --http "..."
+```
+
+Accepts: `1`, `true`, `yes`, `on` (case-insensitive).
+
+**Method 2: API (hot-toggle)**
+
+Check current state:
+```bash
+curl -s -b cookies.txt http://127.0.0.1:8080/api/settings/failover-killswitch
+```
+
+Response:
+```json
+{ "enabled": false }
+```
+
+Enable kill-switch:
+```bash
+curl -s -b cookies.txt -X PUT -H 'Content-Type: application/json' \
+  -d '{"enabled":true}' http://127.0.0.1:8080/api/settings/failover-killswitch
+```
+
+#### Behavior
+
+**When enabled** (`enabled: true`):
+
+- The panel sends **legacy single-upstream config** to **all online agents** (any version).
+- Connected agents pick up the change on next ConfigPush / cert renewal / heartbeat timeout.
+- No failover engine runs; agents behave as before the feature.
+
+**When disabled** (default `enabled: false`):
+
+- The panel sends **structured multi-replica config** (rules with `extra_backends`).
+- Agent runs the failover engine per the semantics above.
+
+#### Persistence and recovery
+
+- Kill-switch is **in-memory, seeded from `PANEL_FAILOVER_KILLSWITCH` env var**.
+- **Panel restart reverts to the env var default** (safest emergency-only mode: stateless recovery).
+- If the panel crashes, restart uses the startup env var. Production recommendation: keep `PANEL_FAILOVER_KILLSWITCH=0` (normal), enable only in emergencies:
+  1. Toggle kill-switch (`PUT /api/settings/failover-killswitch` or set env + restart).
+  2. Wait for agents to receive the new config (minutes at most).
+  3. Observe, confirm normal operation, then toggle off to resume normal mode.
+
+### Operations: migrating "two rules → one rule + replicas"
+
+If you have two separate rules for the same service on different ports (e.g., Emby primary port + backup port), you can now merge them into one rule with multiple replicas:
+
+**Migration (via panel UI)**:
+
+1. **Pick the rule to keep** (e.g., the primary port) and edit it.
+2. **Add the backup rule's backend as a replica**:
+   - Click "Add replica backend".
+   - Enter the backup rule's `host` and `port`.
+   - Save.
+3. **Verify**:
+   - Check the node's StatusReport — both replicas should appear.
+   - Check the **overview** — the rule's "active upstream" should show the new replica, then revert (test failover).
+4. **Delete the old rule**:
+   - Once verified, delete the backup rule.
+   - Panel re-pushes config to the node.
+
+**Client impact during migration**:
+
+- Clients still **connected to the old port** will **disconnect** (listener removed).
+- Clients must **switch to the new port** or **re-resolve** (if the line group points to this node, the DNS answer changes to the new port).
+- **No automatic migration script**: to avoid unintended line changes, this must be manual + observable.
+
+---
+
 ## Test + verify
 
 ```sh

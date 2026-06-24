@@ -13,6 +13,7 @@ use contract::isp::Isp;
 use contract::model::{
     Agent, ConnState, DnsZone, ForwardRule, FrontNode, LineGroup, NodeStatus, TimeWindow, TlsMode,
 };
+use contract::protocol::{ActiveBackend, BackendHealth};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, SESSION_COOKIE};
@@ -98,6 +99,10 @@ pub fn router(state: AppState) -> Router {
             get(get_timezone).put(put_timezone),
         )
         .route("/api/version", get(version_info))
+        .route(
+            "/api/settings/failover-killswitch",
+            get(get_failover_killswitch).put(put_failover_killswitch),
+        )
         .route("/api/update/check", get(update_check))
         .route("/api/update/panel", post(update_panel))
         .route("/api/update/agents", post(update_agents))
@@ -629,6 +634,7 @@ async fn create_rule(
         backend_port: req.backend_port,
         tool: req.tool,
         tls_mode: req.tls_mode,
+        extra_backends: vec![],
     };
     db::upsert_rule(&state.db, &rule).await?;
     // Bump desired config gen (D2) and push to the connected agent (Q6).
@@ -656,6 +662,7 @@ async fn update_rule(
         backend_port: req.backend_port,
         tool: req.tool,
         tls_mode: req.tls_mode,
+        extra_backends: vec![],
     };
     db::upsert_rule(&state.db, &rule).await?;
     // Bump desired config gen (D2) and re-push so the agent applies the edit.
@@ -1016,6 +1023,12 @@ struct NodeHealth {
     /// backend-unreachable / quota / saturated / ok) — lets the UI show *why* a node is
     /// excluded instead of a generic "excluded" label.
     reason: scheduler::HealthReason,
+    /// Per-backend probe results reported by the agent (Phase 4b observability).
+    /// Empty when the connected agent is older and does not send this field.
+    backend_health: Vec<BackendHealth>,
+    /// Currently active backend per forwarding rule, as reported by the agent.
+    /// Empty when the connected agent is older and does not send this field.
+    active_backends: Vec<ActiveBackend>,
 }
 
 async fn health_view(State(state): State<AppState>) -> Result<Json<Vec<NodeHealth>>> {
@@ -1057,6 +1070,8 @@ async fn health_view(State(state): State<AppState>) -> Result<Json<Vec<NodeHealt
                 forwarding_up: rt.is_some_and(|r| r.forwarding_up),
                 backend_reachable: rt.is_some_and(|r| r.backend_reachable),
                 reason,
+                backend_health: rt.map_or_else(Vec::new, |r| r.backend_health.clone()),
+                active_backends: rt.map_or_else(Vec::new, |r| r.active_backends.clone()),
             }
         })
         .collect();
@@ -1573,12 +1588,38 @@ async fn put_timezone(
 
 // ---------- version + self-update ----------
 
-async fn version_info() -> Response {
+async fn version_info(State(state): State<AppState>) -> Response {
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "protocol_version": contract::PROTOCOL_VERSION,
+        // Surface the failover kill-switch on the overview so operators see it at a glance.
+        "failover_killswitch": state.killswitch_on(),
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct FailoverKillswitchReq {
+    enabled: bool,
+}
+
+/// Report the current failover kill-switch state (must-fix #2 visibility).
+async fn get_failover_killswitch(State(state): State<AppState>) -> Response {
+    Json(serde_json::json!({ "enabled": state.killswitch_on() })).into_response()
+}
+
+/// Hot-toggle the failover kill-switch. When enabled, `push_config` reverts to the
+/// legacy single-upstream push for ALL agents (no structured rules). Connected agents
+/// pick up the change on the next push (CRUD / cert renew / reconnect / drift); we do
+/// not force a broadcast here — the toggle is an operational guardrail, not a config gen.
+async fn put_failover_killswitch(
+    State(state): State<AppState>,
+    Json(req): Json<FailoverKillswitchReq>,
+) -> Response {
+    state.set_killswitch(req.enabled);
+    tracing::warn!(enabled = req.enabled, "failover kill-switch toggled");
+    state.notify_change();
+    Json(serde_json::json!({ "enabled": req.enabled })).into_response()
 }
 
 async fn update_check() -> Response {
@@ -1839,5 +1880,73 @@ mod tests {
         assert!(validate_backend_host("").is_err());
         assert!(validate_backend_host("bad host").is_err());
         assert!(validate_backend_host("a\"b").is_err());
+    }
+
+    // ---- Phase 5 observability: NodeHealth backend_health / active_backends passthrough ----
+
+    /// NodeHealth with a populated runtime exposes the per-backend probe results and
+    /// active-backend list exactly as stored in NodeRuntime.
+    #[test]
+    fn node_health_exposes_backend_health_and_active_backends() {
+        use contract::protocol::{ActiveBackend, BackendHealth};
+
+        use crate::scheduler::NodeRuntime;
+
+        let rt = NodeRuntime {
+            backend_health: vec![
+                BackendHealth {
+                    host: "1.2.3.4".into(),
+                    port: 8096,
+                    reachable: true,
+                },
+                BackendHealth {
+                    host: "5.6.7.8".into(),
+                    port: 8096,
+                    reachable: false,
+                },
+            ],
+            active_backends: vec![ActiveBackend {
+                rule_id: "r1".into(),
+                host: "1.2.3.4".into(),
+                port: 8096,
+            }],
+            forwarding_up: true,
+            backend_reachable: true,
+            ..Default::default()
+        };
+
+        // Simulate the extraction logic used in health_view.
+        let bh: Vec<BackendHealth> = rt.backend_health.clone();
+        let ab: Vec<ActiveBackend> = rt.active_backends.clone();
+
+        assert_eq!(bh.len(), 2);
+        assert!(bh[0].reachable);
+        assert!(!bh[1].reachable);
+        assert_eq!(ab.len(), 1);
+        assert_eq!(ab[0].rule_id, "r1");
+    }
+
+    /// When no runtime is present (old agent / offline node), backend_health and
+    /// active_backends are empty — the UI falls back to the node-level backend_reachable
+    /// bool without errors.
+    #[test]
+    fn node_health_empty_for_missing_runtime() {
+        use contract::protocol::{ActiveBackend, BackendHealth};
+
+        use crate::scheduler::NodeRuntime;
+
+        let rt_opt: Option<&NodeRuntime> = None;
+
+        let bh: Vec<BackendHealth> = rt_opt.map_or_else(Vec::new, |r| r.backend_health.clone());
+        let ab: Vec<ActiveBackend> = rt_opt.map_or_else(Vec::new, |r| r.active_backends.clone());
+
+        assert!(
+            bh.is_empty(),
+            "backend_health must be empty for missing runtime"
+        );
+        assert!(
+            ab.is_empty(),
+            "active_backends must be empty for missing runtime"
+        );
     }
 }

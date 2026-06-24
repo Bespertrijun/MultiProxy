@@ -10,9 +10,15 @@
 //! A node may have rules for both tools; [`render_node`] returns each side only when
 //! that tool has at least one rule (so `ConfigPush` carries `gost_config`/`realm_config`
 //! as `Some` only when relevant).
+//!
+//! Rendering primitives (`TlsPaths`, `PROD_TLS_CERT_PATH`, `PROD_TLS_KEY_PATH`,
+//! `render_gost`, `render_realm`) live in the shared `relaycfg` crate and are
+//! re-exported here so existing `configgen::TlsPaths` etc. paths continue to work.
 
-use contract::model::{ForwardRule, Protocol, TlsMode, Tool};
+use contract::model::{ForwardRule, Tool};
 use contract::protocol::BackendEndpoint;
+
+pub use relaycfg::{TlsPaths, PROD_TLS_CERT_PATH, PROD_TLS_KEY_PATH};
 
 /// Rendered configs for one node. Either side is `None` when that tool has no rules.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -40,30 +46,6 @@ fn collect_backends(rules: &[ForwardRule]) -> Vec<BackendEndpoint> {
     backends
 }
 
-/// Cert/key paths the agent writes the `ConfigPush` PEMs to, matching the agent's
-/// default `--config-dir /etc/multiproxy` (`agent::config::ConfigPaths::under`). The
-/// rendered gost/realm config MUST reference these exact paths so the relay process
-/// finds the cert the agent just wrote to disk.
-pub const PROD_TLS_CERT_PATH: &str = "/etc/multiproxy/tls.crt";
-pub const PROD_TLS_KEY_PATH: &str = "/etc/multiproxy/tls.key";
-
-/// Optional TLS config paths for injecting into rendered tool configs.
-pub struct TlsPaths {
-    pub cert: String,
-    pub key: String,
-}
-
-impl TlsPaths {
-    /// The standard prod paths (see [`PROD_TLS_CERT_PATH`]).
-    #[must_use]
-    pub fn prod() -> Self {
-        Self {
-            cert: PROD_TLS_CERT_PATH.to_string(),
-            key: PROD_TLS_KEY_PATH.to_string(),
-        }
-    }
-}
-
 /// Render gost + realm configs for a node's rules. Rules are partitioned by `tool`
 /// and sorted by `listen_port` for deterministic output.
 #[must_use]
@@ -84,95 +66,21 @@ pub fn render_node_with_tls(rules: &[ForwardRule], tls: Option<&TlsPaths>) -> Re
         gost_config: if gost_rules.is_empty() {
             None
         } else {
-            Some(render_gost(&gost_rules, tls))
+            Some(relaycfg::render_gost(&gost_rules, tls))
         },
         realm_config: if realm_rules.is_empty() {
             None
         } else {
-            Some(render_realm(&realm_rules, tls))
+            Some(relaycfg::render_realm(&realm_rules, tls))
         },
         backends: collect_backends(rules),
     }
 }
 
-fn proto_token(p: Protocol) -> &'static str {
-    match p {
-        Protocol::Tcp => "tcp",
-        Protocol::Udp => "udp",
-    }
-}
-
-/// Render gost v3 service config as pretty JSON.
-fn render_gost(rules: &[&ForwardRule], tls: Option<&TlsPaths>) -> String {
-    let services: Vec<serde_json::Value> = rules
-        .iter()
-        .map(|r| {
-            let proto = proto_token(r.protocol);
-            let mut listener = serde_json::json!({ "type": proto });
-            if r.tls_mode == TlsMode::Terminate {
-                if let Some(tls) = tls {
-                    listener = serde_json::json!({
-                        "type": "tls",
-                        "tls": {
-                            "certFile": tls.cert,
-                            "keyFile": tls.key
-                        }
-                    });
-                }
-            }
-            serde_json::json!({
-                "name": format!("svc-{}-{}", proto, r.listen_port),
-                "addr": format!(":{}", r.listen_port),
-                "handler": { "type": proto },
-                "listener": listener,
-                "forwarder": {
-                    "nodes": [
-                        {
-                            "name": "target",
-                            "addr": format!("{}:{}", r.backend_host, r.backend_port)
-                        }
-                    ]
-                }
-            })
-        })
-        .collect();
-    let doc = serde_json::json!({ "services": services });
-    serde_json::to_string_pretty(&doc).unwrap_or_default()
-}
-
-/// Render realm endpoint config as TOML `[[endpoints]]` blocks.
-fn render_realm(rules: &[&ForwardRule], tls: Option<&TlsPaths>) -> String {
-    let mut out = String::new();
-    out.push_str("[network]\nno_tcp = false\nuse_udp = true\n");
-    for r in rules {
-        out.push_str("\n[[endpoints]]\n");
-        out.push_str(&format!("listen = \"0.0.0.0:{}\"\n", r.listen_port));
-        out.push_str(&format!(
-            "remote = \"{}:{}\"\n",
-            r.backend_host, r.backend_port
-        ));
-        if r.protocol == Protocol::Udp {
-            out.push_str("udp = true\n");
-        }
-        if r.tls_mode == TlsMode::Terminate {
-            if let Some(tls) = tls {
-                // realm terminates TLS via a Kaminari `listen_transport` string, NOT
-                // standalone `tls_cert`/`tls_key` keys (which realm silently ignores,
-                // leaving a plain-TCP listener → client HTTPS fails). Server-side TLS
-                // is `tls;cert=<path>;key=<path>` (paths have no chars needing escape).
-                out.push_str(&format!(
-                    "listen_transport = \"tls;cert={};key={}\"\n",
-                    tls.cert, tls.key
-                ));
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use contract::model::{Protocol, TlsMode};
 
     fn rule(
         id: &str,
@@ -191,6 +99,7 @@ mod tests {
             backend_port: bport,
             tool,
             tls_mode: TlsMode::Passthrough,
+            extra_backends: vec![],
         }
     }
 
@@ -212,6 +121,7 @@ mod tests {
             backend_port: bport,
             tool,
             tls_mode,
+            extra_backends: vec![],
         }
     }
 

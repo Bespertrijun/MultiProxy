@@ -55,6 +55,11 @@ async fn agent_retries_after_a_dropped_connection() {
                 Message::HelloOk(HelloOk {
                     session: "s".into(),
                     heartbeat_interval_secs: 1,
+                    probe_interval_secs: 5,
+                    probe_timeout_ms: 1000,
+                    failover_max_fails: 3,
+                    failover_recovery_checks: 6,
+                    min_dwell_secs: 60,
                 }),
             )
             .await;

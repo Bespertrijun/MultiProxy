@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use contract::model::{AvailabilityState, FrontNode, LineGroup, NodeStatus, SaturationState};
-use contract::protocol::{Capacity, StatusReport};
+use contract::protocol::{ActiveBackend, BackendHealth, Capacity, StatusReport};
 use contract::snapshot::{
     select_available, AvailabilitySnapshot, ExclusionClass, LineAvailability, NodeClassification,
 };
@@ -46,6 +46,13 @@ pub struct NodeRuntime {
     /// Consecutive-window counters for saturation debounce hysteresis.
     pub sat_enter_windows: u8,
     pub sat_exit_windows: u8,
+    /// Last-reported per-backend probe results (observability only — the DNS gate still
+    /// reads `backend_reachable`, the any-up anchor). Overwritten on every report; a
+    /// report without this field clears it (no carry-over of stale data).
+    pub backend_health: Vec<BackendHealth>,
+    /// Last-reported active backend per rule (observability only). Overwrite semantics
+    /// identical to `backend_health`.
+    pub active_backends: Vec<ActiveBackend>,
 }
 
 /// Compute the freshness window for a heartbeat interval: `2*interval + slack`.
@@ -362,6 +369,11 @@ pub fn apply_status_report(rt: &mut NodeRuntime, report: &StatusReport, now_ms: 
     rt.connected = true;
     rt.forwarding_up = report.forwarding_up;
     rt.backend_reachable = report.backend_reachable;
+    // Overwrite per-backend telemetry on EVERY report: `None` → clear (do not retain the
+    // previous report's list). Observability only; the DNS gate still reads
+    // `backend_reachable` (the any-up anchor is untouched).
+    rt.backend_health = report.backend_health.clone().unwrap_or_default();
+    rt.active_backends = report.active_backends.clone().unwrap_or_default();
 }
 
 /// Shared, atomically-swappable snapshot handle (the scheduler↔resolver coupling
@@ -673,6 +685,78 @@ mod tests {
         rt.capacity.accumulated_usage_bytes = 950; // 95% ≥ 90% soft, < 100% hard
         let class = classify_node(&n, &rt, 1000, 20);
         assert_eq!(class, ExclusionClass::SoftQuota);
+    }
+
+    #[test]
+    fn status_report_ingest_overwrites_and_clears_telemetry() {
+        use contract::protocol::{ActiveBackend, BackendHealth};
+
+        let mut rt = NodeRuntime::default();
+        let report_with = StatusReport {
+            forwarding_up: true,
+            backend_reachable: true,
+            applied_config_gen: 1,
+            metrics: None,
+            capacity: None,
+            backend_health: Some(vec![BackendHealth {
+                host: "10.0.0.1".into(),
+                port: 8096,
+                reachable: true,
+            }]),
+            active_backends: Some(vec![ActiveBackend {
+                rule_id: "r1".into(),
+                host: "10.0.0.1".into(),
+                port: 8096,
+            }]),
+        };
+        apply_status_report(&mut rt, &report_with, 1000);
+        assert_eq!(rt.backend_health.len(), 1);
+        assert_eq!(rt.active_backends.len(), 1);
+
+        // A subsequent report WITHOUT the fields must CLEAR them (no carry-over).
+        let report_without = StatusReport {
+            forwarding_up: true,
+            backend_reachable: true,
+            applied_config_gen: 1,
+            metrics: None,
+            capacity: None,
+            backend_health: None,
+            active_backends: None,
+        };
+        apply_status_report(&mut rt, &report_without, 2000);
+        assert!(
+            rt.backend_health.is_empty(),
+            "backend_health must be cleared"
+        );
+        assert!(
+            rt.active_backends.is_empty(),
+            "active_backends must be cleared"
+        );
+        // The DNS-gate anchor is untouched (still reads backend_reachable).
+        assert!(rt.backend_reachable);
+    }
+
+    #[test]
+    fn health_reason_ignores_backend_telemetry_partial_failure() {
+        use contract::protocol::BackendHealth;
+
+        // Multiple replicas, some down, but the agent's any-up `backend_reachable` is
+        // true → health_reason stays Ok (we must NOT drop the node from DNS).
+        let n = node("n1", "1.2.3.4", None);
+        let mut rt = healthy_rt(1000);
+        rt.backend_health = vec![
+            BackendHealth {
+                host: "10.0.0.1".into(),
+                port: 8096,
+                reachable: false,
+            },
+            BackendHealth {
+                host: "10.0.0.2".into(),
+                port: 8096,
+                reachable: true,
+            },
+        ];
+        assert_eq!(health_reason(&n, &rt, 1000, 20), HealthReason::Ok);
     }
 
     #[test]
