@@ -268,6 +268,10 @@ fn select_apply_push(
     push: &ConfigPush,
 ) -> (ConfigPush, Option<Vec<BackendEndpoint>>) {
     failover.set_rules(&push.rules);
+    // Gate TLS rendering on actual cert availability (mirrors the panel's
+    // render_node_with_tls): a terminate rule with no cert must render plain TCP,
+    // not a TLS listener pointing at a missing/stale local cert file.
+    failover.set_tls_available(push.tls_cert_pem.is_some() && push.tls_key_pem.is_some());
 
     if failover.is_active() {
         let (gost_config, realm_config) = failover.render_active_config();

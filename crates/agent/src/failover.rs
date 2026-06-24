@@ -146,6 +146,13 @@ pub struct FailoverEngine {
     /// Lookup from rule_id → index in `rules` (rebuilt on each push).
     by_id: HashMap<String, usize>,
     tls: TlsPaths,
+    /// Whether a usable relay cert is currently available (the last `ConfigPush`
+    /// carried `tls_cert_pem`+`tls_key_pem`). Mirrors the panel's rule: a
+    /// `tls_mode=terminate` listener is rendered with TLS ONLY when a cert exists;
+    /// otherwise it renders plain TCP (else the relay references a missing/stale
+    /// cert file and fails to start). Persists across probe-tick re-renders until
+    /// the next push updates it.
+    tls_available: bool,
 }
 
 /// The outcome of one probe-cycle decision: whether a restart is needed and the
@@ -170,7 +177,15 @@ impl FailoverEngine {
                 cert: paths.tls_cert.to_string_lossy().into_owned(),
                 key: paths.tls_key.to_string_lossy().into_owned(),
             },
+            tls_available: false,
         }
+    }
+
+    /// Record whether a relay cert is currently available (set from each
+    /// `ConfigPush`'s `tls_cert_pem`+`tls_key_pem` presence). Gates TLS rendering
+    /// so the engine never emits a TLS listener pointing at a missing cert.
+    pub fn set_tls_available(&mut self, available: bool) {
+        self.tls_available = available;
     }
 
     /// Whether the engine has rules to manage (i.e. the panel pushed structured
@@ -360,15 +375,22 @@ impl FailoverEngine {
         gost_rules.sort_by_key(|r| r.listen_port);
         realm_rules.sort_by_key(|r| r.listen_port);
 
+        // Inject TLS only when a cert is actually available — matches the panel's
+        // `render_node_with_tls` (cert present ⇒ TLS listener; absent ⇒ plain TCP).
+        let tls = if self.tls_available {
+            Some(&self.tls)
+        } else {
+            None
+        };
         let gost_config = if gost_rules.is_empty() {
             None
         } else {
-            Some(relaycfg::render_gost(&gost_rules, Some(&self.tls)))
+            Some(relaycfg::render_gost(&gost_rules, tls))
         };
         let realm_config = if realm_rules.is_empty() {
             None
         } else {
-            Some(relaycfg::render_realm(&realm_rules, Some(&self.tls)))
+            Some(relaycfg::render_realm(&realm_rules, tls))
         };
         (gost_config, realm_config)
     }
@@ -460,6 +482,38 @@ mod tests {
         let mut e = FailoverEngine::new(&ConfigPaths::under("/tmp/fo-test"));
         e.set_rules(&rules);
         e
+    }
+
+    #[test]
+    fn render_gates_tls_on_cert_availability() {
+        // A terminate rule must render a TLS listener ONLY when a cert is available,
+        // else plain TCP — mirroring the panel's render_node_with_tls. Otherwise the
+        // engine would emit a TLS listener pointing at a missing/stale local cert and
+        // the relay would fail to start (Codex review regression).
+        let rule = RuleSpec {
+            rule_id: "r1".into(),
+            listen_port: 443,
+            protocol: Protocol::Tcp,
+            tls_mode: TlsMode::Terminate,
+            tool: ModelTool::Gost,
+            backends: vec![ep("10.0.0.1", 8096)],
+        };
+        let mut e = engine_with(vec![rule]);
+
+        // No cert → plain TCP (no TLS listener referencing a missing cert file).
+        e.set_tls_available(false);
+        let (gost_no_tls, _) = e.render_active_config();
+        let g = gost_no_tls.expect("gost config");
+        assert!(
+            !g.contains("certFile"),
+            "no cert ⇒ must not render a TLS listener: {g}"
+        );
+
+        // Cert available → TLS listener rendered.
+        e.set_tls_available(true);
+        let (gost_tls, _) = e.render_active_config();
+        let g = gost_tls.expect("gost config");
+        assert!(g.contains("certFile"), "cert present ⇒ TLS listener: {g}");
     }
 
     // Drive a rule's single endpoint through a sequence of probe results without a
