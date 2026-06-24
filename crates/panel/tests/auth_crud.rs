@@ -390,3 +390,101 @@ async fn change_password_works() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// Blocker #2: a rule created with `extra_backends` must persist and read back, and a
+/// plain `update_rule` that does NOT send the field must NOT wipe the existing copies
+/// (regression guard against the previous hardcoded `extra_backends: vec![]`).
+#[tokio::test]
+async fn rule_extra_backends_persist_and_survive_plain_edit() {
+    let (base, client) = boot().await;
+    login(&base, &client).await;
+
+    let node: serde_json::Value = client
+        .post(format!("{base}/api/nodes"))
+        .json(&serde_json::json!({"name":"n","public_ip":"9.9.9.9"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let node_id = node["node"]["id"].as_str().unwrap().to_string();
+
+    // Create a rule WITH extra_backends (multi-replica failover via the API).
+    let rule: serde_json::Value = client
+        .post(format!("{base}/api/rules"))
+        .json(&serde_json::json!({
+            "node_id": node_id, "listen_port": 8443, "protocol":"tcp",
+            "backend_host":"10.0.0.1","backend_port":8096,"tool":"gost",
+            "extra_backends":[{"host":"10.0.0.2","port":8096},{"host":"10.0.0.3","port":8097}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rule_id = rule["id"].as_str().unwrap().to_string();
+    // Returned + persisted with both standby replicas.
+    let extra = rule["extra_backends"].as_array().unwrap();
+    assert_eq!(extra.len(), 2, "create must persist extra_backends");
+    assert_eq!(extra[0]["host"], "10.0.0.2");
+    assert_eq!(extra[0]["port"], 8096);
+    assert_eq!(extra[1]["host"], "10.0.0.3");
+    assert_eq!(extra[1]["port"], 8097);
+
+    // Read back from the list endpoint to confirm DB persistence.
+    let rules: serde_json::Value = client
+        .get(format!("{base}/api/rules"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let stored = &rules.as_array().unwrap()[0];
+    assert_eq!(stored["extra_backends"].as_array().unwrap().len(), 2);
+
+    // Plain edit that does NOT send extra_backends (e.g. only changing the port) must
+    // PRESERVE the existing replicas (regression: previously update wiped them to []).
+    let updated: serde_json::Value = client
+        .put(format!("{base}/api/rules/{rule_id}"))
+        .json(&serde_json::json!({
+            "node_id": node_id, "listen_port": 9443, "protocol":"tcp",
+            "backend_host":"10.0.0.1","backend_port":8096,"tool":"gost"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(updated["listen_port"], 9443, "the edit took effect");
+    assert_eq!(
+        updated["extra_backends"].as_array().unwrap().len(),
+        2,
+        "a plain edit must NOT drop the existing extra_backends"
+    );
+
+    // An EXPLICIT empty list DOES clear them (Some([]) overwrites).
+    let cleared: serde_json::Value = client
+        .put(format!("{base}/api/rules/{rule_id}"))
+        .json(&serde_json::json!({
+            "node_id": node_id, "listen_port": 9443, "protocol":"tcp",
+            "backend_host":"10.0.0.1","backend_port":8096,"tool":"gost",
+            "extra_backends":[]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        cleared["extra_backends"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true),
+        "an explicit empty list clears the replicas"
+    );
+}

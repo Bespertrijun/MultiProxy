@@ -578,6 +578,15 @@ struct CreateRuleReq {
     tool: contract::model::Tool,
     #[serde(default)]
     tls_mode: TlsMode,
+    /// Optional additional standby backends `[standby, ...]` appended after the
+    /// primary (`backend_host:backend_port`) to form the rule's ordered replica
+    /// list. `None` (field omitted) means "don't touch": on **create** it yields an
+    /// empty list; on **update** it preserves the rule's existing replicas so a
+    /// plain edit by a client that doesn't send the field never silently wipes
+    /// failover copies. `Some([..])` explicitly overwrites the list (incl. `Some([])`
+    /// to clear it).
+    #[serde(default)]
+    extra_backends: Option<Vec<contract::protocol::BackendEndpoint>>,
 }
 
 /// Validate a `backend_host` against a safe charset before it is hand-written into the
@@ -619,12 +628,25 @@ fn validate_backend_host(host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate every additional standby backend's host with the same charset rule as
+/// the primary (defense-in-depth: these are also hand-written into the rendered
+/// tool config and probed by the agent).
+fn validate_extra_backends(extra: &[contract::protocol::BackendEndpoint]) -> Result<()> {
+    for ep in extra {
+        validate_backend_host(&ep.host)?;
+    }
+    Ok(())
+}
+
 async fn create_rule(
     State(state): State<AppState>,
     Json(req): Json<CreateRuleReq>,
 ) -> Result<Json<ForwardRule>> {
     db::get_node(&state.db, &req.node_id).await?; // FK check
     validate_backend_host(&req.backend_host)?;
+    // On create, an omitted field (`None`) means no standby replicas.
+    let extra_backends = req.extra_backends.unwrap_or_default();
+    validate_extra_backends(&extra_backends)?;
     let rule = ForwardRule {
         id: auth::new_token(),
         node_id: req.node_id.clone(),
@@ -634,7 +656,7 @@ async fn create_rule(
         backend_port: req.backend_port,
         tool: req.tool,
         tls_mode: req.tls_mode,
-        extra_backends: vec![],
+        extra_backends,
     };
     db::upsert_rule(&state.db, &rule).await?;
     // Bump desired config gen (D2) and push to the connected agent (Q6).
@@ -653,6 +675,22 @@ async fn update_rule(
 ) -> Result<Json<ForwardRule>> {
     db::get_node(&state.db, &req.node_id).await?; // FK check
     validate_backend_host(&req.backend_host)?;
+    // Preserve existing replicas unless the request explicitly provides the field:
+    //   * `Some([..])` → overwrite (incl. `Some([])` to clear);
+    //   * `None`       → keep the rule's current `extra_backends` so a plain edit
+    //     never silently wipes failover copies (regression guard).
+    let extra_backends = match req.extra_backends {
+        Some(extra) => {
+            validate_extra_backends(&extra)?;
+            extra
+        }
+        None => db::list_rules(&state.db)
+            .await?
+            .into_iter()
+            .find(|r| r.id == id)
+            .map(|r| r.extra_backends)
+            .unwrap_or_default(),
+    };
     let rule = ForwardRule {
         id,
         node_id: req.node_id.clone(),
@@ -662,7 +700,7 @@ async fn update_rule(
         backend_port: req.backend_port,
         tool: req.tool,
         tls_mode: req.tls_mode,
-        extra_backends: vec![],
+        extra_backends,
     };
     db::upsert_rule(&state.db, &rule).await?;
     // Bump desired config gen (D2) and re-push so the agent applies the edit.

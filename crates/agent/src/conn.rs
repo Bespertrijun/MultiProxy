@@ -238,6 +238,67 @@ fn apply_failover_switch<S, C, P>(
     }
 }
 
+/// Decide, for an inbound [`ConfigPush`], which config bytes the agent writes to
+/// disk + supervises, and which flat backend list it should probe next. Pure
+/// (modulo mutating the engine's rule set): no I/O, so it is directly unit-testable.
+///
+/// Adopting the rules first is load-bearing: an EMPTY `push.rules` clears the engine
+/// → [`FailoverEngine::is_active`] flips to `false` → the caller's `probe_tick` arm
+/// stops switching locally → a panel kill-switch (or an older panel that never sends
+/// rules) genuinely halts local failover. A NON-EMPTY `push.rules` arms/refreshes the
+/// engine (reusing per-replica hysteresis for unchanged rules).
+///
+/// Returns `(apply_push, flat_backends)` where `flat_backends` is the NEW flat probe
+/// target, or `None` to mean "keep the prior list" (caller leaves `deps.backends`
+/// untouched):
+///   * **engine ACTIVE** (rules non-empty) → `apply_push` is rendered from the engine's
+///     CURRENT active selection (NOT the panel's primary-only string), so a node that
+///     has already failed over to a standby is not shoved back to its primary by an
+///     unrelated re-push (e.g. a cert renewal); the push's cert + `desired_gen` are
+///     carried through, `rules`/`backends` cleared. On the very first push the engine's
+///     active is the primary (index 0, optimistically up) → bytes match today's
+///     first-push behavior. `flat_backends` = `Some(`deduped union of all rule backends`)`.
+///   * **engine INACTIVE** (rules empty) → legacy single-upstream path: `apply_push` is
+///     the panel's main-upstream string verbatim (kill-switch / older-agent route);
+///     `flat_backends` tracks `push.backends`, or clears when there is genuinely no
+///     config, or `None` (keep prior seed) for a pre-this-version panel that can't send
+///     backends but does send a config.
+fn select_apply_push(
+    failover: &mut FailoverEngine,
+    push: &ConfigPush,
+) -> (ConfigPush, Option<Vec<BackendEndpoint>>) {
+    failover.set_rules(&push.rules);
+
+    if failover.is_active() {
+        let (gost_config, realm_config) = failover.render_active_config();
+        let apply_push = ConfigPush {
+            desired_gen: push.desired_gen,
+            gost_config,
+            realm_config,
+            tls_cert_pem: push.tls_cert_pem.clone(),
+            tls_key_pem: push.tls_key_pem.clone(),
+            backends: Vec::new(),
+            rules: Vec::new(),
+        };
+        (apply_push, Some(failover.flat_backends()))
+    } else {
+        // A new panel always sends a non-empty `backends` when there are rules (empty
+        // config ⟺ no rules), so for the flat probe target:
+        //   * non-empty           → adopt the pushed backends;
+        //   * empty + no config   → genuinely no rules → clear;
+        //   * empty + has config  → a pre-this-version panel that can't send backends
+        //     → keep the prior seed (don't blank health).
+        let flat = if !push.backends.is_empty() {
+            Some(push.backends.clone())
+        } else if push.gost_config.is_none() && push.realm_config.is_none() {
+            Some(Vec::new())
+        } else {
+            None
+        };
+        (push.clone(), flat)
+    }
+}
+
 /// Run one connected session until it ends. The handshake (`Hello` → wait for
 /// `HelloOk`/`AuthReject`) happens here, then the heartbeat/report/config loop.
 ///
@@ -411,28 +472,15 @@ where
             msg = stream.next() => {
                 match decode_next(msg) {
                     DecodeResult::Message(Message::ConfigPush(push)) => {
-                        // Adopt structured rules (Phase 4a). When present, the failover
-                        // engine owns the per-rule active-backend selection and we probe
-                        // the rules' replicas; flat `deps.backends` is backfilled from
-                        // the union of all rule backends so the legacy any-up path (and
-                        // older panels reading `backend_reachable`) does not regress.
-                        // When absent (older panel / no rules), the engine stays empty
-                        // and we keep today's flat-backend behavior verbatim.
-                        if !push.rules.is_empty() {
-                            failover.set_rules(&push.rules);
-                            deps.backends = failover.flat_backends();
-                        } else if !push.backends.is_empty() {
-                            // Track the real backends so the next health probe targets them.
-                            // A new panel always sends a non-empty `backends` when there are
-                            // rules (empty config ⟺ no rules), so:
-                            //   * non-empty           → adopt the pushed backends;
-                            //   * empty + no config   → genuinely no rules → clear;
-                            //   * empty + has config  → a pre-this-version panel that can't
-                            //     send backends → keep the fallback seed (don't blank health).
-                            deps.backends = push.backends.clone();
-                        } else if push.gost_config.is_none() && push.realm_config.is_none() {
-                            deps.backends.clear();
+                        // Select the bytes that actually hit disk + supervisor (pure decision,
+                        // see `select_apply_push`), then reset the stale per-replica health
+                        // snapshot so the next probe cycle re-populates it.
+                        let (apply_push, new_backends) =
+                            select_apply_push(&mut failover, &push);
+                        if let Some(backends) = new_backends {
+                            deps.backends = backends;
                         }
+                        last_health = None;
                         eprintln!(
                             "config: gen={} backend probe target(s)=[{}]",
                             push.desired_gen,
@@ -442,7 +490,7 @@ where
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         );
-                        let ack = match config::apply(&push, &cfg.config_paths) {
+                        let ack = match config::apply(&apply_push, &cfg.config_paths) {
                             Ok(ApplyOutcome::Start(applied)) => {
                                 let start = deps.supervisor.start(applied.tool, applied.config_path);
                                 match start {
@@ -651,6 +699,196 @@ mod tests {
         let a = new_msg_id();
         let b = new_msg_id();
         assert_ne!(a, b);
+    }
+
+    fn ep(host: &str, port: u16) -> BackendEndpoint {
+        BackendEndpoint {
+            host: host.into(),
+            port,
+        }
+    }
+
+    fn rule_spec(
+        id: &str,
+        port: u16,
+        backends: Vec<BackendEndpoint>,
+    ) -> contract::protocol::RuleSpec {
+        contract::protocol::RuleSpec {
+            rule_id: id.into(),
+            listen_port: port,
+            protocol: contract::model::Protocol::Tcp,
+            tls_mode: contract::model::TlsMode::Passthrough,
+            tool: contract::model::Tool::Gost,
+            backends,
+        }
+    }
+
+    /// Per-endpoint controllable probe (host:port keyed) so a test can fail a
+    /// specific replica and drive the engine to a standby deterministically — with
+    /// no timer (we call `probe_and_decide` directly).
+    #[derive(Clone, Default)]
+    struct MapProbe {
+        down: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    }
+    impl MapProbe {
+        fn key(e: &BackendEndpoint) -> String {
+            format!("{}:{}", e.host, e.port)
+        }
+        fn set_down(&self, e: &BackendEndpoint, down: bool) {
+            let mut g = self.down.lock().unwrap();
+            if down {
+                g.insert(Self::key(e));
+            } else {
+                g.remove(&Self::key(e));
+            }
+        }
+    }
+    impl crate::selfheal::BackendProbe for MapProbe {
+        async fn reachable_each(
+            &self,
+            targets: &[BackendEndpoint],
+        ) -> Vec<contract::protocol::BackendHealth> {
+            let g = self.down.lock().unwrap();
+            targets
+                .iter()
+                .map(|t| contract::protocol::BackendHealth {
+                    host: t.host.clone(),
+                    port: t.port,
+                    reachable: !g.contains(&Self::key(t)),
+                })
+                .collect()
+        }
+    }
+
+    fn tunables_max_fails_1() -> FailoverTunables {
+        FailoverTunables {
+            probe_interval: Duration::from_secs(5),
+            probe_timeout: Duration::from_millis(100),
+            max_fails: 1,
+            recovery_checks: 1,
+            min_dwell: Duration::from_secs(0),
+        }
+    }
+
+    fn push_with_rules(
+        desired_gen: u64,
+        gost_config: Option<String>,
+        backends: Vec<BackendEndpoint>,
+        rules: Vec<contract::protocol::RuleSpec>,
+    ) -> ConfigPush {
+        ConfigPush {
+            desired_gen,
+            gost_config,
+            realm_config: None,
+            tls_cert_pem: None,
+            tls_key_pem: None,
+            backends,
+            rules,
+        }
+    }
+
+    // Kill-switch / empty-rules push: the engine clears (is_active=false) and the
+    // panel's main-upstream string is what hits disk verbatim (local failover off).
+    #[test]
+    fn select_apply_push_empty_rules_is_killswitch_and_applies_panel_string() {
+        let paths = ConfigPaths::under("/tmp/conn-killswitch-test");
+        let mut failover = FailoverEngine::new(&paths);
+
+        // First arm the engine with a rule so it is active...
+        let armed = push_with_rules(
+            1,
+            Some("{\"services\":[{\"name\":\"engine-rendered\"}]}".into()),
+            vec![ep("10.0.0.1", 8096)],
+            vec![rule_spec("r1", 8080, vec![ep("10.0.0.1", 8096)])],
+        );
+        let _ = select_apply_push(&mut failover, &armed);
+        assert!(failover.is_active(), "engine armed by the first push");
+
+        // ...then a kill-switch push with rules=[] but a panel main-upstream string.
+        let panel_string = "{\"services\":[{\"name\":\"PANEL-KILLSWITCH-VERBATIM\"}]}".to_string();
+        let killswitch = push_with_rules(
+            2,
+            Some(panel_string.clone()),
+            vec![ep("10.0.0.1", 8096)],
+            vec![],
+        );
+        let (apply_push, flat) = select_apply_push(&mut failover, &killswitch);
+
+        assert!(
+            !failover.is_active(),
+            "empty rules clear the engine → local failover halted (kill-switch works)"
+        );
+        assert_eq!(
+            apply_push.gost_config.as_deref(),
+            Some(panel_string.as_str()),
+            "kill-switch applies the panel's main-upstream string verbatim, not an engine render"
+        );
+        // Legacy path tracks the pushed flat backends for the any-up probe.
+        assert_eq!(flat, Some(vec![ep("10.0.0.1", 8096)]));
+    }
+
+    // After a failover to the standby, an IDENTICAL re-push (e.g. cert renewal) must
+    // write the engine's CURRENT active (standby) to disk — never shove it back to the
+    // primary.
+    #[tokio::test]
+    async fn select_apply_push_repush_reflects_current_active_not_primary() {
+        let paths = ConfigPaths::under("/tmp/conn-repush-test");
+        let mut failover = FailoverEngine::new(&paths);
+        let rules = vec![rule_spec(
+            "r1",
+            8080,
+            vec![ep("10.0.0.1", 8096), ep("10.0.0.2", 8096)],
+        )];
+
+        // First push arms the engine; active = primary (index 0).
+        let first = push_with_rules(
+            1,
+            Some("panel-primary-string".into()),
+            vec![ep("10.0.0.1", 8096), ep("10.0.0.2", 8096)],
+            rules.clone(),
+        );
+        let (apply_first, _) = select_apply_push(&mut failover, &first);
+        let g0 = apply_first
+            .gost_config
+            .expect("gost rendered on first push");
+        assert!(
+            g0.contains("10.0.0.1:8096"),
+            "first push serves the primary"
+        );
+        assert!(!g0.contains("10.0.0.2"), "standby not yet active");
+
+        // Drive a real failover to the standby (primary down) via the engine — no timer.
+        let t = tunables_max_fails_1();
+        let probe = MapProbe::default();
+        probe.set_down(&ep("10.0.0.1", 8096), true);
+        let (decision, _h) = failover.probe_and_decide(&probe, &t).await;
+        assert!(decision.changed, "primary down → switched to standby");
+
+        // An IDENTICAL re-push (same rules) — simulates a cert-renewal / unrelated push.
+        let repush = push_with_rules(
+            2,
+            Some("panel-primary-string".into()),
+            vec![ep("10.0.0.1", 8096), ep("10.0.0.2", 8096)],
+            rules.clone(),
+        );
+        let (apply_repush, _) = select_apply_push(&mut failover, &repush);
+        let g1 = apply_repush
+            .gost_config
+            .clone()
+            .expect("gost rendered on re-push");
+        assert!(
+            g1.contains("10.0.0.2:8096"),
+            "re-push must reflect the engine's CURRENT active (standby), not the primary"
+        );
+        assert!(
+            !g1.contains("10.0.0.1"),
+            "the failed-over primary must NOT be shoved back as the upstream"
+        );
+        assert_ne!(
+            apply_repush.gost_config.as_deref(),
+            Some("panel-primary-string"),
+            "the panel's primary-only string is NOT what gets written while active"
+        );
     }
 
     #[test]

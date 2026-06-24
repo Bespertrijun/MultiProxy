@@ -865,6 +865,15 @@ tailwind.config = {
           <p id="tlsModeHint" class="text-xs text-panel-400 mt-1">直接转发流量，不处理加密。适用于后端已有 HTTPS 的情况（推荐）</p>
         </div>
       </div>
+      <div>
+        <div class="flex items-center justify-between mb-1">
+          <label class="block text-xs text-panel-300 uppercase tracking-wider">附加副本后端（故障转移）</label>
+          <button type="button" onclick="addExtraBackendRow()"
+            class="text-xs text-blue-400 hover:text-blue-300">+ 添加副本</button>
+        </div>
+        <div id="extraBackendsList" class="space-y-2"></div>
+        <p class="text-xs text-panel-400 mt-1">主后端不可达时按顺序切换到这些副本（host + 端口）。</p>
+      </div>
     </div>
     <div class="flex justify-end gap-2 px-5 py-4 border-t border-panel-500">
       <button onclick="closeModal('addRuleModal')"
@@ -2337,6 +2346,33 @@ function clearNodeForm() {
 // null = create mode; a rule id = editing that rule in place.
 var _editingRuleId = null;
 
+// Append one host:port input row to the extra-backends list. Optional initial values
+// are used when editing an existing rule (回填当前副本).
+function addExtraBackendRow(host, port) {
+  var list = document.getElementById('extraBackendsList');
+  var row = document.createElement('div');
+  row.className = 'flex items-center gap-2 extra-backend-row';
+  row.innerHTML =
+    '<input type="text" placeholder="192.168.1.101" value="' + esc(host || '') + '" ' +
+      'class="extra-backend-host flex-1 bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />' +
+    '<input type="number" placeholder="8096" value="' + (port != null ? esc(String(port)) : '') + '" ' +
+      'class="extra-backend-port w-28 bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />' +
+    '<button type="button" class="text-panel-400 hover:text-red-400 text-lg px-1">&times;</button>';
+  row.querySelector('button').onclick = function() { row.remove(); };
+  list.appendChild(row);
+}
+
+// Collect the extra-backend rows into a [{host, port}] array, skipping empty rows.
+function collectExtraBackends() {
+  var out = [];
+  document.querySelectorAll('#extraBackendsList .extra-backend-row').forEach(function(row) {
+    var host = row.querySelector('.extra-backend-host').value.trim();
+    var port = row.querySelector('.extra-backend-port').value;
+    if (host && port) out.push({ host: host, port: parseInt(port, 10) });
+  });
+  return out;
+}
+
 function resetRuleForm() {
   document.getElementById('addRulePort').value = '';
   document.getElementById('addRuleHost').value = '';
@@ -2344,6 +2380,7 @@ function resetRuleForm() {
   document.getElementById('addRuleProto').value = 'tcp';
   document.getElementById('addRuleTool').value = 'gost';
   document.getElementById('addRuleTlsMode').value = 'passthrough';
+  document.getElementById('extraBackendsList').innerHTML = '';
 }
 
 function openAddRule() {
@@ -2368,6 +2405,9 @@ function openEditRule(id) {
   document.getElementById('addRuleBackPort').value = r.backend_port;
   document.getElementById('addRuleTool').value = r.tool;
   document.getElementById('addRuleTlsMode').value = r.tls_mode;
+  // 回填当前副本后端 so a plain edit re-submits them and never wipes failover copies.
+  document.getElementById('extraBackendsList').innerHTML = '';
+  (r.extra_backends || []).forEach(function(b) { addExtraBackendRow(b.host, b.port); });
   // Node is fixed when editing (changing it would orphan the rule on the old node).
   setTimeout(function() {
     var sel = document.getElementById('addRuleNode');
@@ -2389,7 +2429,10 @@ async function saveRule() {
     backend_host: host,
     backend_port: parseInt(bport, 10),
     tool: document.getElementById('addRuleTool').value,
-    tls_mode: document.getElementById('addRuleTlsMode').value
+    tls_mode: document.getElementById('addRuleTlsMode').value,
+    // Always send the (possibly empty) replica list so editing reflects the form
+    // exactly: removed rows clear, kept rows preserve their failover copies.
+    extra_backends: collectExtraBackends()
   };
 
   try {

@@ -316,6 +316,17 @@ impl FailoverEngine {
         }
     }
 
+    /// Public wrapper over [`Self::render_active`]: render the node's
+    /// single-upstream config from the engine's **current active selection** per
+    /// rule. Used by the inbound ConfigPush handler so the bytes written to disk
+    /// reflect the engine's active replica (not the panel's primary-only string),
+    /// which keeps a failed-over node from being shoved back to its primary on an
+    /// unrelated re-push (e.g. cert renewal).
+    #[must_use]
+    pub fn render_active_config(&self) -> (Option<String>, Option<String>) {
+        self.render_active()
+    }
+
     /// Render the whole node's single-upstream config from each rule's active
     /// backend. Mirrors the panel's `configgen::render_node_with_tls` (gost/realm
     /// split, sorted by listen port, TLS paths) so the bytes match the panel path.
