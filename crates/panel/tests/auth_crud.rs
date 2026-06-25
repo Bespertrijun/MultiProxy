@@ -332,6 +332,89 @@ async fn rule_rejects_unsafe_backend_host() {
     assert_eq!(r.status(), StatusCode::OK);
 }
 
+/// Same-node `(listen_port, protocol)` must be unique: a second rule (esp. the
+/// other tool) on the same TCP port is rejected, but the same port on a different
+/// protocol is allowed, and re-saving the SAME rule on its own port is allowed.
+#[tokio::test]
+async fn duplicate_listen_port_on_node_is_rejected() {
+    let (base, client) = boot().await;
+    login(&base, &client).await;
+
+    let node: serde_json::Value = client
+        .post(format!("{base}/api/nodes"))
+        .json(&serde_json::json!({"name":"n","public_ip":"9.9.9.9"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let node_id = node["node"]["id"].as_str().unwrap().to_string();
+
+    // First rule on 8443/tcp via gost → OK.
+    let first: serde_json::Value = client
+        .post(format!("{base}/api/rules"))
+        .json(&serde_json::json!({
+            "node_id": node_id, "listen_port": 8443, "protocol":"tcp",
+            "backend_host":"10.0.0.1","backend_port":8096,"tool":"gost"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first_id = first["id"].as_str().unwrap().to_string();
+
+    // Second rule on the SAME 8443/tcp via the OTHER tool → 400 (would EADDRINUSE).
+    let dup = client
+        .post(format!("{base}/api/rules"))
+        .json(&serde_json::json!({
+            "node_id": node_id, "listen_port": 8443, "protocol":"tcp",
+            "backend_host":"10.0.0.2","backend_port":8096,"tool":"realm"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        dup.status(),
+        StatusCode::BAD_REQUEST,
+        "same node + same listen_port/protocol must be rejected"
+    );
+
+    // Same port but UDP → OK (distinct socket).
+    let udp = client
+        .post(format!("{base}/api/rules"))
+        .json(&serde_json::json!({
+            "node_id": node_id, "listen_port": 8443, "protocol":"udp",
+            "backend_host":"10.0.0.2","backend_port":8096,"tool":"realm"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        udp.status(),
+        StatusCode::OK,
+        "same port, different protocol is fine"
+    );
+
+    // Re-saving the SAME rule on its own port (excludes self) → OK.
+    let resave = client
+        .put(format!("{base}/api/rules/{first_id}"))
+        .json(&serde_json::json!({
+            "node_id": node_id, "listen_port": 8443, "protocol":"tcp",
+            "backend_host":"10.0.0.1","backend_port":8096,"tool":"gost"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resave.status(),
+        StatusCode::OK,
+        "editing a rule without changing its port must not conflict with itself"
+    );
+}
+
 #[tokio::test]
 async fn change_password_works() {
     let (base, client) = boot().await;

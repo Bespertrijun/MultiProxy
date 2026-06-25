@@ -253,7 +253,11 @@ impl FailoverEngine {
         tunables: &FailoverTunables,
     ) -> (FailoverDecision, Vec<BackendHealth>) {
         let mut all_health: Vec<BackendHealth> = Vec::new();
-        let mut changed = false;
+        // Track which TOOLS had a rule switch this cycle. Only the changed tool(s)
+        // are re-rendered + restarted, so a gost-rule failover never bounces a
+        // healthy realm relay (and vice versa) on a mixed-tool node.
+        let mut gost_changed = false;
+        let mut realm_changed = false;
 
         for rs in &mut self.rules {
             rs.ticks_since_switch = rs.ticks_since_switch.saturating_add(1);
@@ -267,16 +271,22 @@ impl FailoverEngine {
             all_health.extend(health);
 
             if Self::reselect(rs, tunables) {
-                changed = true;
+                match rs.spec.tool {
+                    ModelTool::Gost => gost_changed = true,
+                    ModelTool::Realm => realm_changed = true,
+                }
             }
         }
 
-        let decision = if changed {
-            let (gost_config, realm_config) = self.render_active();
+        let decision = if gost_changed || realm_changed {
+            // render_active splits the whole node by tool; keep only the side(s)
+            // whose active selection actually moved (the other side's bytes are
+            // unchanged, so restarting it would needlessly drop live connections).
+            let (gost_full, realm_full) = self.render_active();
             FailoverDecision {
                 changed: true,
-                gost_config,
-                realm_config,
+                gost_config: if gost_changed { gost_full } else { None },
+                realm_config: if realm_changed { realm_full } else { None },
             }
         } else {
             FailoverDecision::default()
@@ -871,6 +881,32 @@ mod tests {
         let ab = e.active_backends();
         assert_eq!(ab[0].host, "10.0.0.2", "r1 failed over to its standby");
         assert_eq!(ab[1].host, "10.0.1.1", "r2 untouched, still on its primary");
+    }
+
+    #[tokio::test]
+    async fn mixed_tool_node_failover_renders_only_the_changed_tool() {
+        // A node with a gost rule AND a realm rule. Fail only the gost rule's
+        // primary: the decision must carry a fresh gost_config but leave
+        // realm_config = None (realm's selection didn't move → don't bounce it).
+        let t = tunables(1, 1, 0, 5);
+        let gost_rule = spec("g1", 8080, vec![ep("10.0.0.1", 8096), ep("10.0.0.2", 8096)]);
+        let mut realm_rule = spec("r1", 9090, vec![ep("10.0.1.1", 8096), ep("10.0.1.2", 8096)]);
+        realm_rule.tool = ModelTool::Realm;
+        let mut e = engine_with(vec![gost_rule, realm_rule]);
+
+        let probe = MapProbe::default();
+        probe.set_down(&ep("10.0.0.1", 8096), true); // only the gost primary
+
+        let (decision, _h) = e.probe_and_decide(&probe, &t).await;
+        assert!(decision.changed, "gost rule failed over");
+        let g = decision
+            .gost_config
+            .expect("gost re-rendered to its standby");
+        assert!(g.contains("10.0.0.2:8096"), "gost now on its standby");
+        assert!(
+            decision.realm_config.is_none(),
+            "realm unchanged → not re-rendered → realm relay not bounced"
+        );
     }
 
     #[test]

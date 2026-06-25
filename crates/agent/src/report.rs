@@ -13,7 +13,9 @@ pub struct ReportInputs {
     pub backend_reachable: bool,
     pub applied_config_gen: u64,
     pub restart_count: u32,
-    pub pid: Option<u32>,
+    /// Pids of every supervised relay child (gost and/or realm). Empty when none
+    /// is running.
+    pub pids: Vec<u32>,
     pub capacity: Option<Capacity>,
     /// Per-replica probe results from the failover engine (None on the legacy
     /// no-rules path so older panels see the field omitted entirely).
@@ -28,9 +30,13 @@ pub struct ReportInputs {
 /// payload minimal otherwise (the field is optional/extensible per gap 7.5).
 #[must_use]
 pub fn build(inputs: ReportInputs) -> StatusReport {
-    let metrics = if inputs.pid.is_some() || inputs.restart_count > 0 {
+    let metrics = if !inputs.pids.is_empty() || inputs.restart_count > 0 {
         Some(Metrics {
-            gost_realm_pids: inputs.pid.map(|p| vec![p]),
+            gost_realm_pids: if inputs.pids.is_empty() {
+                None
+            } else {
+                Some(inputs.pids)
+            },
             restart_count: Some(inputs.restart_count),
             ..Default::default()
         })
@@ -61,7 +67,7 @@ mod tests {
             backend_reachable: true,
             applied_config_gen: 5,
             restart_count: 2,
-            pid: Some(4321),
+            pids: vec![4321],
             capacity: Some(Capacity {
                 counter_epoch: 99,
                 source: CapacitySource::ForwardBytes,
@@ -81,13 +87,30 @@ mod tests {
     }
 
     #[test]
+    fn reports_both_relay_pids_for_a_mixed_node() {
+        // A node running both gost and realm surfaces both pids in gost_realm_pids.
+        let r = build(ReportInputs {
+            forwarding_up: true,
+            backend_reachable: true,
+            applied_config_gen: 3,
+            restart_count: 0,
+            pids: vec![2000, 3000],
+            capacity: None,
+            backend_health: None,
+            active_backends: None,
+        });
+        let m = r.metrics.expect("metrics present");
+        assert_eq!(m.gost_realm_pids, Some(vec![2000, 3000]));
+    }
+
+    #[test]
     fn omits_metrics_when_nothing_to_report() {
         let r = build(ReportInputs {
             forwarding_up: false,
             backend_reachable: false,
             applied_config_gen: 0,
             restart_count: 0,
-            pid: None,
+            pids: vec![],
             capacity: None,
             backend_health: None,
             active_backends: None,
@@ -104,7 +127,7 @@ mod tests {
             backend_reachable: true,
             applied_config_gen: 1,
             restart_count: 0,
-            pid: None,
+            pids: vec![],
             capacity: None,
             backend_health: Some(vec![BackendHealth {
                 host: "10.0.0.1".into(),

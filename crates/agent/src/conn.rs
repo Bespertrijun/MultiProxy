@@ -29,11 +29,11 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::capacity::{CapacityCollector, CounterSource};
-use crate::config::{self, ApplyOutcome, ConfigPaths};
+use crate::config::{self, ConfigPaths};
 use crate::failover::{FailoverEngine, FailoverTunables};
 use crate::report::{self, ReportInputs};
 use crate::selfheal::BackendProbe;
-use crate::supervisor::{ProcessSpawner, Supervisor};
+use crate::supervisor::{ProcessSpawner, Supervisor, Tool};
 
 /// Static identity + endpoint config for the agent.
 #[derive(Debug, Clone)]
@@ -225,15 +225,27 @@ fn apply_failover_switch<S, C, P>(
         rules: Vec::new(),
     };
     match config::apply(&synthetic, paths) {
-        Ok(ApplyOutcome::Start(applied)) => {
-            if let Err(e) = deps.supervisor.start(applied.tool, applied.config_path) {
-                eprintln!("failover: restart after backend switch failed: {e}");
-            } else {
-                eprintln!("failover: active backend changed → re-rendered + restarted relay");
+        Ok(result) => {
+            // The decision carries a config ONLY for the tool(s) whose active
+            // backend changed this cycle (a gost-rule failover does not re-render
+            // realm). Restart exactly those — and deliberately do NOT stop the
+            // absent tool: its absence here means "unchanged", not "removed", so a
+            // gost failover never bounces a healthy realm relay.
+            for applied in &result.starts {
+                if let Err(e) = deps.supervisor.start(applied.tool, &applied.config_path) {
+                    eprintln!(
+                        "failover: restart {:?} after backend switch failed: {e}",
+                        applied.tool
+                    );
+                } else {
+                    eprintln!(
+                        "failover: {:?} active backend changed → re-rendered + restarted relay",
+                        applied.tool
+                    );
+                }
             }
             // P6: deliberately DO NOT touch deps.applied_gen here.
         }
-        Ok(ApplyOutcome::NoTool { .. }) => { /* nothing to start */ }
         Err(e) => eprintln!("failover: writing re-rendered config failed: {e}"),
     }
 }
@@ -437,7 +449,7 @@ where
                     backend_reachable,
                     applied_config_gen: deps.applied_gen,
                     restart_count: deps.supervisor.restart_count(),
-                    pid: deps.supervisor.pid(),
+                    pids: deps.supervisor.pids(),
                     capacity,
                     backend_health,
                     active_backends,
@@ -495,26 +507,51 @@ where
                                 .join(", ")
                         );
                         let ack = match config::apply(&apply_push, &cfg.config_paths) {
-                            Ok(ApplyOutcome::Start(applied)) => {
-                                let start = deps.supervisor.start(applied.tool, applied.config_path);
-                                match start {
-                                    Ok(()) => {
-                                        deps.applied_gen = applied.applied_gen;
-                                        ConfigAck { applied_gen: applied.applied_gen, ok: true, err: None }
+                            Ok(result) => {
+                                // A full-node render: start every tool the push carried
+                                // (gost AND realm for a mixed node) and STOP any tool no
+                                // longer present (e.g. all of a node's realm rules were
+                                // deleted) so a removed tool doesn't linger holding a port.
+                                let want_gost =
+                                    result.starts.iter().any(|s| s.tool == Tool::Gost);
+                                let want_realm =
+                                    result.starts.iter().any(|s| s.tool == Tool::Realm);
+                                // STOP absent tools BEFORE starting present ones: a rule
+                                // that moves to a different tool on the SAME listen port
+                                // must free the port before the new tool binds it, else the
+                                // new spawn hits EADDRINUSE.
+                                if !want_gost {
+                                    deps.supervisor.stop_tool(Tool::Gost);
+                                }
+                                if !want_realm {
+                                    deps.supervisor.stop_tool(Tool::Realm);
+                                }
+                                let mut spawn_errs: Vec<String> = Vec::new();
+                                for applied in &result.starts {
+                                    if let Err(e) =
+                                        deps.supervisor.start(applied.tool, &applied.config_path)
+                                    {
+                                        spawn_errs.push(format!("{:?}: {e}", applied.tool));
                                     }
-                                    Err(e) => ConfigAck {
-                                        applied_gen: push.desired_gen,
+                                }
+                                if spawn_errs.is_empty() {
+                                    deps.applied_gen = result.applied_gen;
+                                    ConfigAck { applied_gen: result.applied_gen, ok: true, err: None }
+                                } else {
+                                    // Keep applied_gen at the LAST good gen (NOT desired): the
+                                    // panel ignores `ok` and re-pushes only while
+                                    // applied != desired, so acking desired on failure would
+                                    // look converged and the broken node would never be
+                                    // re-pushed (the failed tool stays down forever).
+                                    ConfigAck {
+                                        applied_gen: deps.applied_gen,
                                         ok: false,
-                                        err: Some(format!("spawn failed: {e}")),
-                                    },
+                                        err: Some(format!("spawn failed: {}", spawn_errs.join("; "))),
+                                    }
                                 }
                             }
-                            Ok(ApplyOutcome::NoTool { applied_gen }) => {
-                                deps.applied_gen = applied_gen;
-                                ConfigAck { applied_gen, ok: true, err: None }
-                            }
                             Err(e) => ConfigAck {
-                                applied_gen: push.desired_gen,
+                                applied_gen: deps.applied_gen,
                                 ok: false,
                                 err: Some(format!("write failed: {e}")),
                             },

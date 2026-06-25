@@ -638,12 +638,43 @@ fn validate_extra_backends(extra: &[contract::protocol::BackendEndpoint]) -> Res
     Ok(())
 }
 
+/// Reject a rule whose `(listen_port, protocol)` collides with another rule on the
+/// SAME node. Two rules sharing a listen socket make the relay fail to bind
+/// (`EADDRINUSE`) — most visibly a gost rule and a realm rule on the same TCP
+/// port, which the agent now tries to start side by side. `editing_id` is the rule
+/// being updated (excluded from the scan) or `None` on create. TCP and UDP on the
+/// same port are distinct sockets, so the check is per `(port, protocol)`.
+async fn validate_unique_listen_port(
+    state: &AppState,
+    node_id: &str,
+    listen_port: u16,
+    protocol: contract::model::Protocol,
+    editing_id: Option<&str>,
+) -> Result<()> {
+    let existing = db::list_rules_for_node(&state.db, node_id).await?;
+    let collides = existing.iter().any(|r| {
+        r.listen_port == listen_port && r.protocol == protocol && Some(r.id.as_str()) != editing_id
+    });
+    if collides {
+        let proto = match protocol {
+            contract::model::Protocol::Tcp => "tcp",
+            contract::model::Protocol::Udp => "udp",
+        };
+        return Err(PanelError::BadRequest(format!(
+            "监听端口 {listen_port}/{proto} 在该节点已被其他规则占用——同节点同协议的 listen_port 必须唯一\
+             （否则 gost/realm 会抢同一端口导致启动失败）"
+        )));
+    }
+    Ok(())
+}
+
 async fn create_rule(
     State(state): State<AppState>,
     Json(req): Json<CreateRuleReq>,
 ) -> Result<Json<ForwardRule>> {
     db::get_node(&state.db, &req.node_id).await?; // FK check
     validate_backend_host(&req.backend_host)?;
+    validate_unique_listen_port(&state, &req.node_id, req.listen_port, req.protocol, None).await?;
     // On create, an omitted field (`None`) means no standby replicas.
     let extra_backends = req.extra_backends.unwrap_or_default();
     validate_extra_backends(&extra_backends)?;
@@ -675,6 +706,14 @@ async fn update_rule(
 ) -> Result<Json<ForwardRule>> {
     db::get_node(&state.db, &req.node_id).await?; // FK check
     validate_backend_host(&req.backend_host)?;
+    validate_unique_listen_port(
+        &state,
+        &req.node_id,
+        req.listen_port,
+        req.protocol,
+        Some(&id),
+    )
+    .await?;
     // Preserve existing replicas unless the request explicitly provides the field:
     //   * `Some([..])` → overwrite (incl. `Some([])` to clear);
     //   * `None`       → keep the rule's current `extra_backends` so a plain edit

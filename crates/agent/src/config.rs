@@ -5,10 +5,10 @@
 //! renders the full config text (Line A); the agent treats it as opaque bytes
 //! and just persists + supervises — it does not parse the tool config itself.
 //!
-//! Rule: a push carries `gost_config` and/or `realm_config`. If `gost_config`
-//! is present we run gost; else if `realm_config` is present we run realm. (A
-//! node runs one forwarding tool at a time in M1; gost takes precedence when
-//! both are somehow present.)
+//! Rule: a push carries `gost_config` and/or `realm_config`. Each present config
+//! is written and its tool is (re)started; a node whose rules mix tools runs BOTH
+//! gost and realm at once. The caller stops any tool whose config is absent from
+//! the push (e.g. all of a node's realm rules were deleted).
 
 use std::path::{Path, PathBuf};
 
@@ -40,30 +40,31 @@ impl ConfigPaths {
     }
 }
 
-/// The decision derived from a config push: which file was written and which
-/// tool to (re)start against it.
+/// One tool's config that was written and should be (re)started against its file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedConfig {
     pub tool: Tool,
     pub config_path: String,
-    pub applied_gen: u64,
 }
 
-/// Outcome of applying a [`ConfigPush`].
+/// Outcome of applying a [`ConfigPush`]: the tools whose config the push carried
+/// (each must be (re)started) and the generation to ack.
+///
+/// `starts` holds one entry per present config — gost and/or realm, so a
+/// mixed-tool node yields two. It is empty when the push carried no tool config
+/// at all (the gen is still acked so the panel's drift tracking advances, and the
+/// caller stops any previously-running tool).
 #[derive(Debug)]
-pub enum ApplyOutcome {
-    /// A tool config was written; (re)start `tool` against `config_path`.
-    Start(AppliedConfig),
-    /// The push carried no tool config (neither gost nor realm). The gen is
-    /// still acked so the panel's drift tracking advances.
-    NoTool { applied_gen: u64 },
+pub struct ApplyResult {
+    pub starts: Vec<AppliedConfig>,
+    pub applied_gen: u64,
 }
 
 /// Write the config file(s) from a push and decide the tool to run.
 ///
 /// Returns the outcome, or an IO error if a file write failed (the caller then
 /// acks with `ok=false` and the error string).
-pub fn apply(push: &ConfigPush, paths: &ConfigPaths) -> std::io::Result<ApplyOutcome> {
+pub fn apply(push: &ConfigPush, paths: &ConfigPaths) -> std::io::Result<ApplyResult> {
     // Ensure the parent dir exists for whichever file we write.
     if let Some(text) = &push.gost_config {
         if let Some(parent) = paths.gost.parent() {
@@ -92,24 +93,24 @@ pub fn apply(push: &ConfigPush, paths: &ConfigPaths) -> std::io::Result<ApplyOut
         std::fs::write(&paths.tls_key, key)?;
     }
 
-    // gost takes precedence if both present (M1: one tool per node).
+    // Start every tool the push carried — gost AND realm when a node mixes tools.
+    let mut starts = Vec::new();
     if push.gost_config.is_some() {
-        Ok(ApplyOutcome::Start(AppliedConfig {
+        starts.push(AppliedConfig {
             tool: Tool::Gost,
             config_path: paths.gost.to_string_lossy().into_owned(),
-            applied_gen: push.desired_gen,
-        }))
-    } else if push.realm_config.is_some() {
-        Ok(ApplyOutcome::Start(AppliedConfig {
+        });
+    }
+    if push.realm_config.is_some() {
+        starts.push(AppliedConfig {
             tool: Tool::Realm,
             config_path: paths.realm.to_string_lossy().into_owned(),
-            applied_gen: push.desired_gen,
-        }))
-    } else {
-        Ok(ApplyOutcome::NoTool {
-            applied_gen: push.desired_gen,
-        })
+        });
     }
+    Ok(ApplyResult {
+        starts,
+        applied_gen: push.desired_gen,
+    })
 }
 
 #[cfg(test)]
@@ -142,15 +143,12 @@ mod tests {
             backends: vec![],
             rules: vec![],
         };
-        match apply(&push, &paths).unwrap() {
-            ApplyOutcome::Start(a) => {
-                assert_eq!(a.tool, Tool::Gost);
-                assert_eq!(a.applied_gen, 7);
-                let written = std::fs::read_to_string(&paths.gost).unwrap();
-                assert_eq!(written, "{\"services\":[]}");
-            }
-            other => panic!("expected Start, got {other:?}"),
-        }
+        let r = apply(&push, &paths).unwrap();
+        assert_eq!(r.applied_gen, 7);
+        assert_eq!(r.starts.len(), 1);
+        assert_eq!(r.starts[0].tool, Tool::Gost);
+        let written = std::fs::read_to_string(&paths.gost).unwrap();
+        assert_eq!(written, "{\"services\":[]}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -167,16 +165,13 @@ mod tests {
             backends: vec![],
             rules: vec![],
         };
-        match apply(&push, &paths).unwrap() {
-            ApplyOutcome::Start(a) => {
-                assert_eq!(a.tool, Tool::Realm);
-                assert_eq!(a.applied_gen, 3);
-                assert!(std::fs::read_to_string(&paths.realm)
-                    .unwrap()
-                    .contains("network"));
-            }
-            other => panic!("expected Start, got {other:?}"),
-        }
+        let r = apply(&push, &paths).unwrap();
+        assert_eq!(r.applied_gen, 3);
+        assert_eq!(r.starts.len(), 1);
+        assert_eq!(r.starts[0].tool, Tool::Realm);
+        assert!(std::fs::read_to_string(&paths.realm)
+            .unwrap()
+            .contains("network"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -193,10 +188,9 @@ mod tests {
             backends: vec![],
             rules: vec![],
         };
-        match apply(&push, &paths).unwrap() {
-            ApplyOutcome::NoTool { applied_gen } => assert_eq!(applied_gen, 9),
-            other => panic!("expected NoTool, got {other:?}"),
-        }
+        let r = apply(&push, &paths).unwrap();
+        assert_eq!(r.applied_gen, 9);
+        assert!(r.starts.is_empty(), "no config → no tool to start");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -217,22 +211,19 @@ mod tests {
             backends: vec![],
             rules: vec![],
         };
-        match apply(&push, &paths).unwrap() {
-            ApplyOutcome::Start(a) => {
-                assert_eq!(a.tool, Tool::Gost);
-                assert_eq!(a.applied_gen, 10);
-                let cert = std::fs::read_to_string(&paths.tls_cert).unwrap();
-                assert!(cert.contains("CERTIFICATE"));
-                let key = std::fs::read_to_string(&paths.tls_key).unwrap();
-                assert!(key.contains("PRIVATE KEY"));
-            }
-            other => panic!("expected Start, got {other:?}"),
-        }
+        let r = apply(&push, &paths).unwrap();
+        assert_eq!(r.applied_gen, 10);
+        assert_eq!(r.starts.len(), 1);
+        assert_eq!(r.starts[0].tool, Tool::Gost);
+        let cert = std::fs::read_to_string(&paths.tls_cert).unwrap();
+        assert!(cert.contains("CERTIFICATE"));
+        let key = std::fs::read_to_string(&paths.tls_key).unwrap();
+        assert!(key.contains("PRIVATE KEY"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn gost_takes_precedence_when_both_present() {
+    fn both_tools_start_when_both_present() {
         let dir = tmpdir();
         let paths = ConfigPaths::under(&dir);
         let push = ConfigPush {
@@ -244,11 +235,13 @@ mod tests {
             backends: vec![],
             rules: vec![],
         };
-        match apply(&push, &paths).unwrap() {
-            ApplyOutcome::Start(a) => assert_eq!(a.tool, Tool::Gost),
-            other => panic!("expected Start(gost), got {other:?}"),
-        }
-        // Both files still written.
+        // A mixed-tool node must (re)start BOTH gost and realm — not just one.
+        let r = apply(&push, &paths).unwrap();
+        let tools: Vec<Tool> = r.starts.iter().map(|s| s.tool).collect();
+        assert!(tools.contains(&Tool::Gost), "gost started");
+        assert!(tools.contains(&Tool::Realm), "realm started");
+        assert_eq!(r.starts.len(), 2, "exactly the two present tools");
+        // Both files written.
         assert_eq!(std::fs::read_to_string(&paths.gost).unwrap(), "g");
         assert_eq!(std::fs::read_to_string(&paths.realm).unwrap(), "r");
         std::fs::remove_dir_all(&dir).ok();

@@ -132,16 +132,33 @@ impl ProcessSpawner for RealSpawner {
 }
 
 // ---------------------------------------------------------------------------
-// Supervisor: owns the current child, knows how to (re)start it, counts restarts.
+// Supervisor: owns the running forwarding child(ren), (re)starts them, counts restarts.
 // ---------------------------------------------------------------------------
 
-/// Owns the currently-running forwarding child and the spawner that creates it.
+/// One *desired* tool: the config path it should run, plus its running child.
+///
+/// `child` is `None` when the most recent spawn FAILED — the tool is still
+/// desired (the slot exists), so `forwarding_up` reports down and the self-heal
+/// loop keeps retrying it, rather than silently forgetting the tool. (If the slot
+/// were dropped on a failed spawn, a half-dead mixed node would falsely report
+/// up and never recover.)
+struct Slot {
+    config_path: String,
+    child: Option<Box<dyn ChildProcess>>,
+}
+
+/// Owns the running forwarding child(ren) and the spawner that creates them.
 /// Generic over the spawner so the dummy spawner is a zero-cost test seam.
+///
+/// A node may run **both** gost and realm at once (when its rules mix tools), so
+/// the supervisor keeps an independent [`Slot`] per tool — a gost-only push,
+/// realm-only push, or mixed push each supervise exactly the tools they carry.
+/// Previously a single child was kept and the second tool's config was written to
+/// disk but never started, silently breaking every rule on the losing tool.
 pub struct Supervisor<S: ProcessSpawner> {
     spawner: S,
-    current: Option<Box<dyn ChildProcess>>,
-    tool: Option<Tool>,
-    config_path: Option<String>,
+    gost: Option<Slot>,
+    realm: Option<Slot>,
     restart_count: u32,
 }
 
@@ -150,54 +167,114 @@ impl<S: ProcessSpawner> Supervisor<S> {
     pub fn new(spawner: S) -> Self {
         Self {
             spawner,
-            current: None,
-            tool: None,
-            config_path: None,
+            gost: None,
+            realm: None,
             restart_count: 0,
         }
     }
 
-    /// (Re)start the forwarding tool against a config file. Any existing child
-    /// is killed first so a config change cleanly replaces the process.
+    /// The slot for a given tool.
+    fn slot_mut(&mut self, tool: Tool) -> &mut Option<Slot> {
+        match tool {
+            Tool::Gost => &mut self.gost,
+            Tool::Realm => &mut self.realm,
+        }
+    }
+
+    /// (Re)start **one tool** against a config file. Only that tool's existing
+    /// child is killed first (the other tool keeps running), so a config change
+    /// for one tool never bounces the other. The old child is killed (and reaped)
+    /// before spawning the new one so the freshly-started process can re-bind the
+    /// listen port the old one held.
     pub fn start(&mut self, tool: Tool, config_path: impl Into<String>) -> std::io::Result<()> {
-        if let Some(mut old) = self.current.take() {
-            let _ = old.kill();
+        // Kill this tool's previous child first (the other tool is untouched) so
+        // the new process can re-bind the listen port the old one held.
+        if let Some(slot) = self.slot_mut(tool).as_mut() {
+            if let Some(mut old) = slot.child.take() {
+                let _ = old.kill();
+            }
         }
         let config_path = config_path.into();
-        let child = self.spawner.spawn(tool, &config_path)?;
-        self.current = Some(child);
-        self.tool = Some(tool);
-        self.config_path = Some(config_path);
-        Ok(())
-    }
-
-    /// Self-heal (task 3): if a child was started but is no longer running,
-    /// restart it from the last config and bump `restart_count`. Returns
-    /// `Ok(true)` if a restart happened.
-    pub fn heal_if_crashed(&mut self) -> std::io::Result<bool> {
-        let crashed = match self.current.as_mut() {
-            Some(child) => !child.is_running()?,
-            None => false, // nothing started yet → nothing to heal
+        // Record the desired tool + config regardless of spawn outcome: a spawn
+        // failure leaves the slot present with `child = None` so the tool reports
+        // down and self-heal retries it (and the error still propagates to the
+        // caller for the ConfigAck).
+        let (child, err) = match self.spawner.spawn(tool, &config_path) {
+            Ok(c) => (Some(c), None),
+            Err(e) => (None, Some(e)),
         };
-        if crashed {
-            let (tool, path) = match (self.tool, self.config_path.clone()) {
-                (Some(t), Some(p)) => (t, p),
-                _ => return Ok(false),
-            };
-            let child = self.spawner.spawn(tool, &path)?;
-            self.current = Some(child);
-            self.restart_count += 1;
-            return Ok(true);
+        *self.slot_mut(tool) = Some(Slot { config_path, child });
+        match err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
-        Ok(false)
     }
 
-    /// Whether a forwarding child is currently alive (drives `forwarding_up`).
-    pub fn forwarding_up(&mut self) -> bool {
-        match self.current.as_mut() {
-            Some(child) => child.is_running().unwrap_or(false),
-            None => false,
+    /// Stop one tool (when a push no longer carries that tool's config, e.g. all
+    /// of a node's realm rules were deleted). Idempotent if the tool isn't running.
+    pub fn stop_tool(&mut self, tool: Tool) {
+        if let Some(mut slot) = self.slot_mut(tool).take() {
+            if let Some(mut child) = slot.child.take() {
+                let _ = child.kill();
+            }
         }
+    }
+
+    /// Self-heal (task 3): for every supervised (desired) tool whose child has
+    /// crashed OR never spawned (a prior spawn failure), restart it from its last
+    /// config and bump `restart_count`. Returns `Ok(true)` if at least one restart
+    /// happened. Each tool is healed independently — a crashed gost is restarted
+    /// without touching a live realm.
+    pub fn heal_if_crashed(&mut self) -> std::io::Result<bool> {
+        let mut healed = false;
+        for tool in [Tool::Gost, Tool::Realm] {
+            // Grab the config path only if this tool needs (re)spawning, dropping
+            // the slot borrow before we spawn (which borrows `self.spawner`).
+            let path = match self.slot_mut(tool).as_mut() {
+                Some(slot) => match slot.child.as_mut() {
+                    // Alive → nothing to heal; crashed or never-spawned → respawn.
+                    Some(child) => {
+                        if child.is_running()? {
+                            None
+                        } else {
+                            Some(slot.config_path.clone())
+                        }
+                    }
+                    None => Some(slot.config_path.clone()), // prior spawn failed
+                },
+                None => None, // tool not desired
+            };
+            if let Some(path) = path {
+                let child = self.spawner.spawn(tool, &path)?;
+                if let Some(slot) = self.slot_mut(tool).as_mut() {
+                    slot.child = Some(child);
+                }
+                self.restart_count += 1;
+                healed = true;
+            }
+        }
+        Ok(healed)
+    }
+
+    /// Whether forwarding is fully up: at least one tool is supervised AND every
+    /// supervised tool's child is alive. A node that should run both gost and
+    /// realm reports down if either has crashed (drives `StatusReport.forwarding_up`).
+    pub fn forwarding_up(&mut self) -> bool {
+        let mut any = false;
+        for tool in [Tool::Gost, Tool::Realm] {
+            if let Some(slot) = self.slot_mut(tool).as_mut() {
+                any = true;
+                // A desired tool whose child is missing (spawn failed) or dead → down.
+                let up = match slot.child.as_mut() {
+                    Some(child) => child.is_running().unwrap_or(false),
+                    None => false,
+                };
+                if !up {
+                    return false;
+                }
+            }
+        }
+        any
     }
 
     #[must_use]
@@ -205,19 +282,21 @@ impl<S: ProcessSpawner> Supervisor<S> {
         self.restart_count
     }
 
-    /// Current child pid, if any (for `Metrics.gost_realm_pids`).
+    /// Pids of every supervised child (for `Metrics.gost_realm_pids`) — gost first,
+    /// then realm when both run.
     #[must_use]
-    pub fn pid(&self) -> Option<u32> {
-        self.current.as_ref().and_then(|c| c.pid())
+    pub fn pids(&self) -> Vec<u32> {
+        [self.gost.as_ref(), self.realm.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|slot| slot.child.as_ref().and_then(|c| c.pid()))
+            .collect()
     }
 
-    /// Stop and drop the current child (clean shutdown).
+    /// Stop and drop every supervised child (clean shutdown).
     pub fn stop(&mut self) {
-        if let Some(mut child) = self.current.take() {
-            let _ = child.kill();
-        }
-        self.tool = None;
-        self.config_path = None;
+        self.stop_tool(Tool::Gost);
+        self.stop_tool(Tool::Realm);
     }
 }
 
@@ -279,7 +358,7 @@ mod tests {
         sup.start(Tool::Gost, "/tmp/gost.json").unwrap();
         assert_eq!(spawns.load(Ordering::SeqCst), 1);
         assert!(sup.forwarding_up());
-        assert!(sup.pid().is_some());
+        assert_eq!(sup.pids().len(), 1);
     }
 
     #[test]
@@ -338,5 +417,162 @@ mod tests {
     fn tool_binaries() {
         assert_eq!(Tool::Gost.binary(), "gost");
         assert_eq!(Tool::Realm.binary(), "realm");
+    }
+
+    /// A spawner that tracks gost and realm independently (each with its own
+    /// liveness flag and spawn counter) so a test can drive a mixed-tool node and
+    /// crash one tool without affecting the other.
+    #[derive(Clone, Default)]
+    struct MultiToolSpawner {
+        gost_alive: Arc<std::sync::atomic::AtomicBool>,
+        realm_alive: Arc<std::sync::atomic::AtomicBool>,
+        gost_spawns: Arc<AtomicU32>,
+        realm_spawns: Arc<AtomicU32>,
+    }
+
+    impl ProcessSpawner for MultiToolSpawner {
+        fn spawn(&self, tool: Tool, _config_path: &str) -> std::io::Result<Box<dyn ChildProcess>> {
+            let (alive, spawns, base) = match tool {
+                Tool::Gost => (&self.gost_alive, &self.gost_spawns, 2000),
+                Tool::Realm => (&self.realm_alive, &self.realm_spawns, 3000),
+            };
+            let n = spawns.fetch_add(1, Ordering::SeqCst);
+            alive.store(true, Ordering::SeqCst);
+            Ok(Box::new(DummyChild {
+                alive: alive.clone(),
+                pid: base + n,
+            }))
+        }
+    }
+
+    #[test]
+    fn supervises_gost_and_realm_concurrently() {
+        // A mixed-tool node runs BOTH children at once; pids reports both and
+        // forwarding_up requires every supervised tool to be alive.
+        let spawner = MultiToolSpawner::default();
+        let mut sup = Supervisor::new(spawner.clone());
+
+        sup.start(Tool::Gost, "/tmp/gost.json").unwrap();
+        sup.start(Tool::Realm, "/tmp/realm.toml").unwrap();
+
+        assert_eq!(spawner.gost_spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(spawner.realm_spawns.load(Ordering::SeqCst), 1);
+        assert_eq!(sup.pids().len(), 2, "both gost and realm pids reported");
+        assert!(sup.forwarding_up(), "both children alive → forwarding up");
+    }
+
+    #[test]
+    fn one_tool_crash_is_healed_without_touching_the_other() {
+        let spawner = MultiToolSpawner::default();
+        let mut sup = Supervisor::new(spawner.clone());
+        sup.start(Tool::Gost, "/tmp/gost.json").unwrap();
+        sup.start(Tool::Realm, "/tmp/realm.toml").unwrap();
+
+        // Crash gost only.
+        spawner.gost_alive.store(false, Ordering::SeqCst);
+        assert!(!sup.forwarding_up(), "one crashed tool → not fully up");
+
+        let healed = sup.heal_if_crashed().unwrap();
+        assert!(healed, "crashed gost must be restarted");
+        assert_eq!(sup.restart_count(), 1, "only gost restarted");
+        assert_eq!(
+            spawner.gost_spawns.load(Ordering::SeqCst),
+            2,
+            "gost respawned once"
+        );
+        assert_eq!(
+            spawner.realm_spawns.load(Ordering::SeqCst),
+            1,
+            "realm untouched by gost's heal"
+        );
+        assert!(sup.forwarding_up());
+    }
+
+    #[test]
+    fn stop_tool_stops_only_that_tool() {
+        let spawner = MultiToolSpawner::default();
+        let mut sup = Supervisor::new(spawner.clone());
+        sup.start(Tool::Gost, "/tmp/gost.json").unwrap();
+        sup.start(Tool::Realm, "/tmp/realm.toml").unwrap();
+
+        sup.stop_tool(Tool::Realm);
+        assert!(!spawner.realm_alive.load(Ordering::SeqCst), "realm killed");
+        assert!(
+            spawner.gost_alive.load(Ordering::SeqCst),
+            "gost still alive"
+        );
+        assert_eq!(sup.pids(), vec![2000], "only gost remains");
+        assert!(
+            sup.forwarding_up(),
+            "remaining gost is up → still forwarding"
+        );
+    }
+
+    /// A spawner whose realm spawn can be made to fail on demand, so a test can
+    /// drive the "one tool of a mixed node fails to start" path.
+    #[derive(Clone, Default)]
+    struct ToggleFailSpawner {
+        fail_realm: Arc<std::sync::atomic::AtomicBool>,
+        gost_alive: Arc<std::sync::atomic::AtomicBool>,
+        realm_alive: Arc<std::sync::atomic::AtomicBool>,
+        realm_spawns: Arc<AtomicU32>,
+    }
+
+    impl ProcessSpawner for ToggleFailSpawner {
+        fn spawn(&self, tool: Tool, _config_path: &str) -> std::io::Result<Box<dyn ChildProcess>> {
+            match tool {
+                Tool::Gost => {
+                    self.gost_alive.store(true, Ordering::SeqCst);
+                    Ok(Box::new(DummyChild {
+                        alive: self.gost_alive.clone(),
+                        pid: 1,
+                    }))
+                }
+                Tool::Realm => {
+                    self.realm_spawns.fetch_add(1, Ordering::SeqCst);
+                    if self.fail_realm.load(Ordering::SeqCst) {
+                        Err(std::io::Error::other("realm spawn boom"))
+                    } else {
+                        self.realm_alive.store(true, Ordering::SeqCst);
+                        Ok(Box::new(DummyChild {
+                            alive: self.realm_alive.clone(),
+                            pid: 2,
+                        }))
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_spawn_keeps_tool_desired_and_down_then_self_heals() {
+        // On a mixed node, if realm fails to start while gost succeeds, the node
+        // must NOT report forwarding up (realm is desired but down) and self-heal
+        // must keep retrying realm until it comes up.
+        let spawner = ToggleFailSpawner::default();
+        spawner.fail_realm.store(true, Ordering::SeqCst);
+        let mut sup = Supervisor::new(spawner.clone());
+
+        sup.start(Tool::Gost, "/tmp/gost.json").unwrap();
+        let realm = sup.start(Tool::Realm, "/tmp/realm.toml");
+        assert!(realm.is_err(), "realm spawn fails → error propagates");
+
+        assert!(
+            !sup.forwarding_up(),
+            "a desired-but-failed tool must report forwarding down, not up"
+        );
+        assert_eq!(sup.pids(), vec![1], "only gost has a live pid");
+
+        // Backend recovers; self-heal retries the previously-failed realm spawn.
+        spawner.fail_realm.store(false, Ordering::SeqCst);
+        let healed = sup.heal_if_crashed().unwrap();
+        assert!(healed, "self-heal must retry the failed spawn");
+        assert!(sup.forwarding_up(), "realm now up → forwarding fully up");
+        assert_eq!(sup.pids().len(), 2, "both tools now have live pids");
+        assert_eq!(
+            spawner.realm_spawns.load(Ordering::SeqCst),
+            2,
+            "realm spawn attempted twice (initial fail + heal retry)"
+        );
     }
 }
