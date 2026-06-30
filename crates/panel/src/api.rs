@@ -443,12 +443,18 @@ async fn create_node(
     if req.name.trim().is_empty() {
         return Err(PanelError::BadRequest("name required".into()));
     }
+    let public_ip = req.public_ip.trim().to_string();
+    if !crate::ddns::is_valid_node_address(&public_ip) {
+        return Err(PanelError::BadRequest(
+            "public_ip 必须是 IP 地址或合法域名".into(),
+        ));
+    }
     let id = auth::new_token();
     let region = geoip::division::decode(req.division_code);
     let node = FrontNode {
         id: id.clone(),
         name: req.name,
-        public_ip: req.public_ip,
+        public_ip,
         region,
         isp: req.isp.unwrap_or(Isp::Unknown),
         status: NodeStatus::Unknown,
@@ -525,8 +531,14 @@ async fn update_node(
         }
     }
     if let Some(ip) = req.public_ip {
-        if !ip.trim().is_empty() {
-            node.public_ip = ip;
+        let ip = ip.trim();
+        if !ip.is_empty() {
+            if !crate::ddns::is_valid_node_address(ip) {
+                return Err(PanelError::BadRequest(
+                    "public_ip 必须是 IP 地址或合法域名".into(),
+                ));
+            }
+            node.public_ip = ip.to_string();
         }
     }
     node.bandwidth_cap_mbps = req.bandwidth_cap_mbps.or(node.bandwidth_cap_mbps);
@@ -1086,6 +1098,11 @@ struct NodeHealth {
     id: String,
     name: String,
     public_ip: String,
+    /// For a DDNS (hostname) `public_ip`, the IP the panel currently resolved it to (so
+    /// the UI can show `host → ip` and the operator can confirm DDNS is working). `None`
+    /// for IP-literal nodes and for a hostname that has not resolved yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_ip: Option<String>,
     status: NodeStatus,
     connected: bool,
     throughput_bps: u64,
@@ -1133,10 +1150,17 @@ async fn health_view(State(state): State<AppState>) -> Result<Json<Vec<NodeHealt
                 Some(rt) => scheduler::health_reason(&n, rt, now, hb),
                 None => scheduler::HealthReason::Offline,
             };
+            // Only surface a resolved IP that was resolved from this node's *current*
+            // address (a stale cache from a since-changed hostname is not shown).
+            let resolved_ip = rt
+                .and_then(|r| r.resolved.as_ref())
+                .filter(|(host, _)| *host == n.public_ip)
+                .map(|(_, ip)| ip.to_string());
             NodeHealth {
                 id: n.id,
                 name: n.name,
                 public_ip: n.public_ip,
+                resolved_ip,
                 status: n.status,
                 connected,
                 throughput_bps: throughput,

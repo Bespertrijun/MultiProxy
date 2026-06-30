@@ -305,7 +305,7 @@ tailwind.config = {
               <thead>
                 <tr class="border-b border-panel-500 text-xs text-panel-300 uppercase tracking-wider">
                   <th class="text-left px-4 py-3 font-medium">名称</th>
-                  <th class="text-left px-4 py-3 font-medium">IP地址</th>
+                  <th class="text-left px-4 py-3 font-medium">IP / 域名</th>
                   <th class="text-left px-4 py-3 font-medium">状态</th>
                   <th class="text-left px-4 py-3 font-medium">配置版本</th>
                   <th class="text-left px-4 py-3 font-medium">带宽上限</th>
@@ -673,8 +673,8 @@ tailwind.config = {
             class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
         </div>
         <div>
-          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">公网 IP *</label>
-          <input id="addNodeIP" type="text" placeholder="1.2.3.4"
+          <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">公网 IP / 域名 *</label>
+          <input id="addNodeIP" type="text" placeholder="1.2.3.4 或 relay.example.com (DDNS)"
             class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
         </div>
       </div>
@@ -730,8 +730,8 @@ tailwind.config = {
           class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
       </div>
       <div>
-        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">公网 IP</label>
-        <input id="editNodeIP" type="text"
+        <label class="block text-xs text-panel-300 mb-1 uppercase tracking-wider">公网 IP / 域名</label>
+        <input id="editNodeIP" type="text" placeholder="1.2.3.4 或 relay.example.com (DDNS)"
           class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100" />
       </div>
       <div class="grid grid-cols-2 gap-4">
@@ -1628,9 +1628,11 @@ function renderTopology() {
         var dot = health && (health.status === 'online' || health.connected)
           ? '<span class="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block"></span>'
           : '<span class="w-1.5 h-1.5 rounded-full bg-red-400 inline-block"></span>';
+        var addrText = esc(node.public_ip) + (health && health.resolved_ip
+          ? ' → ' + esc(health.resolved_ip) : '');
         return '<div class="ml-8 flex items-center gap-2 text-xs text-panel-300">' +
           '<span class="text-panel-500">└─</span> ' + dot + ' ' + esc(node.name) +
-          ' <span class="text-panel-500">(' + esc(node.public_ip) + ')</span> ' +
+          ' <span class="text-panel-500">(' + addrText + ')</span> ' +
           '<span class="text-panel-400">' + rulesText + '</span></div>';
       }).join('');
       if (!nodeRows) return '';
@@ -1660,9 +1662,13 @@ function renderNodes() {
       var health = _health.find(function(h) { return h.id === n.id; });
       var driftWarn = n.desired_config_gen !== n.applied_config_gen
         ? ' <span class="text-amber-400" title="配置漂移警告">&#9888;</span>' : '';
+      // For a DDNS (domain) address, show the resolved IP the panel is currently serving.
+      var addrCell = esc(n.public_ip) + (health && health.resolved_ip
+        ? ' <span class="text-panel-500" title="DDNS 解析到的 IP">→ ' + esc(health.resolved_ip) + '</span>'
+        : '');
       return '<tr class="data-row" data-name="' + esc(n.name.toLowerCase()) + '">' +
         '<td class="px-4 py-3 text-panel-100 font-medium">' + esc(n.name) + '</td>' +
-        '<td class="px-4 py-3 text-panel-300 font-mono text-xs">' + esc(n.public_ip) + '</td>' +
+        '<td class="px-4 py-3 text-panel-300 font-mono text-xs">' + addrCell + '</td>' +
         '<td class="px-4 py-3">' + statusBadge(n.status) + '</td>' +
         '<td class="px-4 py-3 text-xs text-panel-300">' + n.desired_config_gen + '/' + n.applied_config_gen + driftWarn + '</td>' +
         '<td class="px-4 py-3 text-xs text-panel-300">' + (n.bandwidth_cap_mbps ? n.bandwidth_cap_mbps + ' Mbps' : '-') + '</td>' +

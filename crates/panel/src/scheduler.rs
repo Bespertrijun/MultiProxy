@@ -53,6 +53,14 @@ pub struct NodeRuntime {
     /// Last-reported active backend per rule (observability only). Overwrite semantics
     /// identical to `backend_health`.
     pub active_backends: Vec<ActiveBackend>,
+    /// Background-resolved address for a node whose `public_ip` is a DDNS *hostname*
+    /// rather than an IP literal: `(hostname_it_was_resolved_from, resolved_ip)`.
+    /// Populated out-of-band by the `ddns` refresh task so the hot snapshot path never
+    /// blocks on a DNS lookup. `None` until the name first resolves. The hostname is kept
+    /// alongside the IP so a *changed* `public_ip` can never be served a stale cache from
+    /// the old name — `build_snapshot` uses it only when the cached hostname still equals
+    /// the node's current `public_ip`. Not persisted — re-resolved on panel restart.
+    pub resolved: Option<(String, IpAddr)>,
 }
 
 /// Compute the freshness window for a heartbeat interval: `2*interval + slack`.
@@ -332,10 +340,22 @@ pub fn build_snapshot(
             let Some(node) = nodes.get(node_id) else {
                 continue;
             };
-            let Ok(ip) = node.public_ip.parse::<IpAddr>() else {
+            let rt = runtimes.get(node_id).cloned().unwrap_or_default();
+            // An IP-literal `public_ip` is used directly. Otherwise the address is a
+            // DDNS hostname: serve the IP the background `ddns` task resolved, but ONLY
+            // if it was resolved from the node's *current* hostname (a changed address
+            // must never be served the previous name's cache). Skip the node until it has
+            // resolved at least once (fail-safe toward exclusion — a never-resolving /
+            // bogus address drops the node, it never SERVFAILs).
+            let resolved_ip = || {
+                rt.resolved
+                    .as_ref()
+                    .filter(|(host, _)| *host == node.public_ip)
+                    .map(|(_, ip)| *ip)
+            };
+            let Some(ip) = node.public_ip.parse::<IpAddr>().ok().or_else(resolved_ip) else {
                 continue;
             };
-            let rt = runtimes.get(node_id).cloned().unwrap_or_default();
             let class = classify_node(node, &rt, now_ms, heartbeat_interval);
             classified.push((ip, class));
         }
@@ -786,5 +806,103 @@ mod tests {
         let snap = build_snapshot(&nodes, &rts, &[group], 1, 1000, 20);
         let avail = snap.available_for("g1");
         assert_eq!(avail, &[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]);
+    }
+
+    fn solo_group(member: &str) -> LineGroup {
+        LineGroup {
+            id: "g1".into(),
+            name: "g1".into(),
+            zone_id: None,
+            match_region: None,
+            match_isp: None,
+            member_node_ids: vec![member.into()],
+            priority: 0,
+            fallback_group: None,
+            active_window: None,
+        }
+    }
+
+    #[test]
+    fn ddns_node_uses_resolved_ip_and_skips_until_resolved() {
+        // A node whose `public_ip` is a hostname is excluded while unresolved...
+        let mut nodes = HashMap::new();
+        nodes.insert("n1".into(), node("n1", "relay.example.com", None));
+        let mut rts = HashMap::new();
+        rts.insert("n1".to_string(), healthy_rt(1000)); // resolved_ip = None
+        let group = solo_group("n1");
+
+        let snap = build_snapshot(&nodes, &rts, std::slice::from_ref(&group), 1, 1000, 20);
+        assert!(
+            snap.available_for("g1").is_empty(),
+            "hostname node must be excluded until the ddns task resolves it (no SERVFAIL bypass)"
+        );
+
+        // ...and served once the background ddns task has cached an IP for it.
+        let mut rt = healthy_rt(1000);
+        rt.resolved = Some((
+            "relay.example.com".into(),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        ));
+        rts.insert("n1".to_string(), rt);
+        let snap = build_snapshot(&nodes, &rts, &[group], 2, 1000, 20);
+        assert_eq!(
+            snap.available_for("g1"),
+            &[IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))]
+        );
+    }
+
+    #[test]
+    fn ip_literal_node_ignores_stale_resolved_ip() {
+        // An IP-literal address always wins; a stale resolved cache never overrides it.
+        let mut nodes = HashMap::new();
+        nodes.insert("n1".into(), node("n1", "10.0.0.5", None));
+        let mut rts = HashMap::new();
+        let mut rt = healthy_rt(1000);
+        rt.resolved = Some((
+            "old.example.com".into(),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        ));
+        rts.insert("n1".to_string(), rt);
+
+        let snap = build_snapshot(&nodes, &rts, &[solo_group("n1")], 1, 1000, 20);
+        assert_eq!(
+            snap.available_for("g1"),
+            &[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))]
+        );
+    }
+
+    #[test]
+    fn changed_hostname_does_not_serve_stale_cache() {
+        // Codex BLOCK #1: address changed old.example.com → new.example.com. The cache
+        // is still bound to the OLD name, so the node must be EXCLUDED (not served the
+        // old name's IP) until the new name resolves.
+        let mut nodes = HashMap::new();
+        nodes.insert("n1".into(), node("n1", "new.example.com", None));
+        let mut rts = HashMap::new();
+        let mut rt = healthy_rt(1000);
+        rt.resolved = Some((
+            "old.example.com".into(),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        ));
+        rts.insert("n1".to_string(), rt);
+
+        let snap = build_snapshot(&nodes, &rts, &[solo_group("n1")], 1, 1000, 20);
+        assert!(
+            snap.available_for("g1").is_empty(),
+            "a changed hostname must not be served the previous name's cached IP"
+        );
+
+        // Once the new name resolves, it is served.
+        let mut rt = healthy_rt(1000);
+        rt.resolved = Some((
+            "new.example.com".into(),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        ));
+        rts.insert("n1".to_string(), rt);
+        let snap = build_snapshot(&nodes, &rts, &[solo_group("n1")], 2, 1000, 20);
+        assert_eq!(
+            snap.available_for("g1"),
+            &[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))]
+        );
     }
 }

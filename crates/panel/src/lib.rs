@@ -13,6 +13,7 @@ pub mod cloudflare;
 pub mod configgen;
 pub mod crypto;
 pub mod db;
+pub mod ddns;
 pub mod dns;
 pub mod error;
 pub mod scheduler;
@@ -364,6 +365,24 @@ pub async fn build(cfg: PanelConfig) -> Result<Panel, String> {
             loop {
                 tick.tick().await;
                 certs::renew_due_zone_certs(&bg).await;
+            }
+        });
+    }
+
+    // 4c. DDNS refresh loop: resolve hostname-addressed nodes in the BACKGROUND (so a
+    //     slow/broken external resolver can never delay :53 binding above — a hostname
+    //     node simply stays excluded, fail-safe, until its first resolve lands) and
+    //     re-resolve every interval so a dynamic public-IP change propagates into the
+    //     served A-records within ~one refresh interval. The first `tick` fires
+    //     immediately, so the initial resolve happens right after startup.
+    {
+        let bg = state.clone();
+        let secs = ddns::refresh_interval_secs();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+            loop {
+                tick.tick().await; // fires immediately on the first iteration
+                ddns::refresh_all(&bg).await;
             }
         });
     }
