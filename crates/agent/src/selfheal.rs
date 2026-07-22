@@ -13,6 +13,32 @@
 use std::time::Duration;
 
 use contract::protocol::{BackendEndpoint, BackendHealth};
+use futures_util::stream::{self, StreamExt};
+
+/// Max simultaneous backend connects in one concurrent probe. Order-preserving
+/// (`buffered`, NOT `buffer_unordered`) so results come back in input order, and
+/// bounded so a node with many rules/replicas cannot exhaust file descriptors.
+const PROBE_CONCURRENCY: usize = 32;
+
+/// Probe a set of health futures with bounded, ORDER-PRESERVING concurrency.
+///
+/// Uses `StreamExt::buffered` (never `buffer_unordered`): at most
+/// [`PROBE_CONCURRENCY`] connects run at once and results are yielded in **input
+/// order**. Input order is load-bearing — the failover engine folds these results
+/// positionally into per-endpoint state and surfaces `all_health` /
+/// `active_backends` in rule→endpoint order, so a reordering here would corrupt
+/// backend selection. Factored out so the ordering guarantee is unit-testable with
+/// deterministic per-item latency (see the `buffered_*` tests).
+async fn buffered_probe<I>(probes: I) -> Vec<BackendHealth>
+where
+    I: IntoIterator,
+    I::Item: std::future::Future<Output = BackendHealth>,
+{
+    stream::iter(probes)
+        .buffered(PROBE_CONCURRENCY)
+        .collect()
+        .await
+}
 
 /// Probes whether the node's forwarding backends are reachable from this node.
 ///
@@ -56,6 +82,25 @@ pub trait BackendProbe: Send + Sync {
         }
         out
     }
+
+    /// Probe each endpoint with a caller-supplied per-endpoint `timeout` (the
+    /// panel's `probe_timeout`), reporting individual health. This is the method
+    /// the failover engine calls so the real connect honors the panel deadline
+    /// instead of a hardcoded one, and so a slow/unreachable replica cannot stall
+    /// the whole probe cycle.
+    ///
+    /// Default impl ignores `timeout` and delegates to
+    /// [`reachable_each`](Self::reachable_each) — enough for test doubles (which
+    /// have no real socket to time out). The real probe ([`TcpBackendProbe`])
+    /// overrides it to apply the deadline per endpoint AND to probe concurrently.
+    async fn reachable_each_timed(
+        &self,
+        targets: &[BackendEndpoint],
+        timeout: Duration,
+    ) -> Vec<BackendHealth> {
+        let _ = timeout;
+        self.reachable_each(targets).await
+    }
 }
 
 /// Real probe: a bounded TCP connect to each `host:port`. A successful connect means
@@ -72,22 +117,26 @@ impl TcpBackendProbe {
         Self { timeout }
     }
 
-    /// Connect-test a single endpoint within the timeout. Logs WHY a probe failed
-    /// (malformed address / refused / timeout) so backend-health issues are
-    /// diagnosable from the agent log instead of guessable.
+    /// Connect-test a single endpoint within the probe's default timeout. Thin
+    /// delegate over [`connects_within`](Self::connects_within) so the any-up
+    /// [`reachable`] path (which has no per-call deadline) is unchanged.
     async fn connects(&self, target: &BackendEndpoint) -> bool {
+        self.connects_within(target, self.timeout).await
+    }
+
+    /// Connect-test a single endpoint within a caller-supplied `timeout`. Logs WHY
+    /// a probe failed (malformed address / refused / timeout) so backend-health
+    /// issues are diagnosable from the agent log instead of guessable.
+    async fn connects_within(&self, target: &BackendEndpoint, timeout: Duration) -> bool {
         let addr = format!("{}:{}", target.host, target.port);
-        match tokio::time::timeout(self.timeout, tokio::net::TcpStream::connect(&addr)).await {
+        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
             Ok(Ok(_)) => true,
             Ok(Err(e)) => {
                 eprintln!("backend probe: connect {addr} failed: {e}");
                 false
             }
             Err(_) => {
-                eprintln!(
-                    "backend probe: connect {addr} timed out after {:?}",
-                    self.timeout
-                );
+                eprintln!("backend probe: connect {addr} timed out after {timeout:?}");
                 false
             }
         }
@@ -121,6 +170,25 @@ impl BackendProbe for TcpBackendProbe {
             });
         }
         out
+    }
+
+    async fn reachable_each_timed(
+        &self,
+        targets: &[BackendEndpoint],
+        timeout: Duration,
+    ) -> Vec<BackendHealth> {
+        // Probe every endpoint concurrently (≤ PROBE_CONCURRENCY at once) with the
+        // panel-supplied per-endpoint deadline, so a whole cycle costs ~one timeout
+        // instead of Σ(unreachable replicas × timeout). Order-preserving: results
+        // come back in input order (see `buffered_probe`).
+        buffered_probe(targets.iter().map(|t| async move {
+            BackendHealth {
+                host: t.host.clone(),
+                port: t.port,
+                reachable: self.connects_within(t, timeout).await,
+            }
+        }))
+        .await
     }
 }
 
@@ -272,5 +340,93 @@ mod tests {
         }
         assert!(check(&FixedProbe(true)).await);
         assert!(!check(&FixedProbe(false)).await);
+    }
+
+    #[tokio::test]
+    async fn reachable_each_timed_honors_short_timeout() {
+        // A dead endpoint under a 100ms deadline must resolve unreachable well
+        // under a second — proving the per-endpoint deadline is the caller's
+        // `timeout`, not the old hardcoded 3s. `192.0.2.1` is RFC5737 TEST-NET-1
+        // (guaranteed non-routable): connect either times out at 100ms or fast-fails
+        // — both are ≪ 3s.
+        let probe = TcpBackendProbe::new(Duration::from_secs(3));
+        let start = std::time::Instant::now();
+        let health = probe
+            .reachable_each_timed(&[ep("192.0.2.1", 9)], Duration::from_millis(100))
+            .await;
+        let elapsed = start.elapsed();
+        assert_eq!(health.len(), 1);
+        assert!(!health[0].reachable, "non-routable endpoint is unreachable");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "per-endpoint deadline must be the passed timeout, not 3s (elapsed {elapsed:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn reachable_each_timed_probes_concurrently() {
+        // Two dead endpoints must resolve in ~ONE timeout, not two: concurrent
+        // probing means the wall-clock cost is bounded by a single deadline even
+        // though both connects run. Serial probing would cost ~2×timeout. (If the
+        // sandbox fast-fails non-routable addresses both finish near-instantly —
+        // still under the bound, and the concurrency property is proven
+        // deterministically by `buffered_probe_preserves_input_order`.)
+        let probe = TcpBackendProbe::new(Duration::from_secs(3));
+        let timeout = Duration::from_millis(400);
+        let start = std::time::Instant::now();
+        let health = probe
+            .reachable_each_timed(&[ep("192.0.2.1", 9), ep("192.0.2.2", 9)], timeout)
+            .await;
+        let elapsed = start.elapsed();
+        assert_eq!(health.len(), 2);
+        assert!(health.iter().all(|h| !h.reachable));
+        assert!(
+            elapsed < timeout * 2,
+            "two dead endpoints must resolve in ~one timeout (concurrent), not two \
+             (elapsed {elapsed:?}, timeout {timeout:?})"
+        );
+    }
+
+    /// Yield a `BackendHealth` after an optional injected delay — lets a test drive
+    /// per-item completion order deterministically (no real sockets).
+    async fn delayed_health(
+        delay_ms: u64,
+        host: &str,
+        port: u16,
+        reachable: bool,
+    ) -> BackendHealth {
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        BackendHealth {
+            host: host.into(),
+            port,
+            reachable,
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_probe_preserves_input_order() {
+        // REORDER GUARD: index 0 is slow + unreachable, index 1 is fast + reachable.
+        // `buffered` must yield results in INPUT order, so the collected Vec is
+        // [reachable=false @ idx0, reachable=true @ idx1] BY POSITION even though
+        // idx1 completes first. A `buffer_unordered` regression would flip them
+        // (fast idx1 landing at position 0) — this asserts by position to catch it.
+        let out = buffered_probe([
+            delayed_health(200, "slow", 0, false),
+            delayed_health(0, "fast", 1, true),
+        ])
+        .await;
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].host, "slow", "slow idx0 must stay at position 0");
+        assert!(
+            !out[0].reachable,
+            "idx0 result (unreachable) must stay at position 0"
+        );
+        assert_eq!(out[1].host, "fast", "fast idx1 must stay at position 1");
+        assert!(
+            out[1].reachable,
+            "idx1 result (reachable) must stay at position 1"
+        );
     }
 }

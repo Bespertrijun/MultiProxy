@@ -250,6 +250,21 @@ fn apply_failover_switch<S, C, P>(
     }
 }
 
+/// Outer wall-clock budget for one `probe_and_decide` cycle. Kept strictly **below
+/// the heartbeat interval** (`heartbeat/2`) so a slow/hanging probe cycle can never
+/// starve the heartbeat past the panel's freshness window — the incident this
+/// hotfix fixes. Floored at `max(probe_timeout*4, 2s)` so a normal cycle (which
+/// costs ~one probe_timeout thanks to concurrent probing) is never clipped. At
+/// defaults (heartbeat 20s, probe_timeout 1s) this is 4s.
+///
+/// Cancellation-safe ONLY because `probe_and_decide` is two-phase: every `.await`
+/// lives in the concurrent-probe phase, and the state-mutating fold has none. Never
+/// apply this timeout without that restructure — an elapse mid-mutation would
+/// corrupt engine state.
+fn cycle_budget(t: &FailoverTunables, heartbeat: Duration) -> Duration {
+    (heartbeat / 2).min(std::cmp::max(t.probe_timeout * 4, Duration::from_secs(2)))
+}
+
 /// Decide, for an inbound [`ConfigPush`], which config bytes the agent writes to
 /// disk + supervises, and which flat backend list it should probe next. Pure
 /// (modulo mutating the engine's rule set): no I/O, so it is directly unit-testable.
@@ -469,18 +484,36 @@ where
             // the legacy single-upstream path is unaffected.
             _ = probe_tick.tick() => {
                 if failover.is_active() {
-                    let (decision, health) =
-                        failover.probe_and_decide(&deps.backend, &tunables).await;
-                    last_health = Some(health);
+                    // Bound the whole cycle by an outer budget (< heartbeat) so a
+                    // slow/hanging probe can never starve the heartbeat past the
+                    // panel's freshness window. Cancellation-safe: probe_and_decide
+                    // is two-phase (awaits only in the concurrent probe; the
+                    // state-mutating fold has none), so an elapse drops the future
+                    // without corrupting engine state or last_health.
+                    match tokio::time::timeout(
+                        cycle_budget(&tunables, heartbeat_interval),
+                        failover.probe_and_decide(&deps.backend, &tunables),
+                    )
+                    .await
+                    {
+                        Ok((decision, health)) => {
+                            last_health = Some(health);
 
-                    // Only an ACTUAL active-backend change triggers a re-render +
-                    // a SINGLE restart (all rule changes this cycle are batched).
-                    // OQ-8: an all-dead rule keeps last-known → no change → no
-                    // restart → never a crash-loop. P6: a local switch NEVER touches
-                    // applied_gen and NEVER emits a ConfigAck — the new active is
-                    // surfaced only via the next StatusReport.active_backends.
-                    if decision.changed {
-                        apply_failover_switch(&decision, deps, &cfg.config_paths);
+                            // Only an ACTUAL active-backend change triggers a re-render +
+                            // a SINGLE restart (all rule changes this cycle are batched).
+                            // OQ-8: an all-dead rule keeps last-known → no change → no
+                            // restart → never a crash-loop. P6: a local switch NEVER touches
+                            // applied_gen and NEVER emits a ConfigAck — the new active is
+                            // surfaced only via the next StatusReport.active_backends.
+                            if decision.changed {
+                                apply_failover_switch(&decision, deps, &cfg.config_paths);
+                            }
+                        }
+                        // Budget exceeded: keep last-known health/decision (no switch,
+                        // last_health untouched) and let the heartbeat proceed.
+                        Err(_) => eprintln!(
+                            "failover: probe cycle exceeded budget; keeping last-known health/decision"
+                        ),
                     }
                 }
             }

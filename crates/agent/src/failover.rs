@@ -252,6 +252,29 @@ impl FailoverEngine {
         probe: &P,
         tunables: &FailoverTunables,
     ) -> (FailoverDecision, Vec<BackendHealth>) {
+        // ---- Phase 1: concurrent probe — the ONLY await points; NO `&mut self.rules`
+        // writes. Clone each rule's backends, then probe every rule concurrently
+        // (`join_all` preserves rule order) with each rule's replicas probed
+        // concurrently and order-preserving (`reachable_each_timed`). This whole
+        // section is what conn.rs's outer cycle-timeout may cancel; because it only
+        // reads/clones engine state, a cancellation here cannot corrupt it.
+        let rule_backends: Vec<Vec<BackendEndpoint>> = self
+            .rules
+            .iter()
+            .map(|rs| rs.spec.backends.clone())
+            .collect();
+        let health_per_rule: Vec<Vec<BackendHealth>> = futures_util::future::join_all(
+            rule_backends
+                .iter()
+                .map(|b| probe.reachable_each_timed(b, tunables.probe_timeout)),
+        )
+        .await;
+        // join_all preserves rule order; buffered preserves endpoint order →
+        // rule→endpoint order preserved.
+
+        // ---- Phase 2: synchronous fold ----
+        // INVARIANT: NO `.await` beyond this point. conn.rs's outer cycle-timeout relies on it —
+        // an await here would let a cancellation land mid-mutation and corrupt engine state. Do not add awaits.
         let mut all_health: Vec<BackendHealth> = Vec::new();
         // Track which TOOLS had a rule switch this cycle. Only the changed tool(s)
         // are re-rendered + restarted, so a gost-rule failover never bounces a
@@ -259,10 +282,9 @@ impl FailoverEngine {
         let mut gost_changed = false;
         let mut realm_changed = false;
 
-        for rs in &mut self.rules {
+        for (rs, health) in self.rules.iter_mut().zip(health_per_rule) {
             rs.ticks_since_switch = rs.ticks_since_switch.saturating_add(1);
 
-            let health = probe.reachable_each(&rs.spec.backends).await;
             for (i, h) in health.iter().enumerate() {
                 if let Some(st) = rs.endpoints.get_mut(i) {
                     st.observe(h.reachable, tunables.max_fails, tunables.recovery_checks);
@@ -921,5 +943,127 @@ mod tests {
         assert_eq!(ab[0].host, "10.0.0.1");
         assert_eq!(ab[1].rule_id, "r2");
         assert_eq!(ab[1].host, "10.0.0.2", "primary active by default");
+    }
+
+    /// A probe that never resolves — used to force `probe_and_decide` to be
+    /// cancelled by an outer timeout mid-Phase-1 (the only await section).
+    struct HangProbe;
+    impl BackendProbe for HangProbe {
+        async fn reachable_each(&self, _targets: &[BackendEndpoint]) -> Vec<BackendHealth> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_and_decide_is_cancellation_safe_under_outer_timeout() {
+        // conn.rs wraps probe_and_decide in an outer cycle-timeout. If it elapses,
+        // the future is dropped mid-cycle. The two-phase shape (all awaits in the
+        // concurrent probe; the state-mutating fold has none) must make that drop a
+        // no-op for engine state: active selection, per-endpoint streaks, AND
+        // ticks_since_switch must all be UNCHANGED from before the cancelled call.
+        let t = tunables(3, 2, 0, 5); // max_fails=3 → one fail won't switch
+        let mut e = engine_with(vec![spec(
+            "r1",
+            8080,
+            vec![ep("10.0.0.1", 8096), ep("10.0.0.2", 8096)],
+        )]);
+        // One real cycle so the snapshot is off the initial values (primary sees a
+        // fail → streak=1; ticks advance) → "unchanged" is a meaningful assertion.
+        let probe = MapProbe::default();
+        probe.set_down(&ep("10.0.0.1", 8096), true);
+        let _ = e.probe_and_decide(&probe, &t).await;
+
+        let ab_before = e.active_backends();
+        let streaks_before: Vec<(bool, u32, u32)> = e.rules[0]
+            .endpoints
+            .iter()
+            .map(|s| (s.up, s.consecutive_fails, s.consecutive_successes))
+            .collect();
+        let ticks_before = e.rules[0].ticks_since_switch;
+
+        // Hanging probe under a short outer timeout: the cycle elapses in Phase 1.
+        let res = tokio::time::timeout(
+            Duration::from_millis(50),
+            e.probe_and_decide(&HangProbe, &t),
+        )
+        .await;
+        assert!(res.is_err(), "hanging probe must make the cycle elapse");
+
+        assert_eq!(
+            e.active_backends(),
+            ab_before,
+            "active backend unchanged after a cancelled cycle"
+        );
+        let streaks_after: Vec<(bool, u32, u32)> = e.rules[0]
+            .endpoints
+            .iter()
+            .map(|s| (s.up, s.consecutive_fails, s.consecutive_successes))
+            .collect();
+        assert_eq!(
+            streaks_after, streaks_before,
+            "per-endpoint streaks unchanged after a cancelled cycle"
+        );
+        assert_eq!(
+            e.rules[0].ticks_since_switch, ticks_before,
+            "ticks_since_switch unchanged after a cancelled cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_and_decide_no_false_switch_when_primary_stays_up() {
+        // A 2-replica rule with a healthy primary and a down (slow/unreachable)
+        // standby must stay active on the primary — a standby's state never drives a
+        // spurious switch away from a healthy higher-priority backend.
+        let t = tunables(1, 1, 0, 5); // aggressive: even 1 fail would switch
+        let mut e = engine_with(vec![spec(
+            "r1",
+            8080,
+            vec![ep("10.0.0.1", 8096), ep("10.0.0.2", 8096)],
+        )]);
+        let probe = MapProbe::default();
+        probe.set_down(&ep("10.0.0.2", 8096), true); // standby down, primary up
+        for cycle in 0..5 {
+            let (decision, _h) = e.probe_and_decide(&probe, &t).await;
+            assert!(
+                !decision.changed,
+                "healthy primary must never yield to a standby (cycle {cycle})"
+            );
+        }
+        assert_eq!(
+            e.active_backends()[0].host,
+            "10.0.0.1",
+            "still serving the primary"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_and_decide_all_health_is_rule_then_endpoint_order() {
+        // `all_health` must be in rule→endpoint order (join_all preserves rule
+        // order; buffered preserves endpoint order) so the report and the positional
+        // observe-fold line up. ≥2 rules × 2 endpoints each.
+        let t = tunables(2, 2, 0, 5);
+        let mut e = engine_with(vec![
+            spec("r1", 8080, vec![ep("10.0.0.1", 8096), ep("10.0.0.2", 8096)]),
+            spec("r2", 9090, vec![ep("10.0.1.1", 8096), ep("10.0.1.2", 8096)]),
+        ]);
+        let probe = MapProbe::default();
+        let (_d, health) = e.probe_and_decide(&probe, &t).await;
+        assert_eq!(health.len(), 4);
+        assert_eq!(
+            (health[0].host.as_str(), health[0].port),
+            ("10.0.0.1", 8096)
+        );
+        assert_eq!(
+            (health[1].host.as_str(), health[1].port),
+            ("10.0.0.2", 8096)
+        );
+        assert_eq!(
+            (health[2].host.as_str(), health[2].port),
+            ("10.0.1.1", 8096)
+        );
+        assert_eq!(
+            (health[3].host.as_str(), health[3].port),
+            ("10.0.1.2", 8096)
+        );
     }
 }
