@@ -571,3 +571,38 @@ async fn rule_extra_backends_persist_and_survive_plain_edit() {
         "an explicit empty list clears the replicas"
     );
 }
+
+/// The frontend distinguishes "loaded & empty" (renders the 暂无… empty states)
+/// from "not loaded yet" (shows the 正在加载… placeholders). That only works if
+/// empty lists serialize as `[]` — lock that contract so a future change to
+/// `null`/error can't silently re-break the empty-state rendering (regression
+/// guard for the "loading forever on empty backend" frontend fix).
+#[tokio::test]
+async fn empty_db_lists_return_empty_arrays() {
+    let (base, client) = boot().await;
+
+    let r = client
+        .post(format!("{base}/api/login"))
+        .json(&serde_json::json!({"username":"admin","password":"secret"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    for path in [
+        "/api/nodes",
+        "/api/rules",
+        "/api/line-groups",
+        "/api/zones",
+        "/api/health",
+    ] {
+        let r = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "{path} should be 200");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!([]),
+            "{path} must return [] on empty DB"
+        );
+    }
+}

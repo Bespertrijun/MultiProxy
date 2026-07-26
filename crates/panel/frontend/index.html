@@ -1039,6 +1039,7 @@ let _rules = [];
 let _groups = [];
 let _zones = [];
 let _health = [];
+let _initialRendered = false;
 let _refreshTimer = null;
 let _eventSource = null;
 let _editingGroupId = null;
@@ -1476,10 +1477,17 @@ async function refreshAll() {
     _groups = newGroups;
     _zones = newZones;
     _health = newHealth;
-    if (changed) renderAll();
+    if (changed || !_initialRendered) {
+      renderAll();
+      _initialRendered = true;
+    }
   } catch (e) {
     if (e.message !== 'unauthorized') {
       console.error('Refresh failed:', e);
+      // Only surface an error state on the INITIAL load. Later transient
+      // failures keep the last good data on screen (no clobber); the 60s
+      // poll / SSE auto-retry.
+      if (!_initialRendered) renderError(e.message || '请求失败');
     }
   }
 }
@@ -1489,6 +1497,26 @@ function renderAll() {
   renderNodes();
   renderZones();
   renderSettings();
+}
+
+// Render a "load failed + retry" state into the five always-loaded containers.
+// Used only when the initial refresh fails, so an empty/unreachable backend no
+// longer leaves the hardcoded loading placeholders spinning forever. The
+// _initialRendered flag stays false afterwards, so the next successful refresh
+// (or the retry button / auto-poll) renders real data or empty states.
+function renderError(msg) {
+  var m = esc(msg);
+  var btn = ' <button onclick="refreshAll()" class="ml-2 text-xs px-2 py-1 rounded-md bg-red-600/20 hover:bg-red-600/40 text-red-400 transition-colors">重试</button>';
+  var grid = document.getElementById('dashNodeGrid');
+  if (grid) grid.innerHTML = '<div class="text-sm text-red-400 py-8 text-center col-span-full">加载失败：' + m + btn + '</div>';
+  var topo = document.getElementById('dashTopology');
+  if (topo) topo.innerHTML = '<div class="text-sm text-red-400 py-4 text-center">加载失败：' + m + btn + '</div>';
+  var body = document.getElementById('nodesTableBody');
+  if (body) body.innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-red-400">加载失败：' + m + btn + '</td></tr>';
+  var rules = document.getElementById('nodeRulesContainer');
+  if (rules) rules.innerHTML = '<div class="text-sm text-red-400 py-4 text-center">加载失败：' + m + btn + '</div>';
+  var zones = document.getElementById('zonesContainer');
+  if (zones) zones.innerHTML = '<div class="text-sm text-red-400 py-8 text-center">加载失败：' + m + btn + '</div>';
 }
 
 /* ========== Auto-refresh ========== */
