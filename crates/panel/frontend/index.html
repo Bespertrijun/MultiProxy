@@ -1494,6 +1494,12 @@ async function refreshAll() {
 
 function renderAll() {
   renderDashboard();
+  // Called here, NOT from the tail of renderDashboard(): that function returns
+  // early when there are no nodes, which used to skip the topology render and
+  // leave 链路总览 stuck on its hardcoded "正在加载..." placeholder forever.
+  // The topology draws from zones/groups/nodes/rules, so it is independent of
+  // whether the health list is empty.
+  renderTopology();
   renderNodes();
   renderZones();
   renderSettings();
@@ -1621,7 +1627,6 @@ function renderDashboard() {
       '</div>' : '') +
     '</div>';
   }).join('');
-  renderTopology();
 }
 
 function renderTopology() {
