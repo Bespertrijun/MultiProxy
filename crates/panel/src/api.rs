@@ -27,26 +27,38 @@ use crate::{acme, cloudflare, db, scheduler, ui, ws_server};
 /// Default download URL for GeoCN.mmdb (ljxi/GeoCN latest release).
 const GEOCN_DEFAULT_URL: &str = "https://github.com/ljxi/GeoCN/releases/latest/download/GeoCN.mmdb";
 
-async fn detect_public_ip() -> Option<String> {
+pub(crate) async fn detect_public_ip() -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .ok()?;
-    let ip = client
-        .get("https://api.ipify.org")
-        .send()
-        .await
-        .ok()?
-        .text()
-        .await
-        .ok()?
-        .trim()
-        .to_string();
-    if ip.is_empty() {
-        None
-    } else {
-        Some(ip)
+    let response = client.get("https://api.ipify.org").send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
     }
+    let body = response.text().await.ok()?;
+    parse_public_ipv4(&body).map(|ip| ip.to_string())
+}
+
+fn parse_public_ipv4(value: &str) -> Option<std::net::Ipv4Addr> {
+    value.trim().parse().ok()
+}
+
+pub(crate) fn resolve_panel_ip(
+    input: &str,
+    detected: Option<&str>,
+) -> std::result::Result<String, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        let Some(detected) = detected else {
+            return Err(
+                "cf_panel_ip is empty and automatic public IPv4 detection failed; enter an IPv4 address explicitly"
+                    .into(),
+            );
+        };
+        return cloudflare::parse_panel_ipv4(detected).map(|ip| ip.to_string());
+    }
+    cloudflare::parse_panel_ipv4(input).map(|ip| ip.to_string())
 }
 
 /// Maximum download size (100 MB) to prevent abuse.
@@ -1611,10 +1623,14 @@ async fn put_cf_settings(
         req.cf_token
     };
 
-    let panel_ip = if req.cf_panel_ip.trim().is_empty() {
-        detect_public_ip().await.unwrap_or_default()
+    let detected_ip = if req.cf_panel_ip.trim().is_empty() {
+        detect_public_ip().await
     } else {
-        req.cf_panel_ip.trim().to_string()
+        None
+    };
+    let panel_ip = match resolve_panel_ip(&req.cf_panel_ip, detected_ip.as_deref()) {
+        Ok(panel_ip) => panel_ip,
+        Err(error) => return PanelError::BadRequest(error).into_response(),
     };
 
     // Save all fields to DB (cf_token is encrypted automatically by set_setting).
@@ -2062,7 +2078,28 @@ async fn index() -> Html<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_strict_cf_child, validate_backend_host};
+    use super::{is_strict_cf_child, parse_public_ipv4, resolve_panel_ip, validate_backend_host};
+
+    #[test]
+    fn panel_ip_auto_detection_requires_a_valid_ipv4_before_persistence() {
+        assert!(resolve_panel_ip("", None).is_err());
+        assert_eq!(
+            resolve_panel_ip("", Some("198.51.100.7\n")),
+            Ok("198.51.100.7".into())
+        );
+        assert!(resolve_panel_ip("", Some("2001:db8::7")).is_err());
+        assert!(resolve_panel_ip("not-an-ip", Some("198.51.100.7")).is_err());
+    }
+
+    #[test]
+    fn public_ip_parser_rejects_non_ipv4_responses() {
+        assert_eq!(
+            parse_public_ipv4(" 203.0.113.9\n"),
+            Some("203.0.113.9".parse().unwrap())
+        );
+        assert!(parse_public_ipv4("2001:db8::9").is_none());
+        assert!(parse_public_ipv4("not-an-ip").is_none());
+    }
 
     #[test]
     fn strict_cf_child_requires_a_dot_boundary_and_descendant() {

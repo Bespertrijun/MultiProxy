@@ -241,7 +241,7 @@ pub async fn inspect_and_repair(state: &AppState, repair: bool) -> Result<Integr
     let snapshot = state.snapshot.load_full();
     let groups = state.groups.load_full();
     let zones = state.zones.load_full();
-    let cf = state.cf_config().await;
+    let mut cf = state.cf_config().await;
     let mut out = ReportBuilder::new();
 
     let format = state.provider.current().format();
@@ -261,21 +261,84 @@ pub async fn inspect_and_repair(state: &AppState, repair: bool) -> Result<Integr
         );
     }
 
-    let desired = if let Some(cf_cfg) = &cf {
-        match derive_desired_state(cf_cfg, zones.as_ref()) {
-            Ok(desired) => Some(desired),
-            Err(error) => {
-                out.push("cf_config", "cloudflare", CheckStatus::Failed, error);
-                None
+    // An empty panel IP is an auto-detection placeholder. Only a repair run may
+    // resolve it; a read-only check reports the incomplete configuration without
+    // attempting a network call or mutating the runtime/DB.
+    let mut cf_ready = true;
+    if let Some(cf_cfg) = cf.as_mut() {
+        if cf_cfg.panel_ip.trim().is_empty() {
+            if repair {
+                match crate::api::detect_public_ip().await {
+                    Some(panel_ip) => {
+                        if let Err(error) = db::set_setting(
+                            &state.db,
+                            "cf_panel_ip",
+                            &panel_ip,
+                            Some(state.vault.as_ref()),
+                        )
+                        .await
+                        {
+                            cf_ready = false;
+                            out.push(
+                                "cf_config",
+                                "cloudflare",
+                                CheckStatus::Failed,
+                                format!(
+                                    "已自动检测到面板公网 IPv4 {panel_ip}，但持久化失败: {error}；未执行 Cloudflare 写入"
+                                ),
+                            );
+                        } else {
+                            cf_cfg.panel_ip = panel_ip;
+                            state.set_cf_config(Some(cf_cfg.clone())).await;
+                            out.push(
+                                "cf_config",
+                                "cloudflare",
+                                CheckStatus::Repaired,
+                                format!("已自动检测并保存面板公网 IPv4: {}", cf_cfg.panel_ip),
+                            );
+                        }
+                    }
+                    None => {
+                        cf_ready = false;
+                        out.push(
+                            "cf_config",
+                            "cloudflare",
+                            CheckStatus::Failed,
+                            "面板公网 IP 为空，自动检测 IPv4 失败；未执行 Cloudflare 检查或写入",
+                        );
+                    }
+                }
+            } else {
+                cf_ready = false;
+                out.push(
+                    "cf_config",
+                    "cloudflare",
+                    CheckStatus::Failed,
+                    "面板公网 IP 为空；点击修复以自动检测 IPv4，当前未执行 Cloudflare 写入",
+                );
             }
         }
+    }
+
+    let desired = if cf_ready {
+        if let Some(cf_cfg) = &cf {
+            match derive_desired_state(cf_cfg, zones.as_ref()) {
+                Ok(desired) => Some(desired),
+                Err(error) => {
+                    out.push("cf_config", "cloudflare", CheckStatus::Failed, error);
+                    None
+                }
+            }
+        } else {
+            out.push(
+                "cf_config",
+                "cloudflare",
+                CheckStatus::Skipped,
+                "未配置 Cloudflare，跳过公共 DNS 检查",
+            );
+            None
+        }
     } else {
-        out.push(
-            "cf_config",
-            "cloudflare",
-            CheckStatus::Skipped,
-            "未配置 Cloudflare，跳过公共 DNS 检查",
-        );
         None
     };
 
@@ -329,7 +392,14 @@ pub async fn inspect_and_repair(state: &AppState, repair: bool) -> Result<Integr
     );
 
     let probe_name = select_probe_name(desired.as_ref(), zones_after.as_ref());
-    inspect_dns_runtime(state, &probe_name, &mut out).await;
+    let route_policy = route_policy_for_probe(
+        state,
+        &probe_name,
+        &zones_after,
+        groups.as_ref(),
+        snapshot.as_ref(),
+    );
+    inspect_dns_runtime(state, &probe_name, route_policy, &mut out).await;
 
     Ok(out.finish())
 }
@@ -621,17 +691,64 @@ fn inspect_groups(
         out.push(
             "line_group_catch_all",
             &scope,
-            if catch_all {
-                CheckStatus::Ok
-            } else {
-                CheckStatus::Attention
-            },
+            CheckStatus::Ok,
             if catch_all {
                 "存在始终适用的 catch-all 线路组"
             } else {
-                "没有当前生效的 catch-all 线路组"
+                "未配置 catch-all，未匹配客户端按策略 SERVFAIL"
             },
         );
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RoutePolicy {
+    catch_all: bool,
+    available_ipv4: bool,
+}
+
+fn route_policy_for_probe(
+    state: &AppState,
+    child: &str,
+    zones: &[DnsZone],
+    groups: &[LineGroup],
+    snapshot: &contract::snapshot::AvailabilitySnapshot,
+) -> RoutePolicy {
+    let now = now_local_minute(state);
+    let zone_id = zones
+        .iter()
+        .find(|zone| cloudflare::normalize_dns_name(&zone.apex_domain) == child)
+        .map(|zone| zone.id.as_str());
+    let active: Vec<&LineGroup> = groups
+        .iter()
+        .filter(|group| match (group.zone_id.as_deref(), zone_id) {
+            (Some(group_zone), Some(query_zone)) => group_zone == query_zone,
+            (None, _) => true,
+            (Some(_), None) => false,
+        })
+        .filter(|group| {
+            group
+                .active_window
+                .is_none_or(|window| window.contains(now))
+        })
+        .collect();
+    RoutePolicy {
+        catch_all: active
+            .iter()
+            .any(|group| group.match_region.is_none() && group.match_isp.is_none()),
+        available_ipv4: active.iter().any(|group| {
+            let primary = snapshot
+                .available_for(&group.id)
+                .iter()
+                .any(|ip| matches!(ip, IpAddr::V4(_)));
+            let fallback = snapshot.fallback_for(&group.id).is_some_and(|fallback_id| {
+                snapshot
+                    .available_for(fallback_id)
+                    .iter()
+                    .any(|ip| matches!(ip, IpAddr::V4(_)))
+            });
+            primary || fallback
+        }),
     }
 }
 
@@ -642,7 +759,33 @@ struct ProbeResult {
     error: Option<String>,
 }
 
-async fn inspect_dns_runtime(state: &AppState, child: &str, out: &mut ReportBuilder) {
+fn route_self_test_status(
+    udp: &ProbeResult,
+    tcp: &ProbeResult,
+    route_policy: RoutePolicy,
+) -> CheckStatus {
+    let route_ok = [udp, tcp].iter().all(|probe| {
+        probe.response_code == Some(ResponseCode::NoError) && !probe.answers.is_empty()
+    });
+    let expected_servfail = !route_policy.catch_all
+        && route_policy.available_ipv4
+        && udp.response_code == Some(ResponseCode::ServFail)
+        && tcp.response_code == Some(ResponseCode::ServFail);
+    if route_ok || expected_servfail {
+        CheckStatus::Ok
+    } else if udp.response_code.is_some() && tcp.response_code.is_some() {
+        CheckStatus::Attention
+    } else {
+        CheckStatus::Failed
+    }
+}
+
+async fn inspect_dns_runtime(
+    state: &AppState,
+    child: &str,
+    route_policy: RoutePolicy,
+    out: &mut ReportBuilder,
+) {
     let Some((liveness, udp_port, tcp_port)) = state.dns_runtime().await else {
         out.push(
             "dns_udp",
@@ -692,27 +835,29 @@ async fn inspect_dns_runtime(state: &AppState, child: &str, out: &mut ReportBuil
     push_probe_item(out, "dns_udp", child, &udp, runtime_live);
     push_probe_item(out, "dns_tcp", child, &tcp, runtime_live);
 
-    let route_ok = [udp.response_code, tcp.response_code]
-        .iter()
-        .all(|code| *code == Some(ResponseCode::NoError))
-        && (!udp.answers.is_empty() || !tcp.answers.is_empty());
+    let route_ok = [&udp, &tcp].iter().all(|probe| {
+        probe.response_code == Some(ResponseCode::NoError) && !probe.answers.is_empty()
+    });
+    let expected_servfail = !route_policy.catch_all
+        && route_policy.available_ipv4
+        && udp.response_code == Some(ResponseCode::ServFail)
+        && tcp.response_code == Some(ResponseCode::ServFail);
     let transport_live = udp.response_code.is_some() && tcp.response_code.is_some();
     let message = format!(
         "UDP: code={:?}, A={:?}; TCP: code={:?}, A={:?}",
         udp.response_code, udp.answers, tcp.response_code, tcp.answers
     );
+    let route_status = route_self_test_status(&udp, &tcp, route_policy);
     out.push(
         "route_self_test",
         child,
-        if route_ok {
-            CheckStatus::Ok
-        } else if transport_live {
-            CheckStatus::Attention
-        } else {
-            CheckStatus::Failed
-        },
+        route_status,
         if route_ok {
             message
+        } else if expected_servfail {
+            format!(
+                "未配置 catch-all，当前自测不带 ECS，未匹配客户端按策略返回 SERVFAIL: {message}"
+            )
         } else if transport_live {
             format!("DNS 传输正常但路由自测未就绪: {message}")
         } else {
@@ -935,5 +1080,41 @@ mod tests {
     fn provider_deadline_leaves_endpoint_budget_for_local_work() {
         assert!(PROVIDER_DEADLINE < ENDPOINT_DEADLINE);
         assert!(PROVIDER_DEADLINE + Duration::from_secs(2) <= ENDPOINT_DEADLINE);
+    }
+
+    fn probe(code: ResponseCode, answers: &[&str]) -> ProbeResult {
+        ProbeResult {
+            response_code: Some(code),
+            answers: answers
+                .iter()
+                .map(|answer| answer.parse().unwrap())
+                .collect(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn no_catch_all_servfail_without_ecs_is_expected_when_ipv4_is_available() {
+        let udp = probe(ResponseCode::ServFail, &[]);
+        let tcp = probe(ResponseCode::ServFail, &[]);
+        let policy = RoutePolicy {
+            catch_all: false,
+            available_ipv4: true,
+        };
+        assert_eq!(route_self_test_status(&udp, &tcp, policy), CheckStatus::Ok);
+    }
+
+    #[test]
+    fn catch_all_servfail_remains_an_attention_condition() {
+        let udp = probe(ResponseCode::ServFail, &[]);
+        let tcp = probe(ResponseCode::ServFail, &[]);
+        let policy = RoutePolicy {
+            catch_all: true,
+            available_ipv4: true,
+        };
+        assert_eq!(
+            route_self_test_status(&udp, &tcp, policy),
+            CheckStatus::Attention
+        );
     }
 }
