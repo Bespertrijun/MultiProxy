@@ -502,7 +502,7 @@ tailwind.config = {
                   class="w-full bg-panel-700 border border-panel-500 rounded-lg px-3 py-2 text-sm text-panel-100 placeholder-panel-400" />
               </div>
             </div>
-            <div class="flex items-center gap-3 mb-4">
+            <div class="flex flex-wrap items-center gap-3 mb-4">
               <button id="cfSaveBtn" onclick="saveCfSettings()"
                 class="bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
                 保存并同步
@@ -511,8 +511,17 @@ tailwind.config = {
                 class="bg-red-600/20 hover:bg-red-600/40 text-red-400 text-sm font-medium rounded-lg px-4 py-2.5 transition-colors">
                 清除配置
               </button>
+              <button id="dnsIntegrityBtn" onclick="runDnsIntegrityCheck()"
+                class="bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium rounded-lg px-4 py-2.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                检查并修复 DNS
+              </button>
             </div>
             <div id="cfSyncStatus" class="hidden text-xs text-panel-300 space-y-1"></div>
+            <div id="dnsIntegrityStatus" class="hidden mt-3 text-xs text-panel-200 space-y-1"></div>
+            <details id="dnsIntegrityDetails" class="hidden mt-3 text-xs text-panel-300">
+              <summary class="cursor-pointer hover:text-panel-100">查看全部检查</summary>
+              <div id="dnsIntegrityChecks" class="mt-2 space-y-1"></div>
+            </details>
           </div>
 
           <!-- SSL Certificate -->
@@ -2173,6 +2182,82 @@ async function saveCfSettings() {
   }
 }
 
+function dnsIntegrityStatusLabel(status) {
+  var labels = {
+    ok: '已正常',
+    repaired: '已修复',
+    attention: '需处理',
+    failed: '失败',
+    skipped: '需处理'
+  };
+  return labels[status] || '需处理';
+}
+
+function dnsIntegrityStatusClass(status) {
+  var classes = {
+    ok: 'text-emerald-400',
+    repaired: 'text-blue-400',
+    attention: 'text-amber-400',
+    failed: 'text-red-400',
+    skipped: 'text-panel-300'
+  };
+  return classes[status] || classes.attention;
+}
+
+function renderDnsIntegrityReport(report) {
+  var summary = report && report.summary ? report.summary : {};
+  var status = report && report.status ? report.status : 'failed';
+  var statusEl = document.getElementById('dnsIntegrityStatus');
+  var detailEl = document.getElementById('dnsIntegrityDetails');
+  var checksEl = document.getElementById('dnsIntegrityChecks');
+  statusEl.classList.remove('hidden');
+  statusEl.innerHTML =
+    '<div class="flex flex-wrap gap-x-4 gap-y-1">' +
+      '<span class="' + dnsIntegrityStatusClass(status) + '">' + esc(dnsIntegrityStatusLabel(status)) + '</span>' +
+      '<span>正常 ' + Number(summary.ok || 0) + '</span>' +
+      '<span>修复 ' + Number(summary.repaired || 0) + '</span>' +
+      '<span>需处理 ' + Number(summary.attention || 0) + '</span>' +
+      '<span>失败 ' + Number(summary.failed || 0) + '</span>' +
+    '</div>';
+
+  var checks = Array.isArray(report && report.checks) ? report.checks : [];
+  var nonOk = checks.filter(function(item) { return item.status !== 'ok'; });
+  var renderItem = function(item) {
+    return '<div class="flex flex-wrap gap-x-2 gap-y-0.5">' +
+      '<span class="' + dnsIntegrityStatusClass(item.status) + '">' + esc(dnsIntegrityStatusLabel(item.status)) + '</span>' +
+      '<span class="text-panel-400">' + esc(item.id || '') + '</span>' +
+      '<span class="text-panel-300">' + esc(item.scope || '') + '</span>' +
+      '<span class="text-panel-100 break-words">' + esc(item.message || '') + '</span>' +
+    '</div>';
+  };
+  checksEl.innerHTML = checks.map(renderItem).join('');
+  detailEl.classList.toggle('hidden', checks.length === 0);
+  detailEl.open = nonOk.length > 0;
+  if (nonOk.length > 0) {
+    statusEl.innerHTML += '<div class="mt-1 space-y-1">' + nonOk.map(renderItem).join('') + '</div>';
+  }
+}
+
+async function runDnsIntegrityCheck() {
+  var btn = document.getElementById('dnsIntegrityBtn');
+  var original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '检查中...';
+  try {
+    var report = await api('POST', '/api/dns/integrity-check', { repair: true });
+    renderDnsIntegrityReport(report);
+    if (report.status === 'ok') toast('DNS 检查完成，配置正常', 'success');
+    else if (report.status === 'repaired') toast('DNS 检查完成，已修复缺失项', 'success');
+    else if (report.status === 'attention') toast('DNS 检查完成，仍有项目需处理', 'warning');
+    else toast('DNS 检查失败，请查看结果', 'error');
+  } catch (e) {
+    toast('DNS 检查失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
 async function clearCfSettings() {
   if (!confirm('确定要清除所有 Cloudflare 配置吗？这将禁用 DNS 自动管理和证书自动申请。')) return;
   try {
@@ -2578,7 +2663,7 @@ async function createZone() {
   var ns = nsRaw ? nsRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
 
   try {
-    await api('POST', '/api/zones', {
+    var result = await api('POST', '/api/zones', {
       apex_domain: apex,
       default_ttl: parseInt(document.getElementById('addZoneTTL').value || '60', 10),
       ns: ns
@@ -2586,11 +2671,13 @@ async function createZone() {
     closeModal('addZoneModal');
     document.getElementById('addZoneApex').value = '';
     document.getElementById('addZoneNS').value = '';
-    var cfData = await api('GET', '/api/settings/cf');
-    if (cfData.configured) {
-      toast('域名 "' + apex + '" 创建成功，CF NS 记录已自动同步', 'success');
+    var sync = result && result.dns_sync ? result.dns_sync : null;
+    if (sync && (sync.status === 'ok' || sync.status === 'repaired')) {
+      toast('域名 "' + apex + '" 创建成功，' + (sync.status === 'repaired' ? 'CF NS 记录已补齐' : 'CF NS 记录已确认'), 'success');
+    } else if (sync && sync.message) {
+      toast('域名 "' + apex + '" 创建成功，但 DNS 同步需处理: ' + sync.message, 'warning');
     } else {
-      toast('域名 "' + apex + '" 创建成功，请手动到 DNS 服务商添加 NS 委派记录（未配置 Cloudflare）', 'warning');
+      toast('域名 "' + apex + '" 创建成功，DNS 同步未执行', 'warning');
     }
     await refreshAll();
   } catch (e) {

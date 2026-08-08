@@ -606,3 +606,48 @@ async fn empty_db_lists_return_empty_arrays() {
         );
     }
 }
+
+#[tokio::test]
+async fn dns_integrity_endpoint_requires_auth_and_returns_complete_no_cf_report() {
+    let (base, client) = boot().await;
+
+    let response = client
+        .post(format!("{base}/api/dns/integrity-check"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    login(&base, &client).await;
+    let response = client
+        .post(format!("{base}/api/dns/integrity-check"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["checked_at"].as_u64().unwrap_or_default() > 0);
+    assert!(body["summary"]["failed"].as_u64().unwrap_or_default() >= 1);
+    assert!(body["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| { item["id"] == "cf_config" && item["status"] == "skipped" }));
+    assert!(body["checks"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "dns_udp"
+            && item["scope"] == "dns-integrity.invalid"
+            && item["status"] == "ok"
+    }));
+    assert!(body["checks"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "dns_tcp"
+            && item["scope"] == "dns-integrity.invalid"
+            && item["status"] == "ok"
+    }));
+    assert!(body["checks"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "route_self_test"
+            && item["scope"] == "dns-integrity.invalid"
+            && item["status"] == "attention"
+    }));
+}

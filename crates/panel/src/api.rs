@@ -83,6 +83,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health_view))
         .route("/api/events", get(sse_events))
         .route("/api/dns-diag", get(dns_diag_list).delete(dns_diag_clear))
+        .route("/api/dns/integrity-check", post(dns_integrity_check))
         .route("/api/geocn/update", post(geocn_update))
         .route("/api/geocn/status", get(geocn_status))
         .route("/api/cf/sync", post(cf_sync))
@@ -926,10 +927,16 @@ fn default_ttl() -> u32 {
     contract::model::DEFAULT_RESOLUTION_TTL_SECS
 }
 
+fn is_strict_cf_child(apex: &str, parent: &str) -> bool {
+    let apex = cloudflare::normalize_dns_name(apex);
+    let parent = cloudflare::normalize_dns_name(parent);
+    !parent.is_empty() && apex != parent && apex.ends_with(&format!(".{parent}"))
+}
+
 async fn create_zone(
     State(state): State<AppState>,
     Json(req): Json<CreateZoneReq>,
-) -> Result<Json<DnsZone>> {
+) -> Result<Response> {
     let zone = DnsZone {
         id: auth::new_token(),
         apex_domain: req.apex_domain,
@@ -940,13 +947,68 @@ async fn create_zone(
     db::upsert_zone(&state.db, &zone).await?;
     refresh_zones(&state).await;
 
-    if let Some(cf_cfg) = state.cf_config().await {
-        let cf_client = cloudflare::CfClient::new(&cf_cfg.token, &cf_cfg.zone_id);
-        let ns_fqdn = format!("{}.{}", cf_cfg.ns_name, cf_cfg.domain);
-        let _ = cf_client
-            .upsert_record("NS", &zone.apex_domain, &ns_fqdn, false, 300)
-            .await;
+    let cf_cfg = state.cf_config().await;
+    let is_cf_child = cf_cfg
+        .as_ref()
+        .is_some_and(|cf_cfg| is_strict_cf_child(&zone.apex_domain, &cf_cfg.domain));
+    let dns_sync = match cf_cfg.as_ref() {
+        Some(cf_cfg) if !is_cf_child => serde_json::json!({
+            "status": "skipped",
+            "message": format!(
+                "Cloudflare 已跳过：区域 `{}` 不是父域名 `{}` 的严格子域名；请在父域名对应的 DNS 提供商处手动添加 NS 委派记录。",
+                cloudflare::normalize_dns_name(&zone.apex_domain),
+                cloudflare::normalize_dns_name(&cf_cfg.domain),
+            ),
+        }),
+        Some(cf_cfg) => {
+            let ns_fqdn = format!(
+                "{}.{}",
+                cloudflare::normalize_dns_name(&cf_cfg.ns_name),
+                cloudflare::normalize_dns_name(&cf_cfg.domain)
+            );
+            let cf_client = cloudflare::CfClient::new(&cf_cfg.token, &cf_cfg.zone_id);
+            match cloudflare::parse_panel_ipv4(&cf_cfg.panel_ip) {
+                Err(error) => serde_json::json!({
+                    "status": "attention",
+                    "message": error,
+                }),
+                Ok(_) => match cf_client.validate_zone_name(&cf_cfg.domain).await {
+                    Err(error) => serde_json::json!({
+                        "status": "failed",
+                        "message": format!("Cloudflare: {error}"),
+                    }),
+                    Ok(_) => match cf_client
+                        .ensure_missing_record("NS", &zone.apex_domain, &ns_fqdn, false, 300)
+                        .await
+                    {
+                        Ok(cloudflare::EnsureRecord::AlreadyOk(_)) => serde_json::json!({
+                            "status": "ok",
+                            "message": "NS 记录已存在且匹配",
+                        }),
+                        Ok(cloudflare::EnsureRecord::Created(_)) => serde_json::json!({
+                            "status": "repaired",
+                            "message": "已创建并验证 NS 记录",
+                        }),
+                        Err(error) => {
+                            let text = format!("Cloudflare: {error}");
+                            let status = if text.to_ascii_lowercase().contains("conflict") {
+                                "attention"
+                            } else {
+                                "failed"
+                            };
+                            serde_json::json!({ "status": status, "message": text })
+                        }
+                    },
+                },
+            }
+        }
+        None => serde_json::json!({
+            "status": "skipped",
+            "message": "未配置 Cloudflare，未同步 NS 记录",
+        }),
+    };
 
+    if cf_cfg.is_some() {
         // Issue the relay cert in the background (ACME takes tens of seconds; don't
         // block the create response). The UI polls per-zone cert status.
         let st = state.clone();
@@ -958,7 +1020,21 @@ async fn create_zone(
         });
     }
 
-    Ok(Json(zone))
+    // Keep the zone fields at the top level for older clients while exposing the
+    // explicit `{ zone, dns_sync }` contract to newer clients.
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "zone": zone,
+            "dns_sync": dns_sync,
+            "id": zone.id,
+            "apex_domain": zone.apex_domain,
+            "soa": zone.soa,
+            "ns": zone.ns,
+            "default_ttl": zone.default_ttl,
+        })),
+    )
+        .into_response())
 }
 
 async fn list_zones(State(state): State<AppState>) -> Result<Json<Vec<DnsZone>>> {
@@ -1089,6 +1165,40 @@ async fn dns_diag_list() -> Json<Vec<crate::dns::diag::DiagEntry>> {
 async fn dns_diag_clear() -> StatusCode {
     crate::dns::diag::clear();
     StatusCode::NO_CONTENT
+}
+
+#[derive(Debug, Deserialize)]
+struct DnsIntegrityReq {
+    #[serde(default = "default_repair")]
+    repair: bool,
+}
+
+fn default_repair() -> bool {
+    true
+}
+
+/// Inspect the complete DNS/local configuration and optionally repair only records
+/// that are unambiguously absent. A completed inspection is HTTP 200 even when it
+/// reports attention or failed checks; authentication/input/internal failures retain
+/// the normal API error status.
+async fn dns_integrity_check(
+    State(state): State<AppState>,
+    Json(req): Json<DnsIntegrityReq>,
+) -> Response {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        crate::dns_integrity::inspect_and_repair(&state, req.repair),
+    )
+    .await
+    {
+        Ok(Ok(report)) => (StatusCode::OK, Json(report)).into_response(),
+        Ok(Err(error)) => error.into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "DNS integrity check timed out after 15s" })),
+        )
+            .into_response(),
+    }
 }
 
 // ---------- health / dashboard view (AC-5/AC-13 panel side) ----------
@@ -1501,6 +1611,12 @@ async fn put_cf_settings(
         req.cf_token
     };
 
+    let panel_ip = if req.cf_panel_ip.trim().is_empty() {
+        detect_public_ip().await.unwrap_or_default()
+    } else {
+        req.cf_panel_ip.trim().to_string()
+    };
+
     // Save all fields to DB (cf_token is encrypted automatically by set_setting).
     if let Err(e) = db::set_setting(&state.db, "cf_token", &token, vault_ref).await {
         return e.into_response();
@@ -1527,15 +1643,11 @@ async fn put_cf_settings(
     if let Err(e) = db::set_setting(&state.db, "cf_ns_name", &ns_name, vault_ref).await {
         return e.into_response();
     }
-    if let Err(e) = db::set_setting(&state.db, "cf_panel_ip", &req.cf_panel_ip, vault_ref).await {
+    // Persist the detected value, rather than the original blank input, so a restart
+    // retains the repair target.
+    if let Err(e) = db::set_setting(&state.db, "cf_panel_ip", &panel_ip, vault_ref).await {
         return e.into_response();
     }
-
-    let panel_ip = if req.cf_panel_ip.is_empty() {
-        detect_public_ip().await.unwrap_or_default()
-    } else {
-        req.cf_panel_ip
-    };
 
     // Build runtime CfConfig and update state.
     let cf_cfg = crate::state::CfConfig {
@@ -1571,7 +1683,7 @@ async fn put_cf_settings(
     // Try DNS sync (non-fatal).
     let dns_sync;
     if cf_cfg.panel_ip.is_empty() {
-        dns_sync = "skipped: no panel IP configured".to_string();
+        dns_sync = "attention: no panel IP configured".to_string();
     } else {
         let cf_client = cloudflare::CfClient::new(&cf_cfg.token, &cf_cfg.zone_id);
         match cloudflare::auto_setup_dns(
@@ -1587,7 +1699,12 @@ async fn put_cf_settings(
                 dns_sync = format!("success ({} records)", records.len());
             }
             Err(e) => {
-                dns_sync = format!("error: {e}");
+                let text = e.to_string();
+                dns_sync = if text.to_ascii_lowercase().contains("conflict") {
+                    format!("attention: {text}")
+                } else {
+                    format!("failed: {text}")
+                };
             }
         }
     }
@@ -1945,7 +2062,15 @@ async fn index() -> Html<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_backend_host;
+    use super::{is_strict_cf_child, validate_backend_host};
+
+    #[test]
+    fn strict_cf_child_requires_a_dot_boundary_and_descendant() {
+        assert!(!is_strict_cf_child("hwii.de", "hwii.de"));
+        assert!(!is_strict_cf_child("nothwii.de", "hwii.de"));
+        assert!(!is_strict_cf_child("example.net", "hwii.de"));
+        assert!(is_strict_cf_child("child.hwii.de.", "HWII.DE."));
+    }
 
     #[test]
     fn backend_host_accepts_clean_hosts() {

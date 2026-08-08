@@ -91,4 +91,30 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn dns_integrity_action_has_authenticated_repair_contract() {
+        assert_eq!(
+            INDEX_HTML.matches("检查并修复 DNS").count(),
+            1,
+            "settings must expose exactly one DNS integrity action"
+        );
+        assert!(INDEX_HTML.contains("function runDnsIntegrityCheck()"));
+        assert!(INDEX_HTML.contains("'/api/dns/integrity-check', { repair: true }"));
+        assert!(INDEX_HTML.contains("btn.disabled = false"));
+        assert!(INDEX_HTML.contains("esc(item.message || '')"));
+    }
+
+    #[test]
+    fn create_zone_uses_returned_sync_result() {
+        let start = INDEX_HTML.find("async function createZone()").unwrap();
+        let end = INDEX_HTML[start..]
+            .find("/* ========== Delete ========== */")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &INDEX_HTML[start..end];
+        assert!(body.contains("result.dns_sync"));
+        assert!(!body.contains("cfData.configured"));
+        assert!(!body.contains("CF NS 记录已自动同步"));
+    }
 }

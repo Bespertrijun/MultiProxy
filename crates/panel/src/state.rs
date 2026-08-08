@@ -15,6 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::crypto::Vault;
+use crate::dns::DnsLiveness;
 use crate::scheduler::NodeRuntime;
 
 /// Failover tunable parameters broadcast to agents in `HelloOk` on every (re)connect.
@@ -113,6 +114,11 @@ pub struct AppState {
     /// seeded from `PANEL_FAILOVER_KILLSWITCH=1`, hot-toggled via the API. Not a ConfigPush
     /// wire field; zero agent cooperation.
     pub failover_killswitch: Arc<AtomicBool>,
+    /// DNS runtime liveness and actual bound ports, populated immediately after startup.
+    /// The integrity endpoint uses these values instead of assuming port 53.
+    pub dns_liveness: Arc<RwLock<Option<DnsLiveness>>>,
+    pub dns_udp_port: Arc<AtomicU64>,
+    pub dns_tcp_port: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -154,7 +160,27 @@ impl AppState {
             zone_certs: Arc::new(RwLock::new(HashMap::new())),
             // Default OFF; operator may seed it ON via env, hot-toggle via the API.
             failover_killswitch: Arc::new(AtomicBool::new(failover_killswitch_from_env())),
+            dns_liveness: Arc::new(RwLock::new(None)),
+            dns_udp_port: Arc::new(AtomicU64::new(0)),
+            dns_tcp_port: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Publish the isolated DNS runtime handles after both sockets are bound.
+    pub async fn set_dns_runtime(&self, liveness: DnsLiveness, udp_port: u16, tcp_port: u16) {
+        *self.dns_liveness.write().await = Some(liveness);
+        self.dns_udp_port
+            .store(u64::from(udp_port), Ordering::Relaxed);
+        self.dns_tcp_port
+            .store(u64::from(tcp_port), Ordering::Relaxed);
+    }
+
+    /// Read the current DNS runtime status and actual ports.
+    pub async fn dns_runtime(&self) -> Option<(DnsLiveness, u16, u16)> {
+        let liveness = self.dns_liveness.read().await.clone()?;
+        let udp = self.dns_udp_port.load(Ordering::Relaxed) as u16;
+        let tcp = self.dns_tcp_port.load(Ordering::Relaxed) as u16;
+        Some((liveness, udp, tcp))
     }
 
     /// Whether the failover kill-switch is currently engaged (legacy-only push mode).

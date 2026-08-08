@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod db;
 pub mod ddns;
 pub mod dns;
+pub mod dns_integrity;
 pub mod error;
 pub mod scheduler;
 pub mod state;
@@ -351,6 +352,9 @@ pub async fn build(cfg: PanelConfig) -> Result<Panel, String> {
     let dns_liveness = dns.liveness.clone();
     let dns_udp_port = dns.udp_port;
     let dns_tcp_port = dns.tcp_port;
+    state
+        .set_dns_runtime(dns_liveness.clone(), dns_udp_port, dns_tcp_port)
+        .await;
 
     // 4b. Per-zone relay certs: load existing ones now (fast), then issue/renew missing
     //     or expiring ones in the background. Self-served DNS-01 requires the GeoDNS
