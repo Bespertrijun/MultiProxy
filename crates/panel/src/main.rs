@@ -406,16 +406,131 @@ async fn run_serve(args: ServeArgs) {
         "panel started (DNS on isolated runtime)"
     );
 
-    let listener = match tokio::net::TcpListener::bind(&http_bind).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("http bind {http_bind} failed: {e}");
-            std::process::exit(1);
-        }
+    // Prefer a systemd socket-activated listener (sd_listen_fds). The companion
+    // `multiproxy-panel.socket` unit keeps the HTTP port listening across service
+    // restarts, so nginx never sees a refused connection during self-update,
+    // script upgrade, or manual `systemctl restart` — requests simply queue in
+    // the kernel backlog until the new process adopts fd 3 and serves them.
+    let listener = match systemd_http_listener() {
+        Some(std_listener) => match tokio::net::TcpListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("failed to adopt systemd socket: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => match tokio::net::TcpListener::bind(&http_bind).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("http bind {http_bind} failed: {e}");
+                std::process::exit(1);
+            }
+        },
     };
 
     if let Err(e) = axum::serve(listener, panel.router).await {
         eprintln!("http server error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// First file descriptor passed by systemd socket activation (`sd_listen_fds(3)`).
+const SD_LISTEN_FDS_START: i32 = 3;
+
+/// Pure `sd_listen_fds` gate: returns the first passed fd (`SD_LISTEN_FDS_START`)
+/// only when `listen_pid` parses to our own pid and `listen_fds` parses to ≥ 1.
+/// Kept free of env/IO so it is unit-testable.
+fn systemd_listen_fd(listen_pid: &str, listen_fds: &str, our_pid: u32) -> Option<i32> {
+    let pid: u32 = listen_pid.parse().ok()?;
+    if pid != our_pid {
+        return None;
+    }
+    let fds: u32 = listen_fds.parse().ok()?;
+    if fds >= 1 {
+        Some(SD_LISTEN_FDS_START)
+    } else {
+        None
+    }
+}
+
+/// Adopt the HTTP listener handed over by systemd socket activation, if any.
+/// Returns `None` (caller falls back to a normal bind) when not running under a
+/// socket unit, when the env contract is stale (pid mismatch), or when fd 3 is
+/// not a usable TCP listener.
+#[cfg(unix)]
+fn systemd_http_listener() -> Option<std::net::TcpListener> {
+    use std::os::unix::io::FromRawFd;
+
+    let listen_pid = std::env::var("LISTEN_PID").ok()?;
+    let listen_fds = std::env::var("LISTEN_FDS").ok()?;
+    let fd = systemd_listen_fd(&listen_pid, &listen_fds, std::process::id())?;
+
+    if let Ok(fds) = listen_fds.parse::<u32>() {
+        if fds > 1 {
+            tracing::warn!(
+                fds,
+                "systemd passed more than one fd; adopting only fd 3 (HTTP) and ignoring the rest"
+            );
+        }
+    }
+
+    // SAFETY: when LISTEN_PID matches our pid and LISTEN_FDS ≥ 1, systemd
+    // guarantees fd 3 is a bound listening socket owned by this process;
+    // from_raw_fd takes ownership of it.
+    let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    match listener.local_addr() {
+        Ok(addr) => {
+            // systemd passes blocking sockets; tokio refuses to register a
+            // blocking fd (tokio#7172), so switch to nonblocking before from_std.
+            if let Err(e) = listener.set_nonblocking(true) {
+                tracing::warn!(
+                    error = %e,
+                    "failed to set systemd-passed listener nonblocking; falling back to normal bind"
+                );
+                return None;
+            }
+            tracing::info!(%addr, "http listener adopted from systemd socket activation (fd 3)");
+            Some(listener)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "systemd-passed fd 3 is not a valid TCP listener; falling back to normal bind"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn systemd_http_listener() -> Option<std::net::TcpListener> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systemd_listen_fd_matching_pid() {
+        assert_eq!(systemd_listen_fd("42", "1", 42), Some(3));
+        assert_eq!(systemd_listen_fd("42", "3", 42), Some(3));
+    }
+
+    #[test]
+    fn systemd_listen_fd_pid_mismatch() {
+        assert_eq!(systemd_listen_fd("41", "1", 42), None);
+    }
+
+    #[test]
+    fn systemd_listen_fd_zero_fds() {
+        assert_eq!(systemd_listen_fd("42", "0", 42), None);
+    }
+
+    #[test]
+    fn systemd_listen_fd_garbage() {
+        assert_eq!(systemd_listen_fd("abc", "1", 42), None);
+        assert_eq!(systemd_listen_fd("42", "xyz", 42), None);
+        assert_eq!(systemd_listen_fd("", "", 42), None);
     }
 }

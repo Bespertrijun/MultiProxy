@@ -139,6 +139,44 @@ curl -sL https://github.com/Bespertrijun/MultiProxy/releases/latest/download/ins
 - **Agent 更新**: `agent --self-update --panel-url wss://...` 或重新运行安装脚本
 - **发版**: `git tag v0.2.0 && git push --tags` → CI 自动构建发布到 GitHub Releases
 
+一键脚本安装的面板运行在 systemd **socket activation** 下（`multiproxy-panel.socket` 持有 HTTP 监听），面板自更新 / 脚本升级 / `systemctl restart` / 崩溃拉起期间端口永不关闭，nginx 反代不会 502（见下文「Nginx 反向代理」）。
+
+### Nginx 反向代理
+
+把面板页反代到域名后时，注意 `/agent` 路径是 agent 的 WebSocket 反连入口，必须配置 Upgrade 头：
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 443 ssl;
+    server_name panel.example.com;
+
+    ssl_certificate     /etc/nginx/certs/panel.example.com.crt;
+    ssl_certificate_key /etc/nginx/certs/panel.example.com.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # /agent WebSocket 必需
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        # 容忍 agent 长连接,以及面板重启期间几秒的请求排队
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+```
+
+面板更新/重启期间，请求只会在内核队列里短暂排队（nginx 侧表现为响应慢几秒，不会 502）；前端会在检测到新版本上线后自动刷新。旧版本直接 enable service 的部署，重跑一次 `install-panel.sh` 即自动迁移到 socket activation。
+
 ---
 
 ## 本地开发运行（高位 DNS 端口，无需特权）

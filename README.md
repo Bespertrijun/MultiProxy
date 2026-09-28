@@ -160,6 +160,45 @@ The panel supports online self-update:
 - **Agent update**: `agent --self-update --panel-url wss://...` or re-run the install script
 - **Release**: `git tag v0.2.0 && git push --tags` → CI auto-builds and publishes to GitHub Releases
 
+Script-installed panels run under systemd **socket activation** (`multiproxy-panel.socket` owns the HTTP listener): the port never closes during self-update, script upgrade, `systemctl restart`, or crash recovery, so an nginx reverse proxy never sees 502s (see "Nginx reverse proxy" below).
+
+### Nginx reverse proxy
+
+When proxying the panel behind a domain, note that the `/agent` path is the agents' WebSocket reverse-connect endpoint and requires the Upgrade headers:
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 443 ssl;
+    server_name panel.example.com;
+
+    ssl_certificate     /etc/nginx/certs/panel.example.com.crt;
+    ssl_certificate_key /etc/nginx/certs/panel.example.com.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Required for the /agent WebSocket
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        # Tolerate long-lived agent connections and the few seconds of
+        # kernel-side request queuing while the panel restarts.
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+```
+
+During a panel update/restart, requests simply queue in the kernel backlog (nginx sees a slower response for a few seconds, never a 502); the web UI auto-reloads once it detects the new version is up. Deployments still using the old directly-enabled service unit migrate automatically by re-running `install-panel.sh`.
+
 ---
 
 ## Local development (high DNS port, no privileges)

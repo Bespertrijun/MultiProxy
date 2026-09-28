@@ -1,6 +1,7 @@
 /target
 /dist
 .omc/
+.omx/
 .claude/
 **/*.rs.bk
 *.pdb

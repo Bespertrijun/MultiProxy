@@ -79,6 +79,11 @@ curl -sL https://github.com/Bespertrijun/MultiProxy/releases/latest/download/ins
 # 进入面板 → 系统设置 → 系统更新 → 检查更新 → 更新面板
 ```
 
+> 说明：安装脚本会同时安装 `multiproxy-panel.socket`（systemd socket activation），
+> HTTP 监听由 systemd 持有。升级期间（脚本升级或 Web UI 自更新）服务重启不会关闭
+> 监听端口，nginx 反代不会 502，请求仅短暂排队。旧版直接 enable service 的部署
+> 重跑脚本即自动迁移（脚本会 disable 旧的 service enable，改由 socket 触发）。
+
 ### 2. 升级 Agent 二进制
 
 在每个 NAT 节点升级 agent（通常通过重新运行安装脚本）：

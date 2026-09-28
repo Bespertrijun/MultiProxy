@@ -2378,14 +2378,19 @@ async function doUpdatePanel() {
   btn.disabled = true;
   btn.textContent = '更新中...';
   var statusEl = document.getElementById('updateStatus');
+  // 记住旧版本号,更新完成后靠它判断新版本是否已上线。
+  var oldVersion = '';
+  try {
+    var cur = await api('GET', '/api/version');
+    oldVersion = (cur && cur.version) || '';
+  } catch (e) { /* 拿不到旧版本不阻塞更新 */ }
   try {
     var result = await api('POST', '/api/update/panel');
     if (result.ok) {
       statusEl.classList.remove('hidden');
-      statusEl.innerHTML = '<span class="text-emerald-400">' + esc(result.message) + '</span>';
+      statusEl.innerHTML = '<span class="text-emerald-400">' + esc(result.message) + '（正在下载并替换二进制…）</span>';
       toast('正在更新，面板将自动重启...', 'info');
-      // Auto-refresh after 10 seconds to pick up the new version.
-      setTimeout(function() { location.reload(); }, 10000);
+      pollPanelReady(oldVersion, statusEl);
     } else {
       toast(result.message || '已是最新版本', 'info');
     }
@@ -2395,6 +2400,47 @@ async function doUpdatePanel() {
     btn.disabled = false;
     btn.textContent = origText;
   }
+}
+
+// 轮询 /api/version 直到新版本上线再自动刷新页面。
+// socket activation 下重启期间请求只会短暂挂起(不会 502),因此:
+//   - 200 且版本变化  -> 新版本已就绪,reload;
+//   - 401            -> 面板已回来但会话过期,reload 回登录页;
+//   - 网络错误/5xx   -> 面板正在重启,继续等;
+//   - 120s 超时      -> 提示手动刷新。
+function pollPanelReady(oldVersion, statusEl) {
+  var deadline = Date.now() + 120000;
+  var restarting = false;
+  var timer = setInterval(async function() {
+    try {
+      var resp = await fetch('/api/version', { cache: 'no-store', credentials: 'same-origin' });
+      if (resp.status === 401) {
+        clearInterval(timer);
+        location.reload();
+        return;
+      }
+      if (resp.ok) {
+        var info = await resp.json();
+        if (info && info.version && info.version !== oldVersion) {
+          clearInterval(timer);
+          location.reload();
+          return;
+        }
+        // 200 但版本未变: 旧进程还在收尾(下载/替换中),继续等。
+      } else {
+        restarting = true;
+      }
+    } catch (e) {
+      restarting = true; // 连接失败/超时: 面板正在重启,继续轮询。
+    }
+    if (restarting && statusEl) {
+      statusEl.innerHTML = '<span class="text-emerald-400">面板正在重启，等待就绪…</span>';
+    }
+    if (Date.now() > deadline) {
+      clearInterval(timer);
+      toast('重启超时，请手动刷新页面', 'error');
+    }
+  }, 2000);
 }
 
 async function doUpdateAgents() {

@@ -57,8 +57,10 @@ echo "================================================"
 mkdir -p "$DATA_DIR/certs" "$DATA_DIR/dist"
 
 # 升级/重装:先停旧服务,避免覆盖正在运行的二进制(Text file busy)。
-if command -v systemctl &>/dev/null && systemctl is-active multiproxy-panel &>/dev/null 2>&1; then
-  systemctl stop multiproxy-panel 2>/dev/null || true
+# 注意: 只停 .service —— 若已安装 multiproxy-panel.socket (socket activation),
+# 让它继续持有 HTTP 监听,升级期间 nginx 不会 502 (请求在内核队列里等)。
+if command -v systemctl &>/dev/null && systemctl is-active multiproxy-panel.service &>/dev/null 2>&1; then
+  systemctl stop multiproxy-panel.service 2>/dev/null || true
 elif command -v rc-service &>/dev/null && [[ -f /etc/init.d/multiproxy-panel ]]; then
   rc-service multiproxy-panel stop 2>/dev/null || true
 elif [[ -f /run/multiproxy-panel.pid ]]; then
@@ -108,29 +110,46 @@ if [[ "$SKIP_SYSTEMD" == "true" ]]; then
   echo "手动启动:"
   echo "  $PANEL_CMD"
 elif command -v systemctl &>/dev/null && systemctl --version &>/dev/null 2>&1; then
-  # systemd
+  # systemd + socket activation: systemd 持有 HTTP 监听 socket,服务重启
+  # (面板自更新 / 脚本升级 / 手动 restart / 崩溃拉起) 期间端口永不关闭,
+  # nginx 反代不会 502 —— 请求在内核 backlog 里排队,新进程接管 fd 3 后继续服务。
   echo ""
-  echo "[4/4] 安装 systemd 服务..."
+  echo "[4/4] 安装 systemd 服务 (socket activation)..."
+  cat > /etc/systemd/system/multiproxy-panel.socket <<EOF
+[Unit]
+Description=multiProxy Panel HTTP Socket
+
+[Socket]
+ListenStream=$HTTP_BIND
+Backlog=1024
+
+[Install]
+WantedBy=sockets.target
+EOF
   cat > /etc/systemd/system/multiproxy-panel.service <<EOF
 [Unit]
 Description=multiProxy Panel
-After=network-online.target
+After=network-online.target multiproxy-panel.socket
 Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=$PANEL_CMD
 Restart=always
-RestartSec=5
+RestartSec=1
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now multiproxy-panel
-  echo "  ✓ 服务已启动: multiproxy-panel.service (systemd)"
+  # 迁移: 旧版本直接 enable 了 service 本身,改为由 socket 触发。
+  if systemctl is-enabled multiproxy-panel.service &>/dev/null; then
+    systemctl disable multiproxy-panel.service 2>/dev/null || true
+  fi
+  # 顺序很重要: 先让 socket 接管 HTTP 监听,再启动服务;
+  # 服务进程检测到 LISTEN_FDS 后会直接接管 fd 3,不再自己 bind。
+  systemctl enable --now multiproxy-panel.socket
+  systemctl restart multiproxy-panel.service
+  echo "  ✓ 服务已启动: multiproxy-panel.socket + multiproxy-panel.service (systemd)"
 elif command -v rc-service &>/dev/null; then
   # OpenRC (Alpine)
   echo ""
